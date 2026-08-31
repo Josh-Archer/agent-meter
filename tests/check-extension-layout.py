@@ -24,4 +24,33 @@ assert "width: ${percent}%" not in source
 assert "agent-meter-progress-stale" in source
 assert "if (hasNumericQuota)" in source
 assert source.count("provider.status === 'unavailable'") == 2
+
+# Validate progressive quotaColor function in JS
+import subprocess
+js_test = """
+const source = require('fs').readFileSync('gnome-extension/agent-meter@local/extension.js', 'utf8');
+// Extract COLOR_STOPS and quotaColor function
+const fnMatch = source.match(/const COLOR_STOPS = [\\s\\S]*?function quotaColor\\([\\s\\S]*?\\n\\}/);
+if (!fnMatch) throw new Error('quotaColor function not found in extension.js');
+eval(fnMatch[0]);
+
+const asserts = [
+  [quotaColor(100, true), '#38d472'],
+  [quotaColor(41, true), '#38d472'],
+  [quotaColor(40, true), '#38d472'],
+  [quotaColor(30, true), '#f6c445'],
+  [quotaColor(20, true), '#ff8833'],
+  [quotaColor(10, true), '#ff6644'],
+  [quotaColor(0, true), '#ff3b56'],
+  [quotaColor(50, false), '#8b949e'],
+];
+
+for (const [actual, expected] of asserts) {
+  if (actual !== expected) {
+    throw new Error(`quotaColor mismatch: expected ${expected}, got ${actual}`);
+  }
+}
+console.log('quotaColor progressive scale validated successfully across all stops');
+"""
+subprocess.run(["node", "-e", js_test], check=True, cwd=root)
 print("GNOME extension layout checks passed")
