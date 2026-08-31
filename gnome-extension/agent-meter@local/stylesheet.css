@@ -1,0 +1,177 @@
+/* Panel Icons and Pills */
+.agent-meter-icons {
+  spacing: 8px;
+  margin-left: 4px;
+  margin-right: 4px;
+}
+
+.agent-meter-pill {
+  spacing: 3px;
+  padding: 2px 5px;
+  border-radius: 6px;
+  background-color: rgba(255, 255, 255, 0.13);
+  border: 1px solid rgba(255, 255, 255, 0.20);
+}
+
+.agent-meter-panel-icon {
+  icon-size: 16px;
+  -st-icon-style: symbolic;
+  color: #f7f9fc;
+}
+
+.agent-meter-pill-label {
+  font-size: 11px;
+  font-weight: 800;
+  margin-top: 1px;
+}
+
+/* High-contrast status colors */
+.agent-meter-good {
+  color: #38d472;
+}
+
+.agent-meter-warning {
+  color: #f6c445;
+}
+
+.agent-meter-critical {
+  color: #ff5c6c;
+}
+
+.agent-meter-stale {
+  color: #d0d5e0;
+}
+
+/* Menu styling */
+.popup-menu-icon {
+  icon-size: 20px;
+  margin-right: 10px;
+  -st-icon-style: symbolic;
+}
+
+.agent-meter-provider {
+  font-weight: 700;
+  font-size: 1.05em;
+  color: #ffffff;
+}
+
+.agent-meter-limit {
+  color: #a8adb9;
+  font-size: 0.9em;
+}
+
+/* Desktop Widget */
+.agent-meter-desktop {
+  width: 460px;
+  spacing: 12px;
+  padding: 20px;
+  border-radius: 18px;
+  background-color: rgba(22, 25, 32, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
+}
+
+.agent-meter-desktop-header {
+  spacing: 8px;
+  margin-bottom: 4px;
+}
+
+.agent-meter-drag-handle {
+  padding: 5px 7px;
+  border-radius: 9px;
+  background-color: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.agent-meter-drag-handle:hover,
+.agent-meter-drag-handle:active {
+  background-color: rgba(255, 255, 255, 0.13);
+  border-color: rgba(255, 255, 255, 0.24);
+}
+
+.agent-meter-desktop-title {
+  font-size: 17px;
+  font-weight: 800;
+  color: #ffffff;
+}
+
+.agent-meter-desktop-time {
+  font-size: 12px;
+  color: #8b949e;
+  text-align: right;
+}
+
+.agent-meter-desktop-card {
+  spacing: 8px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background-color: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.agent-meter-desktop-card-unavailable {
+  opacity: 0.85;
+  background-color: rgba(255, 255, 255, 0.03);
+}
+
+.agent-meter-desktop-icon {
+  icon-size: 22px;
+  margin-right: 10px;
+  -st-icon-style: symbolic;
+}
+
+.agent-meter-desktop-window {
+  spacing: 10px;
+  margin-top: 2px;
+}
+
+.agent-meter-window-label {
+  width: 70px;
+  font-size: 13px;
+  color: #c9d1d9;
+}
+
+.agent-meter-window-value {
+  width: 130px;
+  text-align: right;
+  font-size: 13px;
+  font-weight: bold;
+  color: #ffffff;
+}
+
+.agent-meter-progress {
+  width: 150px;
+  height: 8px;
+  margin-top: 5px;
+  border-radius: 4px;
+  background-color: rgba(255, 255, 255, 0.12);
+}
+
+.agent-meter-progress-fill {
+  height: 8px;
+  border-radius: 4px;
+  background-color: #38d472;
+}
+
+.agent-meter-progress-warning {
+  background-color: #f6c445;
+}
+
+.agent-meter-progress-critical {
+  background-color: #ff5c6c;
+}
+
+.agent-meter-connect {
+  margin-left: 8px;
+  padding: 3px 10px;
+  border-radius: 8px;
+  background-color: rgba(56, 212, 114, 0.2);
+  border: 1px solid rgba(56, 212, 114, 0.4);
+  color: #ffffff;
+  font-weight: 700;
+  font-size: 12px;
+}
+
+.agent-meter-connect:hover {
+  background-color: rgba(56, 212, 114, 0.35);
+}

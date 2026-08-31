@@ -1,0 +1,29 @@
+{
+  "refresh_seconds": 300,
+  "sources": [
+    {
+      "kind": "command",
+      "program": "/home/you/.local/bin/agent-meter-adapter",
+      "args": ["codex"]
+    },
+    {
+      "kind": "command",
+      "program": "/home/you/.local/bin/agent-meter-adapter",
+      "args": ["agy"]
+    },
+    {
+      "kind": "command",
+      "program": "/home/you/.local/bin/agent-meter-adapter",
+      "args": ["grok"]
+    },
+    {
+      "kind": "command",
+      "program": "/home/you/.local/bin/agent-meter-adapter",
+      "args": ["copilot"]
+    },
+    {
+      "kind": "file",
+      "path": "/home/you/.local/state/agent-meter/claude.json"
+    }
+  ]
+}

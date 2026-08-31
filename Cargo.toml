@@ -1,0 +1,35 @@
+[package]
+name = "agent-meter"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A local GNOME usage meter for coding-agent harnesses"
+
+[lib]
+name = "agent_meter"
+path = "src/lib.rs"
+
+[[bin]]
+name = "agent-meterd"
+path = "src/bin/agent-meterd.rs"
+
+[[bin]]
+name = "agent-meter"
+path = "src/bin/agent-meter.rs"
+required-features = ["desktop"]
+
+[features]
+default = []
+desktop = ["dep:gtk"]
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+dirs = "5.0"
+gtk = { package = "gtk4", version = "0.9", optional = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+tempfile = "3.12"

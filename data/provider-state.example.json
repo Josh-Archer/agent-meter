@@ -1,0 +1,21 @@
+{
+  "id": "codex",
+  "label": "Codex",
+  "icon": "codex",
+  "windows": [
+    {
+      "id": "five_hour",
+      "label": "5 hours",
+      "remaining_percent": 72.0,
+      "reset_label": "in 1h 12m"
+    },
+    {
+      "id": "weekly",
+      "label": "Weekly",
+      "remaining_percent": 51.0,
+      "reset_label": "Tue 10:00"
+    }
+  ],
+  "status": "fresh",
+  "usage_url": "https://chatgpt.com/#settings/usage"
+}

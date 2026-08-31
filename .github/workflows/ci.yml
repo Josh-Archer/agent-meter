@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install GTK build dependencies
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libgtk-4-dev pkg-config
+      - name: Run Python checks
+        run: |
+          python3 tests/check-extension-layout.py
+          python3 tests/test-adapters.py
+      - name: Run Rust tests
+        run: cargo test --all-features

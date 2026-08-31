@@ -1,0 +1,12 @@
+[Unit]
+Description=Agent Meter local usage-state daemon
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/agent-meterd --watch
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

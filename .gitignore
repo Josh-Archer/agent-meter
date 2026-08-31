@@ -1,0 +1,21 @@
+/target/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+dist/
+build/
+*.deb
+*.tar.gz
+
+# Local configuration and runtime state
+.env
+.env.*
+*.jsonl
+data/sources.json
+data/provider-state.json
+
+# Editor and OS files
+.idea/
+.vscode/
+*.swp
+.DS_Store

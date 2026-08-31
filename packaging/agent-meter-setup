@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+bin_dir=$(dirname -- "$(command -v agent-meter-adapter)")
+data_dir=${XDG_DATA_HOME:-"$HOME/.local/share"}/agent-meter
+config_dir=${XDG_CONFIG_HOME:-"$HOME/.config"}/agent-meter
+state_dir=${XDG_STATE_HOME:-"$HOME/.local/state"}/agent-meter
+copilot_sdk_dir="$data_dir/copilot-sdk"
+
+install -d -m700 "$config_dir" "$state_dir" "$copilot_sdk_dir"
+install -Dm644 /usr/lib/agent-meter/copilot_quota.mjs "$copilot_sdk_dir/copilot_quota.mjs"
+if [[ ! -d "$copilot_sdk_dir/node_modules/@github/copilot-sdk" ]]; then
+    npm install --prefix "$copilot_sdk_dir" --no-audit --no-fund \
+        @github/copilot-sdk@1.0.11 @github/copilot@1.0.82
+fi
+
+if [[ ! -f "$config_dir/sources.json" ]]; then
+    "$bin_dir/agent-meter-adapter" claude > "$state_dir/claude.json"
+    chmod 600 "$state_dir/claude.json"
+    cat > "$config_dir/sources.json" <<EOF
+{
+  "refresh_seconds": 300,
+  "sources": [
+    {"kind":"command","program":"$bin_dir/agent-meter-adapter","args":["codex"]},
+    {"kind":"command","program":"$bin_dir/agent-meter-adapter","args":["agy"]},
+    {"kind":"command","program":"$bin_dir/agent-meter-adapter","args":["grok"]},
+    {"kind":"command","program":"$bin_dir/agent-meter-adapter","args":["copilot"]},
+    {"kind":"file","path":"$state_dir/claude.json"}
+  ]
+}
+EOF
+    chmod 600 "$config_dir/sources.json"
+fi
+
+systemctl --user daemon-reload
+systemctl --user enable --now agent-meter.service
+if gnome-extensions list | grep -qx 'agent-meter@local'; then
+    gnome-extensions enable agent-meter@local
+fi
+printf 'Agent Meter is configured. Log out and back in once so GNOME loads the extension.\n'
