@@ -35,6 +35,24 @@ normal app gets focus. Drag the highlighted **Agent Meter** header to move it;
 the saved position is clamped to the monitor so the card cannot be lost
 off-screen. The top-bar row is always available.
 
+## Progressive Quota Color Scale
+
+Agent Meter uses a continuous, high-contrast color scale to convey remaining quota across all GNOME Shell and GTK surfaces:
+
+| Remaining Quota | Visual Color | Hex Stop | Purpose |
+| ---: | --- | :---: | --- |
+| **> 40%** | Stable Green | `#38d472` | Normal operational headroom |
+| **~30%** | Yellow | `#f6c445` | Usage threshold reached |
+| **~20%** | Vivid Orange | `#ff8833` | Quota drawing down |
+| **~10%** | Red-Orange | `#ff6644` | Approaching quota exhaustion |
+| **0%** | Clear Red | `#ff3b56` | Quota exhausted |
+| **Stale / Offline** | Neutral Slate | `#8b949e` | Unchanged cached state |
+
+### Accessibility & Contrast Invariants
+* **Dual Indicator**: Numeric percentages are always rendered alongside colors so color vision deficiency does not impede usage tracking.
+* **High Foreground Contrast**: All chosen color stops maintain strong contrast (>4.5:1 WCAG AA) against Ubuntu's black top bar (`#000000`) and the dark desktop widget background (`#161920`).
+* **Neutral Inactive State**: Stale or disconnected providers remain neutral gray (`#8b949e`) rather than mapping onto the warning/critical spectrum.
+
 ## Install a release on Ubuntu
 
 The packaged release targets Ubuntu 24.04 on `amd64` with GNOME Shell 46.

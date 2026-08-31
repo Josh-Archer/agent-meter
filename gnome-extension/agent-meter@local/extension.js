@@ -68,6 +68,36 @@ function iconFor(extension, symbol) {
     return new Gio.FileIcon({file: iconsDir.get_child(`${name}.svg`)});
 }
 
+const COLOR_STOPS = [
+    { p: 0,  rgb: [255, 59, 86] },   // 0%: Red #ff3b56
+    { p: 10, rgb: [255, 102, 68] },  // 10%: Red-Orange #ff6644
+    { p: 20, rgb: [255, 136, 51] },  // 20%: Orange #ff8833
+    { p: 30, rgb: [246, 196, 69] },  // 30%: Yellow #f6c445
+    { p: 40, rgb: [56, 212, 114] },  // 40%+: Green #38d472
+];
+
+function quotaColor(percent, isFresh = true) {
+    if (!isFresh) {
+        return '#8b949e';
+    }
+    const p = Math.max(0, Math.min(100, Number(percent) || 0));
+    if (p >= 40) {
+        return '#38d472';
+    }
+    for (let i = 0; i < COLOR_STOPS.length - 1; i++) {
+        const lower = COLOR_STOPS[i];
+        const upper = COLOR_STOPS[i + 1];
+        if (p >= lower.p && p <= upper.p) {
+            const factor = (p - lower.p) / (upper.p - lower.p);
+            const r = Math.round(lower.rgb[0] + (upper.rgb[0] - lower.rgb[0]) * factor);
+            const g = Math.round(lower.rgb[1] + (upper.rgb[1] - lower.rgb[1]) * factor);
+            const b = Math.round(lower.rgb[2] + (upper.rgb[2] - lower.rgb[2]) * factor);
+            return `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`;
+        }
+    }
+    return '#ff3b56';
+}
+
 function limitText(provider) {
     const windows = provider.windows ?? [];
     const lowest = windows.reduce((current, entry) =>
@@ -250,9 +280,7 @@ class AgentMeterIndicator extends PanelMenu.Button {
             else if (isFresh)
                 pctText = 'Active';
 
-            const iconStyle = !isFresh ? 'agent-meter-stale' :
-                (hasNumericQuota && percentage <= 15) ? 'agent-meter-critical' :
-                (hasNumericQuota && percentage <= 35) ? 'agent-meter-warning' : 'agent-meter-good';
+            const color = quotaColor(percentage, isFresh);
 
             const pill = new St.BoxLayout({
                 style_class: 'agent-meter-pill',
@@ -261,7 +289,8 @@ class AgentMeterIndicator extends PanelMenu.Button {
 
             const icon = new St.Icon({
                 gicon: iconFor(this._extension, provider.icon ?? provider.id),
-                style_class: `system-status-icon agent-meter-panel-icon ${iconStyle}`,
+                style_class: 'system-status-icon agent-meter-panel-icon',
+                style: `color: ${color};`,
                 accessible_name: `${provider.label}: ${limitText(provider)}`,
             });
             pill.add_child(icon);
@@ -269,7 +298,8 @@ class AgentMeterIndicator extends PanelMenu.Button {
             // Label beside icon
             const pctLabel = new St.Label({
                 text: pctText,
-                style_class: `agent-meter-pill-label ${iconStyle}`,
+                style_class: 'agent-meter-pill-label',
+                style: `color: ${color};`,
                 y_align: Clutter.ActorAlign.CENTER,
             });
             pill.add_child(pctLabel);
@@ -280,9 +310,9 @@ class AgentMeterIndicator extends PanelMenu.Button {
             const item = new PopupMenu.PopupBaseMenuItem({reactive: false, can_focus: false});
             item.add_child(new St.Icon({
                 gicon: iconFor(this._extension, provider.icon ?? provider.id),
-                style_class: `popup-menu-icon ${iconStyle}`,
+                style_class: 'popup-menu-icon',
+                style: `color: ${color};`,
             }));
-
             const labels = new St.BoxLayout({vertical: true, x_expand: true});
             labels.add_child(new St.Label({text: provider.label, style_class: 'agent-meter-provider'}));
             labels.add_child(new St.Label({text: limitText(provider), style_class: 'agent-meter-limit'}));
@@ -384,13 +414,12 @@ class AgentMeterIndicator extends PanelMenu.Button {
 
             const heading = new St.BoxLayout({});
             const percentage = hasNumericQuota ? Math.min(...windows.map(w => w.remaining_percent)) : 100;
-            const iconStyle = !isFresh ? 'agent-meter-stale' :
-                (hasNumericQuota && percentage <= 15) ? 'agent-meter-critical' :
-                (hasNumericQuota && percentage <= 35) ? 'agent-meter-warning' : 'agent-meter-good';
+            const color = quotaColor(percentage, isFresh);
 
             heading.add_child(new St.Icon({
                 gicon: iconFor(this._extension, provider.icon ?? provider.id),
-                style_class: `agent-meter-desktop-icon ${iconStyle}`,
+                style_class: 'agent-meter-desktop-icon',
+                style: `color: ${color};`,
             }));
             heading.add_child(new St.Label({text: provider.label, x_expand: true, style_class: 'agent-meter-provider'}));
 
@@ -410,19 +439,22 @@ class AgentMeterIndicator extends PanelMenu.Button {
 
                     const bar = new St.Widget({style_class: 'agent-meter-progress', width: PROGRESS_WIDTH});
                     const percent = Math.max(0, Math.min(100, window.remaining_percent));
-                    const barFillClass = !isFresh ? 'agent-meter-progress-fill agent-meter-progress-stale' :
-                        percent <= 15 ? 'agent-meter-progress-fill agent-meter-progress-critical' :
-                        percent <= 35 ? 'agent-meter-progress-fill agent-meter-progress-warning' : 'agent-meter-progress-fill';
+                    const windowColor = quotaColor(percent, isFresh);
 
                     bar.add_child(new St.Widget({
-                        style_class: barFillClass,
+                        style_class: isFresh ? 'agent-meter-progress-fill' : 'agent-meter-progress-fill agent-meter-progress-stale',
+                        style: `background-color: ${windowColor};`,
                         width: Math.round(PROGRESS_WIDTH * percent / 100),
                     }));
                     row.add_child(bar);
 
                     const staleSuffix = !isFresh ? ' · stale' : '';
                     const valueText = `${Math.round(percent)}%  ${window.reset_label ?? 'reset unknown'}${staleSuffix}`;
-                    row.add_child(new St.Label({text: valueText, style_class: 'agent-meter-window-value'}));
+                    row.add_child(new St.Label({
+                        text: valueText,
+                        style_class: 'agent-meter-window-value',
+                        style: `color: ${windowColor};`,
+                    }));
                     card.add_child(row);
                 }
             } else {

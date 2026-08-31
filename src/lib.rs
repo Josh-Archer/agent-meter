@@ -135,6 +135,46 @@ pub fn write_state(path: &Path, state: &AgentMeterState) -> Result<()> {
     Ok(())
 }
 
+/// Deterministic piecewise progressive color scale for remaining quota.
+///
+/// Returns a hex RGB color string, for example `#38d472`.
+///
+/// Stale/unavailable states return a neutral gray (`#8b949e`).
+/// Percentages >= 40% return stable green (`#38d472`).
+/// Percentages between 0% and 40% transition smoothly through yellow-green,
+/// yellow, orange, and clear red.
+pub fn quota_color_hex(percent: f32, is_fresh: bool) -> String {
+    if !is_fresh {
+        return "#8b949e".to_string();
+    }
+    let p = percent.clamp(0.0, 100.0);
+    if p >= 40.0 {
+        return "#38d472".to_string();
+    }
+
+    const STOPS: [(f32, (u8, u8, u8)); 5] = [
+        (0.0, (255, 59, 86)),   // Red #ff3b56
+        (10.0, (255, 102, 68)), // Red-Orange #ff6644
+        (20.0, (255, 136, 51)), // Orange #ff8833
+        (30.0, (246, 196, 69)), // Yellow #f6c445
+        (40.0, (56, 212, 114)), // Green #38d472
+    ];
+
+    for i in 0..STOPS.len() - 1 {
+        let (p0, c0) = STOPS[i];
+        let (p1, c1) = STOPS[i + 1];
+        if p >= p0 && p <= p1 {
+            let t = (p - p0) / (p1 - p0);
+            let r = (c0.0 as f32 + (c1.0 as f32 - c0.0 as f32) * t).round() as u8;
+            let g = (c0.1 as f32 + (c1.1 as f32 - c0.1 as f32) * t).round() as u8;
+            let b = (c0.2 as f32 + (c1.2 as f32 - c0.2 as f32) * t).round() as u8;
+            return format!("#{r:02x}{g:02x}{b:02x}");
+        }
+    }
+
+    "#ff3b56".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,5 +223,17 @@ mod tests {
         let mut state = sample_state();
         state.providers.push(state.providers[0].clone());
         assert!(state.validate().is_err());
+    }
+
+    #[test]
+    fn progressive_quota_color_scale_stops() {
+        assert_eq!(quota_color_hex(100.0, true), "#38d472");
+        assert_eq!(quota_color_hex(41.0, true), "#38d472");
+        assert_eq!(quota_color_hex(40.0, true), "#38d472");
+        assert_eq!(quota_color_hex(30.0, true), "#f6c445");
+        assert_eq!(quota_color_hex(20.0, true), "#ff8833");
+        assert_eq!(quota_color_hex(10.0, true), "#ff6644");
+        assert_eq!(quota_color_hex(0.0, true), "#ff3b56");
+        assert_eq!(quota_color_hex(50.0, false), "#8b949e");
     }
 }
