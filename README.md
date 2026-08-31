@@ -35,10 +35,55 @@ normal app gets focus. Drag the highlighted **Agent Meter** header to move it;
 the saved position is clamped to the monitor so the card cannot be lost
 off-screen. The top-bar row is always available.
 
-## Install prerequisites
+## Install a release on Ubuntu
 
-The current machine still needs these development dependencies before the
-GTK application can compile:
+The packaged release targets Ubuntu 24.04 on `amd64` with GNOME Shell 46.
+Open the [latest Agent Meter release](https://github.com/Josh-Archer/agent-meter/releases/latest)
+and download the file ending in `_amd64.deb`. For the current release, that is
+[`agent-meter_0.1.0_amd64.deb`](https://github.com/Josh-Archer/agent-meter/releases/download/v0.1.0/agent-meter_0.1.0_amd64.deb).
+
+Install the downloaded package and configure Agent Meter for your user:
+
+```bash
+cd ~/Downloads
+sudo apt install ./agent-meter_0.1.0_amd64.deb
+agent-meter-setup
+```
+
+`apt` installs the daemon, GTK surface, provider adapters, systemd user unit,
+and GNOME extension. `agent-meter-setup` then creates
+`~/.config/agent-meter/sources.json`, installs GitHub's pinned Copilot SDK in
+your user data directory, enables the user service, and enables the extension.
+It never copies provider credentials into the package or repository.
+
+Log out and back in once so GNOME Shell discovers the extension, then verify
+the installation:
+
+```bash
+systemctl --user status agent-meter.service
+gnome-extensions info agent-meter@local
+```
+
+The package is now registered with Ubuntu's package database. Until the
+[signed APT repository](https://github.com/Josh-Archer/agent-meter/issues/2)
+is available, update by downloading the newer `.deb` from Releases and running
+`sudo apt install ./agent-meter_NEW_VERSION_amd64.deb`; your user configuration
+is preserved. To remove the installed package:
+
+```bash
+systemctl --user disable --now agent-meter.service
+sudo apt remove agent-meter
+```
+
+The release also includes a filesystem tarball for inspection and manual
+packaging workflows. Most Ubuntu desktop users should choose the `.deb`.
+
+## Build from source
+
+### Build prerequisites
+
+Source builds need these development dependencies before the GTK application
+can compile:
 
 ```bash
 sudo apt install libgtk-4-dev build-essential pkg-config
@@ -49,7 +94,7 @@ Restart the terminal after installing Rust. The GNOME extension itself needs
 only the already-installed GNOME Shell and GJS. The Rust daemon and core tests
 do **not** need GTK4 headers.
 
-## Build and install locally
+### Build and install locally
 
 From this directory:
 
@@ -57,19 +102,6 @@ From this directory:
 cargo test
 ./install.sh
 ```
-
-For a tagged Ubuntu release, download the `.deb` from GitHub Releases and
-install and configure it with:
-
-```bash
-sudo apt install ./agent-meter_VERSION_amd64.deb
-agent-meter-setup
-```
-
-A portable
-tarball is published alongside it. The package installs the daemon, optional
-GTK surface, adapters, systemd user unit, and GNOME extension; it does not
-include provider credentials or machine-local state.
 
 GNOME Shell only discovers newly copied user extensions when it starts. Log
 out and back in once after the first install, then verify with
