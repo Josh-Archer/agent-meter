@@ -161,6 +161,10 @@
   background-color: #ff5c6c;
 }
 
+.agent-meter-progress-stale {
+  background-color: #9aa4b2;
+}
+
 .agent-meter-connect {
   margin-left: 8px;
   padding: 3px 10px;

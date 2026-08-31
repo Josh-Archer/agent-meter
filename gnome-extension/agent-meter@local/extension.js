@@ -242,18 +242,14 @@ class AgentMeterIndicator extends PanelMenu.Button {
             const isFresh = provider.status === 'fresh';
             const windows = quotaWindows(provider);
             const hasNumericQuota = windows.length > 0;
+            const percentage = hasNumericQuota ? Math.min(...windows.map(w => w.remaining_percent)) : 100;
 
             let pctText = '—';
-            if (isFresh) {
-                if (hasNumericQuota) {
-                    const percentage = Math.min(...windows.map(w => w.remaining_percent));
-                    pctText = `${Math.round(percentage)}%`;
-                } else {
-                    pctText = 'Active';
-                }
-            }
+            if (hasNumericQuota)
+                pctText = `${Math.round(percentage)}%`;
+            else if (isFresh)
+                pctText = 'Active';
 
-            const percentage = hasNumericQuota ? Math.min(...windows.map(w => w.remaining_percent)) : 100;
             const iconStyle = !isFresh ? 'agent-meter-stale' :
                 (hasNumericQuota && percentage <= 15) ? 'agent-meter-critical' :
                 (hasNumericQuota && percentage <= 35) ? 'agent-meter-warning' : 'agent-meter-good';
@@ -411,7 +407,7 @@ class AgentMeterIndicator extends PanelMenu.Button {
 
                     const bar = new St.Widget({style_class: 'agent-meter-progress', width: PROGRESS_WIDTH});
                     const percent = Math.max(0, Math.min(100, window.remaining_percent));
-                    const barFillClass = !isFresh ? 'agent-meter-progress-fill agent-meter-progress-critical' :
+                    const barFillClass = !isFresh ? 'agent-meter-progress-fill agent-meter-progress-stale' :
                         percent <= 15 ? 'agent-meter-progress-fill agent-meter-progress-critical' :
                         percent <= 35 ? 'agent-meter-progress-fill agent-meter-progress-warning' : 'agent-meter-progress-fill';
 
@@ -421,7 +417,8 @@ class AgentMeterIndicator extends PanelMenu.Button {
                     }));
                     row.add_child(bar);
 
-                    const valueText = isFresh ? `${Math.round(percent)}%  ${window.reset_label ?? ''}` : (window.reset_label ?? 'unavailable');
+                    const staleSuffix = !isFresh ? ' · stale' : '';
+                    const valueText = `${Math.round(percent)}%  ${window.reset_label ?? 'reset unknown'}${staleSuffix}`;
                     row.add_child(new St.Label({text: valueText, style_class: 'agent-meter-window-value'}));
                     card.add_child(row);
                 }
