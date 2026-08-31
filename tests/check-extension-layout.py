@@ -23,4 +23,5 @@ assert "Clutter.DragAction" not in source
 assert "width: ${percent}%" not in source
 assert "agent-meter-progress-stale" in source
 assert "if (hasNumericQuota)" in source
+assert source.count("provider.status === 'unavailable'") == 2
 print("GNOME extension layout checks passed")

@@ -174,6 +174,9 @@ Start Grok Build once after login to refresh the snapshot. Because Grok does not
 publish a live quota RPC for the CLI, snapshots older than 30 minutes are marked
 `stale` while their last known percentage remains visible. You can tune that
 honest freshness boundary with `AGENT_METER_GROK_MAX_AGE_SECONDS`.
+Stale means usage data needs refreshing, not that the saved Grok sign-in has
+expired; Agent Meter only offers **Connect** when a provider is actually
+unavailable.
 
 ### Codex
 

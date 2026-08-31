@@ -289,7 +289,10 @@ class AgentMeterIndicator extends PanelMenu.Button {
             item.add_child(labels);
             this.menu.addMenuItem(item);
 
-            if (!isFresh) {
+            // A stale snapshot means the provider was previously available but
+            // has not emitted a newer usage record. It is not an OAuth failure,
+            // so do not steer the user into a needless sign-in flow.
+            if (provider.status === 'unavailable') {
                 const connect = new PopupMenu.PopupMenuItem(`  → Connect ${provider.label}…`);
                 connect.connect('activate', () => this._startControl('connect', provider.id));
                 this.menu.addMenuItem(connect);
@@ -391,7 +394,7 @@ class AgentMeterIndicator extends PanelMenu.Button {
             }));
             heading.add_child(new St.Label({text: provider.label, x_expand: true, style_class: 'agent-meter-provider'}));
 
-            if (!isFresh) {
+            if (provider.status === 'unavailable') {
                 const connect = new St.Button({label: 'Connect', reactive: true, can_focus: true, style_class: 'agent-meter-connect'});
                 connect.connect('clicked', () => this._startControl('connect', provider.id));
                 heading.add_child(connect);
