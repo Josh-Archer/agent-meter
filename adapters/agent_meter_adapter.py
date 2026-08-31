@@ -271,6 +271,7 @@ def normalize_grok(records: list[Any], now: dt.datetime | None = None) -> dict[s
     if not candidates:
         raise ValueError("no current Grok billing snapshot; start Grok Build once to refresh it")
     observed, config = max(candidates, key=lambda item: item[0])
+    snapshot_age = max(0.0, (current - observed).total_seconds())
     reset_at, reset_text = reset_label(config["billingPeriodEnd"])
     window: dict[str, Any] = {
         "id": "weekly",
@@ -281,10 +282,15 @@ def normalize_grok(records: list[Any], now: dt.datetime | None = None) -> dict[s
         window["resets_at"] = reset_at
     if reset_text:
         window["reset_label"] = reset_text
+    stale = snapshot_age > float(os.environ.get("AGENT_METER_GROK_MAX_AGE_SECONDS", "1800"))
     return {
         "id": "grok", "label": "Grok Build", "icon": "grok",
-        "windows": [window], "status": "fresh",
-        "detail": f"Grok weekly usage snapshot from {observed.astimezone().strftime('%a %-I:%M %p')}",
+        "windows": [window], "status": "stale" if stale else "fresh",
+        "detail": (
+            f"Grok weekly usage snapshot from {observed.astimezone().strftime('%a %-I:%M %p')}"
+            if not stale else
+            f"Grok usage snapshot is {snapshot_age / 60:.0f} minutes old; start Grok Build to refresh"
+        ),
         "usage_url": "https://grok.com/#settings/usage",
     }
 

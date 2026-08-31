@@ -170,7 +170,10 @@ Grok Build writes a structured weekly billing snapshot to its private local log
 after the CLI starts. The adapter reads only records named
 `billing: fetched credits config`, selecting the newest unexpired period. It never
 opens `~/.grok/auth.json` or reads tokens, identity, prompts, or model output.
-Start Grok Build once after login to refresh the snapshot.
+Start Grok Build once after login to refresh the snapshot. Because Grok does not
+publish a live quota RPC for the CLI, snapshots older than 30 minutes are marked
+`stale` while their last known percentage remains visible. You can tune that
+honest freshness boundary with `AGENT_METER_GROK_MAX_AGE_SECONDS`.
 
 ### Codex
 

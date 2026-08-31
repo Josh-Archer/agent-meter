@@ -271,7 +271,7 @@ def test_grok_billing_snapshot() -> None:
     now = adapter.dt.datetime(2026, 8, 30, tzinfo=adapter.dt.UTC)
     state = adapter.normalize_grok([
         {"ts": "2026-08-29T20:00:00Z", "msg": "unrelated", "ctx": {}},
-        {"ts": "2026-08-29T21:00:00Z", "msg": "billing: fetched credits config", "ctx": {"config": {
+        {"ts": "2026-08-29T23:59:30Z", "msg": "billing: fetched credits config", "ctx": {"config": {
             "creditUsagePercent": 55.0,
             "billingPeriodEnd": "2026-09-05T01:45:30Z",
         }}},
@@ -291,6 +291,16 @@ def test_grok_ignores_expired_snapshot() -> None:
         assert False, "Expected ValueError"
     except ValueError:
         pass
+
+
+def test_grok_marks_old_snapshot_stale() -> None:
+    now = adapter.dt.datetime(2026, 8, 30, tzinfo=adapter.dt.UTC)
+    state = adapter.normalize_grok([{"ts": "2026-08-29T20:00:00Z", "msg": "billing: fetched credits config", "ctx": {"config": {
+        "creditUsagePercent": 55,
+        "billingPeriodEnd": "2026-09-05T00:00:00Z",
+    }}}], now=now)
+    assert state["status"] == "stale"
+    assert "old" in state["detail"]
 
 
 def test_grok_never_infers_quota_from_auth_file() -> None:
@@ -346,5 +356,6 @@ if __name__ == "__main__":
     test_copilot_env_allowance()
     test_grok_billing_snapshot()
     test_grok_ignores_expired_snapshot()
+    test_grok_marks_old_snapshot_stale()
     test_grok_never_infers_quota_from_auth_file()
     print("Adapter normalization checks passed")
