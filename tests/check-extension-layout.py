@@ -13,7 +13,7 @@ for name in ("codex", "antigravity", "grok", "copilot", "claude", "generic"):
     assert (extension / "icons" / f"{name}-symbolic.svg").is_file(), name
     assert f"'{name}'" in source, name
 for symbolic_icon in (extension / "icons").glob("*-symbolic.svg"):
-    assert "currentColor" in symbolic_icon.read_text(), symbolic_icon.name
+    assert "#f7f9fc" in symbolic_icon.read_text(), symbolic_icon.name
 assert "_backgroundGroup" in source or "Main.layoutManager.addChrome" in source
 assert "this._icons.add_child" in source
 assert "_attachDragHandle" in source

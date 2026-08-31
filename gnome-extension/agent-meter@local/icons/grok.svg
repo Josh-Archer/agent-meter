@@ -1,4 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <style>path { fill: #f7f9fc !important; }</style>
   <!-- xAI / Grok Solid Bold Emblem -->
   <path fill="currentColor" d="M10 6L37.5 42.5H48L20.5 6H10Z"/>
   <path fill="currentColor" d="M43.5 6L54 6L26.5 58H16L43.5 6Z"/>
