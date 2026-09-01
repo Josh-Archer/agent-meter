@@ -58,13 +58,13 @@ Agent Meter uses a continuous, high-contrast color scale to convey remaining quo
 The packaged release targets Ubuntu 24.04 on `amd64` with GNOME Shell 46.
 Open the [latest Agent Meter release](https://github.com/Josh-Archer/agent-meter/releases/latest)
 and download the file ending in `_amd64.deb`. For the current release, that is
-[`agent-meter_0.1.0_amd64.deb`](https://github.com/Josh-Archer/agent-meter/releases/download/v0.1.0/agent-meter_0.1.0_amd64.deb).
+[`agent-meter_0.1.1_amd64.deb`](https://github.com/Josh-Archer/agent-meter/releases/download/v0.1.1/agent-meter_0.1.1_amd64.deb).
 
 Install the downloaded package and configure Agent Meter for your user:
 
 ```bash
 cd ~/Downloads
-sudo apt install ./agent-meter_0.1.0_amd64.deb
+sudo apt install ./agent-meter_0.1.1_amd64.deb
 agent-meter-setup
 ```
 

@@ -1,4 +1,4 @@
-use agent_meter::{quota_color_hex, read_state, runtime_state_path, AgentMeterState, ProviderState};
+use agent_meter::{read_state, runtime_state_path, AgentMeterState, ProviderState};
 use gtk::prelude::*;
 use gtk::{gdk, glib};
 
