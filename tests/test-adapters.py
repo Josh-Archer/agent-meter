@@ -277,8 +277,9 @@ def test_grok_billing_snapshot() -> None:
         }}},
     ], now=now)
     assert state["status"] == "fresh"
-    # Grok's TUI displays creditUsagePercent directly as percentage remaining.
-    assert state["windows"][0]["remaining_percent"] == 55.0
+    # Grok's billing snapshot reports credit usage, while Agent Meter displays
+    # the remaining percentage.
+    assert state["windows"][0]["remaining_percent"] == 45.0
 
 
 def test_grok_ignores_expired_snapshot() -> None:

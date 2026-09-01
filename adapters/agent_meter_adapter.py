@@ -251,11 +251,10 @@ def normalize_grok(records: list[Any], now: dt.datetime | None = None) -> dict[s
             continue
         ctx = record.get("ctx")
         config = ctx.get("config") if isinstance(ctx, dict) else None
-        # Grok's CLI names this field creditUsagePercent, but renders it in the
-        # TUI as the percentage remaining. Preserve the provider's displayed
-        # value instead of treating it as percentage consumed.
-        remaining = _number(config.get("creditUsagePercent")) if isinstance(config, dict) else None
-        if remaining is None or not 0 <= remaining <= 100:
+        # Grok's local billing record reports credits *used*. Convert that to
+        # the normalized remaining percentage used by the widget.
+        used_percent = _number(config.get("creditUsagePercent")) if isinstance(config, dict) else None
+        if used_percent is None or not 0 <= used_percent <= 100:
             continue
         try:
             observed = dt.datetime.fromisoformat(str(record.get("ts")).replace("Z", "+00:00"))
@@ -276,7 +275,7 @@ def normalize_grok(records: list[Any], now: dt.datetime | None = None) -> dict[s
     window: dict[str, Any] = {
         "id": "weekly",
         "label": "Weekly",
-        "remaining_percent": round(float(config["creditUsagePercent"]), 1),
+        "remaining_percent": round(100.0 - float(config["creditUsagePercent"]), 1),
     }
     if reset_at:
         window["resets_at"] = reset_at
