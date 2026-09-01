@@ -53,20 +53,36 @@ Agent Meter uses a continuous, high-contrast color scale to convey remaining quo
 * **High Foreground Contrast**: All chosen color stops maintain strong contrast (>4.5:1 WCAG AA) against Ubuntu's black top bar (`#000000`) and the dark desktop widget background (`#161920`).
 * **Neutral Inactive State**: Stale or disconnected providers remain neutral gray (`#8b949e`) rather than mapping onto the warning/critical spectrum.
 
-## Install a release on Ubuntu
+## Install on Ubuntu
 
 The packaged release targets Ubuntu 24.04 on `amd64` with GNOME Shell 46.
-Open the [latest Agent Meter release](https://github.com/Josh-Archer/agent-meter/releases/latest)
-and download the file ending in `_amd64.deb`. For the current release, that is
-[`agent-meter_0.1.1_amd64.deb`](https://github.com/Josh-Archer/agent-meter/releases/download/v0.1.1/agent-meter_0.1.1_amd64.deb).
 
-Install the downloaded package and configure Agent Meter for your user:
+### Standard APT Repository Installation
+
+Install the cryptographic signing key and add the official Agent Meter repository:
 
 ```bash
-cd ~/Downloads
-sudo apt install ./agent-meter_0.1.1_amd64.deb
+curl -fsSL https://josh-archer.github.io/agent-meter/agent-meter-archive-keyring.gpg \
+  | sudo tee /usr/share/keyrings/agent-meter-archive-keyring.gpg >/dev/null
+
+echo "deb [arch=amd64 signed-by=/usr/share/keyrings/agent-meter-archive-keyring.gpg] https://josh-archer.github.io/agent-meter stable main" \
+  | sudo tee /etc/apt/sources.list.d/agent-meter.list >/dev/null
+
+sudo apt update
+sudo apt install agent-meter
 agent-meter-setup
 ```
+
+### Manual Package Installation
+
+Alternatively, download the `.deb` directly from the [latest Agent Meter release](https://github.com/Josh-Archer/agent-meter/releases/latest) and install it:
+
+```bash
+sudo apt install ./agent-meter_*_amd64.deb
+agent-meter-setup
+```
+
+### Setup and Verification
 
 `apt` installs the daemon, GTK surface, provider adapters, systemd user unit,
 and GNOME extension. `agent-meter-setup` then creates
@@ -82,11 +98,13 @@ systemctl --user status agent-meter.service
 gnome-extensions info agent-meter@local
 ```
 
-The package is now registered with Ubuntu's package database. Until the
-[signed APT repository](https://github.com/Josh-Archer/agent-meter/issues/2)
-is available, update by downloading the newer `.deb` from Releases and running
-`sudo apt install ./agent-meter_NEW_VERSION_amd64.deb`; your user configuration
-is preserved. To remove the installed package:
+To update through standard system package management:
+
+```bash
+sudo apt update && sudo apt upgrade
+```
+
+To remove the installed package:
 
 ```bash
 systemctl --user disable --now agent-meter.service
