@@ -141,6 +141,15 @@ unique lowercase `id`, one of the bundled `icon` values (or it falls back to
 `generic`), and one or more windows. Use `status: "fresh"`, `"stale"`,
 `"unavailable"`, or `"error"` to make data quality visible in the UI.
 
+### Visual states and provider marks
+
+Each provider uses a bundled, high-contrast monochrome vector replica of its
+recognizable product mark. These are local UI identifiers, not vendor-provided
+brand assets or an endorsement by the respective providers. While a manual
+refresh is running, the top bar shows an animated spinner. A provider command
+failure is shown as a muted gray icon and `-`; stale data instead keeps its last
+known percentage so it is not mistaken for a sign-in failure.
+
 ### Claude Code
 
 Claude Code exposes rate limits through its status-line JSON. Configure its

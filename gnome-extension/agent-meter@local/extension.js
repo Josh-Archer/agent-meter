@@ -99,6 +99,8 @@ function quotaColor(percent, isFresh = true) {
 }
 
 function limitText(provider) {
+    if (['unavailable', 'error'].includes(provider.status))
+        return 'Unavailable';
     const windows = provider.windows ?? [];
     const lowest = windows.reduce((current, entry) =>
         current === null || entry.remaining_percent < current.remaining_percent ? entry : current, null);
@@ -119,6 +121,10 @@ class AgentMeterIndicator extends PanelMenu.Button {
         this._dragGrab = null;
         this._dragHandle = null;
         this._clampIdle = null;
+        this._refreshPending = false;
+        this._spinnerActor = null;
+        this._spinnerSource = null;
+        this._spinnerAngle = 0;
 
         this._icons = new St.BoxLayout({style_class: 'agent-meter-icons'});
         this.add_child(this._icons);
@@ -255,35 +261,72 @@ class AgentMeterIndicator extends PanelMenu.Button {
         }
     }
 
+    _stopSpinner() {
+        if (this._spinnerSource) {
+            GLib.Source.remove(this._spinnerSource);
+            this._spinnerSource = null;
+        }
+        this._spinnerActor = null;
+        this._spinnerAngle = 0;
+    }
+
+    _addSpinner(container) {
+        this._stopSpinner();
+        const spinner = new St.Icon({
+            icon_name: 'process-working-symbolic',
+            style_class: 'system-status-icon agent-meter-spinner',
+            accessible_name: 'Refreshing Agent Meter usage',
+        });
+        spinner.set_pivot_point(0.5, 0.5);
+        this._spinnerActor = spinner;
+        this._spinnerSource = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 80, () => {
+            if (!this._spinnerActor)
+                return GLib.SOURCE_REMOVE;
+            this._spinnerAngle = (this._spinnerAngle + 24) % 360;
+            this._spinnerActor.rotation_angle_z = this._spinnerAngle;
+            return GLib.SOURCE_CONTINUE;
+        });
+        container.add_child(spinner);
+    }
+
     _refresh() {
         const state = this._readState();
         this._icons.destroy_all_children();
         this.menu.removeAll();
 
         if (!state?.providers?.length) {
-            this._icons.add_child(new St.Icon({icon_name: 'view-refresh-symbolic', style_class: 'system-status-icon agent-meter-panel-icon'}));
-            this.menu.addMenuItem(new PopupMenu.PopupMenuItem('Waiting for Agent Meter data…', {reactive: false}));
+            this._addSpinner(this._icons);
+            this.menu.addMenuItem(new PopupMenu.PopupMenuItem('Loading Agent Meter data…', {reactive: false}));
             this._rebuildDesktop(null);
             return;
         }
 
+        if (this._refreshPending) {
+            this._addSpinner(this._icons);
+            this.menu.addMenuItem(new PopupMenu.PopupMenuItem('Refreshing usage…', {reactive: false}));
+            this._rebuildDesktop(state);
+            return;
+        }
+        this._stopSpinner();
+
         // Top bar: Each provider gets its symbol + remaining percent / active status
         for (const provider of state.providers) {
             const isFresh = provider.status === 'fresh';
+            const isFailure = ['unavailable', 'error'].includes(provider.status);
             const windows = quotaWindows(provider);
             const hasNumericQuota = windows.length > 0;
             const percentage = hasNumericQuota ? Math.min(...windows.map(w => w.remaining_percent)) : 100;
 
-            let pctText = '—';
-            if (hasNumericQuota)
+            let pctText = '-';
+            if (!isFailure && hasNumericQuota)
                 pctText = `${Math.round(percentage)}%`;
             else if (isFresh)
                 pctText = 'Active';
 
-            const color = quotaColor(percentage, isFresh);
+            const color = isFailure ? '#8b949e' : quotaColor(percentage, isFresh);
 
             const pill = new St.BoxLayout({
-                style_class: 'agent-meter-pill',
+                style_class: isFailure ? 'agent-meter-pill agent-meter-pill-failed' : 'agent-meter-pill',
                 reactive: false,
             });
 
@@ -293,6 +336,7 @@ class AgentMeterIndicator extends PanelMenu.Button {
                 style: `color: ${color};`,
                 accessible_name: `${provider.label}: ${limitText(provider)}`,
             });
+            icon.opacity = isFailure ? 115 : 255;
             pill.add_child(icon);
 
             // Label beside icon
@@ -308,11 +352,13 @@ class AgentMeterIndicator extends PanelMenu.Button {
 
             // Menu item
             const item = new PopupMenu.PopupBaseMenuItem({reactive: false, can_focus: false});
-            item.add_child(new St.Icon({
+            const menuIcon = new St.Icon({
                 gicon: iconFor(this._extension, provider.icon ?? provider.id),
                 style_class: 'popup-menu-icon',
                 style: `color: ${color};`,
-            }));
+            });
+            menuIcon.opacity = isFailure ? 115 : 255;
+            item.add_child(menuIcon);
             const labels = new St.BoxLayout({vertical: true, x_expand: true});
             labels.add_child(new St.Label({text: provider.label, style_class: 'agent-meter-provider'}));
             labels.add_child(new St.Label({text: limitText(provider), style_class: 'agent-meter-limit'}));
@@ -370,8 +416,14 @@ class AgentMeterIndicator extends PanelMenu.Button {
             ? [executable, provider]
             : [executable, '--user', 'restart', 'agent-meter.service'];
         try {
+            if (action === 'refresh') {
+                this._refreshPending = true;
+                this._refresh();
+            }
             Gio.Subprocess.new(argv, Gio.SubprocessFlags.NONE);
             GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1500, () => {
+                if (action === 'refresh')
+                    this._refreshPending = false;
                 this._refresh();
                 return GLib.SOURCE_REMOVE;
             });
@@ -406,27 +458,29 @@ class AgentMeterIndicator extends PanelMenu.Button {
 
         for (const provider of state.providers) {
             const isFresh = provider.status === 'fresh';
+            const isFailure = ['unavailable', 'error'].includes(provider.status);
             const windows = quotaWindows(provider);
             const hasNumericQuota = windows.length > 0;
 
-            const cardClass = isFresh ? 'agent-meter-desktop-card' : 'agent-meter-desktop-card agent-meter-desktop-card-unavailable';
+            const cardClass = isFailure ? 'agent-meter-desktop-card agent-meter-desktop-card-failed' :
+                (isFresh ? 'agent-meter-desktop-card' : 'agent-meter-desktop-card agent-meter-desktop-card-unavailable');
             const card = new St.BoxLayout({vertical: true, style_class: cardClass});
 
             const heading = new St.BoxLayout({});
             const percentage = hasNumericQuota ? Math.min(...windows.map(w => w.remaining_percent)) : 100;
-            const color = quotaColor(percentage, isFresh);
+            const color = isFailure ? '#8b949e' : quotaColor(percentage, isFresh);
 
-            heading.add_child(new St.Icon({
+            const icon = new St.Icon({
                 gicon: iconFor(this._extension, provider.icon ?? provider.id),
                 style_class: 'agent-meter-desktop-icon',
                 style: `color: ${color};`,
-            }));
+            });
+            icon.opacity = isFailure ? 115 : 255;
+            heading.add_child(icon);
             heading.add_child(new St.Label({text: provider.label, x_expand: true, style_class: 'agent-meter-provider'}));
 
-            if (provider.status === 'unavailable') {
-                const connect = new St.Button({label: 'Connect', reactive: true, can_focus: true, style_class: 'agent-meter-connect'});
-                connect.connect('clicked', () => this._startControl('connect', provider.id));
-                heading.add_child(connect);
+            if (isFailure) {
+                heading.add_child(new St.Label({text: '-', style_class: 'agent-meter-failure-mark'}));
             } else if (!hasNumericQuota) {
                 heading.add_child(new St.Label({text: 'Active', style_class: 'agent-meter-badge-fresh'}));
             }
@@ -480,6 +534,7 @@ class AgentMeterIndicator extends PanelMenu.Button {
             GLib.Source.remove(this._clampIdle);
             this._clampIdle = null;
         }
+        this._stopSpinner();
         this._finishDrag(false);
         if (this._focusChangedId) {
             global.display.disconnect(this._focusChangedId);

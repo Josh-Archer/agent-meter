@@ -25,6 +25,17 @@
   margin-top: 1px;
 }
 
+.agent-meter-pill-failed {
+  opacity: 0.62;
+  background-color: rgba(139, 148, 158, 0.12);
+  border-color: rgba(139, 148, 158, 0.20);
+}
+
+.agent-meter-spinner {
+  icon-size: 16px;
+  color: #d0d5e0;
+}
+
 /* High-contrast status colors */
 .agent-meter-good {
   color: #38d472;
@@ -112,6 +123,19 @@
 .agent-meter-desktop-card-unavailable {
   opacity: 0.85;
   background-color: rgba(255, 255, 255, 0.03);
+}
+
+.agent-meter-desktop-card-failed {
+  opacity: 0.62;
+  background-color: rgba(139, 148, 158, 0.05);
+  border-color: rgba(139, 148, 158, 0.15);
+}
+
+.agent-meter-failure-mark {
+  color: #8b949e;
+  font-size: 20px;
+  font-weight: 800;
+  margin-right: 4px;
 }
 
 .agent-meter-desktop-icon {

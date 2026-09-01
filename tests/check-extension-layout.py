@@ -23,7 +23,10 @@ assert "Clutter.DragAction" not in source
 assert "width: ${percent}%" not in source
 assert "agent-meter-progress-stale" in source
 assert "if (hasNumericQuota)" in source
-assert source.count("provider.status === 'unavailable'") == 2
+assert "process-working-symbolic" in source
+assert "rotation_angle_z" in source
+assert "agent-meter-pill-failed" in source
+assert "let pctText = '-'" in source
 
 # Validate progressive quotaColor function in JS
 import subprocess
