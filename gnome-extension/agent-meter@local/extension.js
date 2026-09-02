@@ -376,6 +376,11 @@ class AgentMeterIndicator extends PanelMenu.Button {
                 connect.connect('activate', () => this._startControl('connect', provider.id));
                 this.menu.addMenuItem(connect);
             }
+            if (provider.id === 'grok' && provider.status === 'stale') {
+                const refreshGrok = new PopupMenu.PopupMenuItem('  → Open Grok Build to refresh…');
+                refreshGrok.connect('activate', () => this._startControl('open', provider.id));
+                this.menu.addMenuItem(refreshGrok);
+            }
         }
 
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
@@ -410,13 +415,14 @@ class AgentMeterIndicator extends PanelMenu.Button {
     _startControl(action, provider = null) {
         const home = GLib.get_home_dir();
         const localConnect = GLib.build_filenamev([home, '.local', 'bin', 'agent-meter-connect']);
-        const executable = action === 'connect'
+        const providerCommand = ['connect', 'open'].includes(action);
+        const executable = providerCommand
             ? (GLib.file_test(localConnect, GLib.FileTest.IS_EXECUTABLE)
                 ? localConnect
                 : (GLib.find_program_in_path('agent-meter-connect') ?? 'agent-meter-connect'))
             : 'systemctl';
-        const argv = action === 'connect'
-            ? [executable, provider]
+        const argv = providerCommand
+            ? [executable, ...(action === 'open' ? ['--mode', 'open'] : []), provider]
             : [executable, '--user', 'restart', 'agent-meter.service'];
         try {
             if (action === 'refresh') {

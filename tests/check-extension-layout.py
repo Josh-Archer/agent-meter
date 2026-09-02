@@ -29,6 +29,8 @@ assert "agent-meter-pill-failed" in source
 assert "let pctText = '—'" in source
 assert "const shouldShowQuota = isFresh && hasNumericQuota;" in source
 assert "Usage unavailable; cached data expired." in source
+assert "Open Grok Build to refresh" in source
+assert "['connect', 'open'].includes(action)" in source
 
 # Validate progressive quotaColor function in JS
 import subprocess

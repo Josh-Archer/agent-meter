@@ -23,6 +23,13 @@ COMMANDS = {
     "claude": ["claude"],
 }
 
+OPEN_COMMANDS = {
+    # Grok Build refreshes its billing snapshot during normal startup. Its CLI
+    # does not expose a non-interactive quota command, so opening its own TUI
+    # is the only supported refresh path that does not read credentials.
+    "grok": ["grok"],
+}
+
 
 def terminal_command(command: list[str]) -> list[str] | None:
     preferred = os.environ.get("TERMINAL")
@@ -40,10 +47,15 @@ def terminal_command(command: list[str]) -> list[str] | None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Launch a provider's own sign-in flow")
+    parser = argparse.ArgumentParser(description="Launch a provider-owned sign-in or refresh flow")
+    parser.add_argument("--mode", choices=("login", "open"), default="login")
     parser.add_argument("provider", choices=COMMANDS)
-    provider = parser.parse_args().provider
-    command = COMMANDS[provider]
+    args = parser.parse_args()
+    provider = args.provider
+    if args.mode == "open" and provider not in OPEN_COMMANDS:
+        print(f"{provider} does not provide a supported refresh command.", file=sys.stderr)
+        raise SystemExit(1)
+    command = (OPEN_COMMANDS if args.mode == "open" else COMMANDS)[provider]
     if not shutil.which(command[0]):
         print(f"{command[0]} is not installed; Agent Meter cannot start its sign-in flow.", file=sys.stderr)
         raise SystemExit(1)
