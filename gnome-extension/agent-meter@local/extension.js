@@ -101,6 +101,8 @@ function quotaColor(percent, isFresh = true) {
 function limitText(provider) {
     if (['unavailable', 'error'].includes(provider.status))
         return 'Unavailable';
+    if (provider.status === 'stale')
+        return 'Usage unavailable (cached data expired)';
     const windows = provider.windows ?? [];
     const lowest = windows.reduce((current, entry) =>
         current === null || entry.remaining_percent < current.remaining_percent ? entry : current, null);
@@ -316,9 +318,10 @@ class AgentMeterIndicator extends PanelMenu.Button {
             const windows = quotaWindows(provider);
             const hasNumericQuota = windows.length > 0;
             const percentage = hasNumericQuota ? Math.min(...windows.map(w => w.remaining_percent)) : 100;
+            const shouldShowQuota = isFresh && hasNumericQuota;
 
-            let pctText = '-';
-            if (!isFailure && hasNumericQuota)
+            let pctText = '—';
+            if (shouldShowQuota)
                 pctText = `${Math.round(percentage)}%`;
             else if (isFresh)
                 pctText = 'Active';
@@ -459,8 +462,10 @@ class AgentMeterIndicator extends PanelMenu.Button {
         for (const provider of state.providers) {
             const isFresh = provider.status === 'fresh';
             const isFailure = ['unavailable', 'error'].includes(provider.status);
+            const isStale = provider.status === 'stale';
             const windows = quotaWindows(provider);
             const hasNumericQuota = windows.length > 0;
+            const shouldShowQuota = isFresh && hasNumericQuota;
 
             const cardClass = isFailure ? 'agent-meter-desktop-card agent-meter-desktop-card-failed' :
                 (isFresh ? 'agent-meter-desktop-card' : 'agent-meter-desktop-card agent-meter-desktop-card-unavailable');
@@ -479,14 +484,14 @@ class AgentMeterIndicator extends PanelMenu.Button {
             heading.add_child(icon);
             heading.add_child(new St.Label({text: provider.label, x_expand: true, style_class: 'agent-meter-provider'}));
 
-            if (isFailure) {
-                heading.add_child(new St.Label({text: '-', style_class: 'agent-meter-failure-mark'}));
+            if (isFailure || isStale) {
+                heading.add_child(new St.Label({text: '—', style_class: 'agent-meter-failure-mark'}));
             } else if (!hasNumericQuota) {
                 heading.add_child(new St.Label({text: 'Active', style_class: 'agent-meter-badge-fresh'}));
             }
             card.add_child(heading);
 
-            if (hasNumericQuota) {
+            if (shouldShowQuota) {
                 for (const window of windows) {
                     const row = new St.BoxLayout({style_class: 'agent-meter-desktop-window'});
                     row.add_child(new St.Label({text: window.label, style_class: 'agent-meter-window-label'}));
@@ -513,7 +518,8 @@ class AgentMeterIndicator extends PanelMenu.Button {
                 }
             } else {
                 const detailRow = new St.BoxLayout({style_class: 'agent-meter-desktop-window'});
-                const detailText = provider.detail ?? 'Signed in and operational';
+                const detailText = isStale ? 'Usage unavailable; cached data expired.' :
+                    (provider.detail ?? 'Signed in and operational');
                 detailRow.add_child(new St.Label({text: detailText, style_class: 'agent-meter-limit', x_expand: true}));
                 card.add_child(detailRow);
             }
