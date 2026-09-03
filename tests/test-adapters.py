@@ -282,6 +282,23 @@ def test_grok_billing_snapshot() -> None:
     assert state["windows"][0]["remaining_percent"] == 45.0
 
 
+def test_omp_grok_usage_prefers_grok_build_limit() -> None:
+    state = adapter.normalize_omp_grok_usage({"reports": [{
+        "provider": "xai-oauth",
+        "limits": [
+            {"id": "xai-oauth:credits:1w", "status": "ok", "window": {"resetsAt": 1788572730851},
+             "amount": {"remaining": 35}},
+            {"id": "xai-oauth:product:grokbuild:1w", "status": "ok", "window": {"resetsAt": 1788572730851},
+             "amount": {"remainingFraction": 0.35}},
+            {"id": "xai-oauth:product:grokvoice:1w", "status": "ok", "window": {"resetsAt": 1788572730851},
+             "amount": {"remaining": 100}},
+        ],
+    }]})
+    assert state["status"] == "fresh"
+    assert state["windows"][0]["remaining_percent"] == 35.0
+    assert "OMP OAuth" in state["detail"]
+
+
 def test_grok_ignores_expired_snapshot() -> None:
     now = adapter.dt.datetime(2026, 8, 30, tzinfo=adapter.dt.UTC)
     try:
@@ -356,6 +373,7 @@ if __name__ == "__main__":
     test_copilot_sdk_quota()
     test_copilot_env_allowance()
     test_grok_billing_snapshot()
+    test_omp_grok_usage_prefers_grok_build_limit()
     test_grok_ignores_expired_snapshot()
     test_grok_marks_old_snapshot_stale()
     test_grok_never_infers_quota_from_auth_file()

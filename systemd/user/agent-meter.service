@@ -7,7 +7,7 @@ Type=simple
 # User managers do not automatically inherit the interactive shell PATH after
 # a reboot. Include locally installed CLIs so their adapters work on first
 # login rather than appearing unavailable until a terminal is opened.
-Environment="PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="PATH=%h/.local/bin:%h/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 ExecStart=%h/.local/bin/agent-meterd --watch
 Restart=on-failure
 RestartSec=5

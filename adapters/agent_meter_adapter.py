@@ -294,7 +294,83 @@ def normalize_grok(records: list[Any], now: dt.datetime | None = None) -> dict[s
     }
 
 
+def normalize_omp_grok_usage(payload: dict[str, Any]) -> dict[str, Any]:
+    """Normalize OMP's credential-safe xAI OAuth usage report.
+
+    OMP owns its OAuth session and refreshes it internally. Agent Meter only
+    consumes its usage report on stdout; it never reads OMP's auth store.
+    """
+    reports = payload.get("reports")
+    if not isinstance(reports, list):
+        raise ValueError("OMP returned no usage reports")
+    preferred: list[dict[str, Any]] = []
+    fallback: list[dict[str, Any]] = []
+    for report in reports:
+        if not isinstance(report, dict) or report.get("provider") != "xai-oauth":
+            continue
+        limits = report.get("limits")
+        if not isinstance(limits, list):
+            continue
+        for limit in limits:
+            if not isinstance(limit, dict) or limit.get("status") != "ok":
+                continue
+            identifier = str(limit.get("id", ""))
+            if ":product:grokbuild:" in identifier:
+                preferred.append(limit)
+            elif identifier == "xai-oauth:credits:1w":
+                fallback.append(limit)
+    choices = preferred or fallback
+    if not choices:
+        raise ValueError("OMP returned no Grok Build usage limit")
+    selected = choices[0]
+    amount = selected.get("amount")
+    window = selected.get("window")
+    if not isinstance(amount, dict) or not isinstance(window, dict):
+        raise ValueError("OMP Grok usage limit has no amount or reset window")
+    remaining = _number(amount.get("remaining"))
+    if remaining is None:
+        fraction = _number(amount.get("remainingFraction"))
+        remaining = fraction * 100.0 if fraction is not None else None
+    if remaining is None or not 0 <= remaining <= 100:
+        raise ValueError("OMP Grok usage limit has no usable remaining percentage")
+    reset_value = _number(window.get("resetsAt"))
+    reset_at, reset_text = reset_label(reset_value / 1000.0 if reset_value else None)
+    usage_window: dict[str, Any] = {
+        "id": "weekly", "label": "Weekly",
+        "remaining_percent": round(remaining, 1),
+    }
+    if reset_at:
+        usage_window["resets_at"] = reset_at
+    if reset_text:
+        usage_window["reset_label"] = reset_text
+    return {
+        "id": "grok", "label": "Grok Build", "icon": "grok",
+        "windows": [usage_window], "status": "fresh",
+        "detail": "Grok Build weekly usage via OMP OAuth",
+        "usage_url": "https://grok.com/#settings/usage",
+    }
+
+
 def grok() -> dict[str, Any]:
+    omp = os.environ.get("AGENT_METER_OMP_BIN", "omp")
+    if omp == "omp":
+        bun_omp = os.path.expanduser("~/.bun/bin/omp")
+        if os.path.isfile(bun_omp) and os.access(bun_omp, os.X_OK):
+            omp = bun_omp
+    try:
+        environment = os.environ.copy()
+        omp_dir = os.path.dirname(omp)
+        if omp_dir:
+            environment["PATH"] = f"{omp_dir}:{environment.get('PATH', '')}"
+        output = subprocess.run(
+            [omp, "usage", "--json", "--provider", "xai-oauth"],
+            check=True, capture_output=True, text=True, timeout=30, env=environment,
+        )
+        return normalize_omp_grok_usage(json.loads(output.stdout))
+    except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError):
+        # OMP is optional. Preserve the existing local-log fallback for users
+        # who use Grok Build directly without OMP.
+        pass
     log_path = os.environ.get("AGENT_METER_GROK_LOG", os.path.expanduser("~/.grok/logs/unified.jsonl"))
     try:
         records: list[Any] = []
