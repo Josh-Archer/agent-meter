@@ -60,4 +60,5 @@ for (const [actual, expected] of asserts) {
 console.log('quotaColor progressive scale validated successfully across all stops');
 """
 subprocess.run(["node", "-e", js_test], check=True, cwd=root)
+subprocess.run(["node", "tests/test-drag.cjs"], check=True, cwd=root)
 print("GNOME extension layout checks passed")

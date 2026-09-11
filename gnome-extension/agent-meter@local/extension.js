@@ -121,6 +121,7 @@ class AgentMeterIndicator extends PanelMenu.Button {
         this._desktopVisible = true;
         this._dragState = null;
         this._dragGrab = null;
+        this._dragEventId = null;
         this._dragHandle = null;
         this._clampIdle = null;
         this._refreshPending = false;
@@ -199,6 +200,10 @@ class AgentMeterIndicator extends PanelMenu.Button {
     }
 
     _finishDrag(persist = true) {
+        if (this._dragEventId) {
+            global.stage.disconnect(this._dragEventId);
+            this._dragEventId = null;
+        }
         this._dragHandle?.remove_style_pseudo_class('active');
         this._dragHandle = null;
         this._dragState = null;
@@ -225,25 +230,30 @@ class AgentMeterIndicator extends PanelMenu.Button {
             this._dragHandle = handle;
             handle.add_style_pseudo_class('active');
             this._dragGrab = global.stage.grab(handle);
-            return Clutter.EVENT_STOP;
-        });
-        handle.connect('motion-event', (_actor, event) => {
-            if (!this._dragState)
+            this._dragEventId = global.stage.connect('captured-event', (_stage, dragEvent) => {
+                if (dragEvent.type() === Clutter.EventType.MOTION)
+                    return this._moveDrag(dragEvent);
+                if (dragEvent.type() === Clutter.EventType.BUTTON_RELEASE &&
+                    dragEvent.get_button() === Clutter.BUTTON_PRIMARY) {
+                    this._finishDrag(true);
+                    return Clutter.EVENT_STOP;
+                }
                 return Clutter.EVENT_PROPAGATE;
-            const [pointerX, pointerY] = event.get_coords();
-            const {actorX, actorY} = this._dragState;
-            const x = actorX + pointerX - this._dragState.pointerX;
-            const y = actorY + pointerY - this._dragState.pointerY;
-            const [clampedX, clampedY] = this._clampedPosition(x, y, pointerX, pointerY);
-            this._desktop.set_position(clampedX, clampedY);
+            });
             return Clutter.EVENT_STOP;
         });
-        handle.connect('button-release-event', (_actor, event) => {
-            if (!this._dragState || event.get_button() !== Clutter.BUTTON_PRIMARY)
-                return Clutter.EVENT_PROPAGATE;
-            this._finishDrag(true);
-            return Clutter.EVENT_STOP;
-        });
+    }
+
+    _moveDrag(event) {
+        if (!this._dragState)
+            return Clutter.EVENT_PROPAGATE;
+        const [pointerX, pointerY] = event.get_coords();
+        const {actorX, actorY} = this._dragState;
+        const x = actorX + pointerX - this._dragState.pointerX;
+        const y = actorY + pointerY - this._dragState.pointerY;
+        const [clampedX, clampedY] = this._clampedPosition(x, y, pointerX, pointerY);
+        this._desktop.set_position(clampedX, clampedY);
+        return Clutter.EVENT_STOP;
     }
 
     _syncDesktopVisibility() {
@@ -292,6 +302,9 @@ class AgentMeterIndicator extends PanelMenu.Button {
     }
 
     _refresh() {
+        // Rebuilding the header destroys the active drag handle and its grab.
+        if (this._dragState)
+            return;
         const state = this._readState();
         this._icons.destroy_all_children();
         this.menu.removeAll();

@@ -12,6 +12,19 @@ provider configured in the daemon state appears both in the top bar and in the
 expanded desktop card. The panel uses true `-symbolic.svg` variants plus a
 high-contrast pill so the symbols remain visible on Ubuntu's black top bar.
 
+## Screenshots
+
+The compact top bar shows each provider's icon and remaining quota. Low quota
+turns orange or red; unavailable usage appears as an em dash.
+
+![Agent Meter top bar showing five provider icons and remaining quota](docs/screenshots/top-bar.png)
+
+Open the provider menu for reset dates, refresh controls, and desktop-widget
+settings. These screenshots show version 0.1.6; percentages are illustrative
+snapshots, not live usage.
+
+![Agent Meter provider menu with quota reset dates and widget controls](docs/screenshots/provider-menu.png)
+
 ## Design
 
 ```text
