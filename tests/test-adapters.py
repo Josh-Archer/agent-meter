@@ -318,12 +318,12 @@ def test_grok_billing_snapshot() -> None:
     assert state["windows"][0]["remaining_percent"] == 45.0
 
 
-def test_omp_grok_usage_prefers_grok_build_limit() -> None:
+def test_omp_grok_usage_uses_shared_limit() -> None:
     state = adapter.normalize_omp_grok_usage({"reports": [{
         "provider": "xai-oauth",
         "limits": [
-            {"id": "xai-oauth:credits:1w", "status": "ok", "window": {"resetsAt": 1788572730851},
-             "amount": {"remaining": 35}},
+            {"id": "xai-oauth:credits:1w", "status": "warning", "window": {"resetsAt": 1788572730851},
+             "amount": {"remaining": 4}},
             {"id": "xai-oauth:product:grokbuild:1w", "status": "ok", "window": {"resetsAt": 1788572730851},
              "amount": {"remainingFraction": 0.35}},
             {"id": "xai-oauth:product:grokvoice:1w", "status": "ok", "window": {"resetsAt": 1788572730851},
@@ -331,8 +331,29 @@ def test_omp_grok_usage_prefers_grok_build_limit() -> None:
         ],
     }]})
     assert state["status"] == "fresh"
-    assert state["windows"][0]["remaining_percent"] == 35.0
+    assert state["windows"][0]["remaining_percent"] == 4.0
+    assert len(state["windows"]) == 1
+    assert state["windows"][0]["label"] == "Shared weekly"
     assert "OMP OAuth" in state["detail"]
+
+
+def test_omp_grok_shared_statuses() -> None:
+    for status, remaining in (("ok", 52), ("warning", 4), ("exhausted", 0)):
+        payload = {"reports": [{"provider": "xai-oauth", "limits": [{
+            "id": "xai-oauth:credits:1w", "status": status,
+            "window": {"resetsAt": 1788572730851},
+            "amount": {"remainingFraction": remaining / 100},
+        }]}]}
+        state = adapter.normalize_omp_grok_usage(payload)
+        assert state["status"] == "fresh"
+        assert state["windows"][0]["remaining_percent"] == remaining
+    for identifier, status in (("xai-oauth:product:grokbuild:1w", "ok"), ("xai-oauth:credits:1w", "unknown")):
+        payload["reports"][0]["limits"][0].update(id=identifier, status=status)
+        try:
+            adapter.normalize_omp_grok_usage(payload)
+            assert False, "Do not substitute a product limit or unknown data for shared credits"
+        except ValueError:
+            pass
 
 
 def test_grok_ignores_expired_snapshot() -> None:
@@ -411,7 +432,8 @@ if __name__ == "__main__":
     test_copilot_sdk_quota()
     test_copilot_env_allowance()
     test_grok_billing_snapshot()
-    test_omp_grok_usage_prefers_grok_build_limit()
+    test_omp_grok_usage_uses_shared_limit()
+    test_omp_grok_shared_statuses()
     test_grok_ignores_expired_snapshot()
     test_grok_marks_old_snapshot_stale()
     test_grok_never_infers_quota_from_auth_file()

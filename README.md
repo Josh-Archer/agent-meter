@@ -211,6 +211,14 @@ remaining fractions and reset times without reading OAuth storage. The
 
 ### Grok
 
+When OMP is installed and signed in, Agent Meter polls its OAuth usage report
+and displays only **Shared weekly** credits. Product-specific Build, Imagine,
+and Chat quotas are not substituted for this shared pool. Low and exhausted
+quotas remain visible as valid percentages, including 0%, rather than being
+treated as connection failures. OMP manages its own session refresh; Agent
+Meter never reads its credential store.
+
+Without a usable OMP report, the legacy local-log fallback works as follows.
 Grok Build writes a structured weekly billing snapshot to its private local log
 after the CLI starts. The adapter reads only records named
 `billing: fetched credits config`, selecting the newest unexpired period. It never

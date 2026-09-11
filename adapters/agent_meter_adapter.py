@@ -306,8 +306,7 @@ def normalize_omp_grok_usage(payload: dict[str, Any]) -> dict[str, Any]:
     reports = payload.get("reports")
     if not isinstance(reports, list):
         raise ValueError("OMP returned no usage reports")
-    preferred: list[dict[str, Any]] = []
-    fallback: list[dict[str, Any]] = []
+    choices: list[dict[str, Any]] = []
     for report in reports:
         if not isinstance(report, dict) or report.get("provider") != "xai-oauth":
             continue
@@ -315,31 +314,26 @@ def normalize_omp_grok_usage(payload: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(limits, list):
             continue
         for limit in limits:
-            if not isinstance(limit, dict) or limit.get("status") != "ok":
+            if not isinstance(limit, dict) or limit.get("status") not in ("ok", "warning", "exhausted"):
                 continue
             identifier = str(limit.get("id", ""))
-            if ":product:grokbuild:" in identifier:
-                preferred.append(limit)
-            elif identifier == "xai-oauth:credits:1w":
-                fallback.append(limit)
-    choices = preferred or fallback
+            if identifier == "xai-oauth:credits:1w":
+                choices.append(limit)
     if not choices:
-        raise ValueError("OMP returned no Grok Build usage limit")
+        raise ValueError("OMP returned no shared Grok usage limit")
     selected = choices[0]
     amount = selected.get("amount")
     window = selected.get("window")
     if not isinstance(amount, dict) or not isinstance(window, dict):
         raise ValueError("OMP Grok usage limit has no amount or reset window")
-    remaining = _number(amount.get("remaining"))
-    if remaining is None:
-        fraction = _number(amount.get("remainingFraction"))
-        remaining = fraction * 100.0 if fraction is not None else None
+    fraction = _number(amount.get("remainingFraction"))
+    remaining = fraction * 100.0 if fraction is not None else _number(amount.get("remaining"))
     if remaining is None or not 0 <= remaining <= 100:
         raise ValueError("OMP Grok usage limit has no usable remaining percentage")
     reset_value = _number(window.get("resetsAt"))
     reset_at, reset_text = reset_label(reset_value / 1000.0 if reset_value else None)
     usage_window: dict[str, Any] = {
-        "id": "weekly", "label": "Weekly",
+        "id": "weekly", "label": "Shared weekly",
         "remaining_percent": round(remaining, 1),
     }
     if reset_at:
@@ -347,9 +341,9 @@ def normalize_omp_grok_usage(payload: dict[str, Any]) -> dict[str, Any]:
     if reset_text:
         usage_window["reset_label"] = reset_text
     return {
-        "id": "grok", "label": "Grok Build", "icon": "grok",
+        "id": "grok", "label": "Grok", "icon": "grok",
         "windows": [usage_window], "status": "fresh",
-        "detail": "Grok Build weekly usage via OMP OAuth",
+        "detail": "Grok shared weekly credits via OMP OAuth",
         "usage_url": "https://grok.com/#settings/usage",
     }
 
