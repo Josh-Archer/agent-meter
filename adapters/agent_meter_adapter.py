@@ -48,7 +48,7 @@ def reset_label(timestamp: int | float | str | None) -> tuple[str | None, str | 
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=dt.UTC)
     local = parsed.astimezone()
-    return parsed.astimezone(dt.UTC).isoformat().replace("+00:00", "Z"), local.strftime("%a %-I:%M %p")
+    return parsed.astimezone(dt.UTC).isoformat().replace("+00:00", "Z"), local.strftime("%a, %b %-d, %Y · %-I:%M %p %Z")
 
 
 def codex_window(name: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -213,6 +213,9 @@ def claude() -> dict[str, Any]:
         expired = False
         for window in state.get("windows", []):
             reset_at = window.get("resets_at") if isinstance(window, dict) else None
+            if isinstance(window, dict):
+                _, label = reset_label(reset_at)
+                window["reset_label"] = label or "Reset unknown"
             try:
                 parsed = dt.datetime.fromisoformat(str(reset_at).replace("Z", "+00:00"))
                 expired = expired or parsed <= now
@@ -572,7 +575,7 @@ def normalize_copilot(payload: Any, allowance: float | None = None) -> dict[str,
                 "id": "monthly",
                 "label": "Monthly",
                 "remaining_percent": round(remaining_percent, 1),
-                "reset_label": "resets 1st",
+                "reset_label": "Reset unknown",
             }
         ],
         "status": "fresh",
@@ -601,7 +604,8 @@ def copilot_allowance() -> float | None:
     return allowance
 
 
-def normalize_copilot_quota(payload: Any) -> dict[str, Any]:
+def normalize_copilot_quota(payload: Any, now: dt.datetime | None = None) -> dict[str, Any]:
+    now = now or dt.datetime.now(dt.UTC)
     snapshots = payload.get("quotaSnapshots") if isinstance(payload, dict) else None
     if not isinstance(snapshots, dict):
         raise ValueError("Copilot returned no account quota snapshots")
@@ -623,10 +627,15 @@ def normalize_copilot_quota(payload: Any) -> dict[str, Any]:
         if remaining is None:
             continue
         reset_at, reset_text = reset_label(snapshot.get("resetDate"))
+        # Observed SDK reset dates can coincide with the fetch time.
+        # An elapsed timestamp cannot describe the next quota reset.
+        if reset_at and dt.datetime.fromisoformat(reset_at.replace("Z", "+00:00")) <= now:
+            reset_at, reset_text = None, None
         window: dict[str, Any] = {
             "id": str(identifier),
             "label": labels.get(str(identifier), str(identifier).replace("_", " ").title()),
             "remaining_percent": max(0.0, min(100.0, round(remaining, 1))),
+            "reset_label": "Reset unknown",
         }
         if reset_at:
             window["resets_at"] = reset_at

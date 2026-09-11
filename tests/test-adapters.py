@@ -3,10 +3,46 @@ import json
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "adapters"))
 import agent_meter_adapter as adapter
+
+
+def test_reset_calendar_and_timezone() -> None:
+    previous = os.environ.get("TZ")
+    try:
+        os.environ["TZ"] = "America/New_York"
+        time.tzset()
+        stamp, label = adapter.reset_label("2026-09-16T21:52:00Z")
+        assert stamp == "2026-09-16T21:52:00Z"
+        assert label == "Wed, Sep 16, 2026 · 5:52 PM EDT"
+        assert adapter.reset_label("2027-01-01T02:00:00Z")[1] == "Thu, Dec 31, 2026 · 9:00 PM EST"
+        assert adapter.reset_label("2026-11-01T05:30:00Z")[1].endswith("1:30 AM EDT")
+        assert adapter.reset_label("2026-11-01T06:30:00Z")[1].endswith("1:30 AM EST")
+        assert adapter.reset_label(None) == (None, None)
+        assert adapter.reset_label("invalid") == (None, None)
+    finally:
+        if previous is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous
+        time.tzset()
+
+
+def test_copilot_reset_validity() -> None:
+    now = adapter.dt.datetime(2026, 9, 11, tzinfo=adapter.dt.UTC)
+    for reset in (None, "invalid", "2026-09-10T00:00:00Z", "2026-09-11T00:00:00Z", "2026-10-01T00:00:00Z"):
+        payload = {"quotaSnapshots": {"premium_interactions": {"remainingPercentage": 55, "resetDate": reset}}}
+        window = adapter.normalize_copilot_quota(payload, now=now)["windows"][0]
+        assert window["remaining_percent"] == 55
+        if reset == "2026-10-01T00:00:00Z":
+            assert window["resets_at"] == reset
+            assert "2026" in window["reset_label"]
+        else:
+            assert "resets_at" not in window
+            assert window["reset_label"] == "Reset unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -351,6 +387,8 @@ def test_copilot_env_allowance() -> None:
 
 
 if __name__ == "__main__":
+    test_reset_calendar_and_timezone()
+    test_copilot_reset_validity()
     test_codex()
     test_codex_rateLimitsByLimitId()
     test_agy()

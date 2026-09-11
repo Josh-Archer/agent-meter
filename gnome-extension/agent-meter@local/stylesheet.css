@@ -73,7 +73,7 @@
 
 /* Desktop Widget */
 .agent-meter-desktop {
-  width: 460px;
+  width: 620px;
   spacing: 12px;
   padding: 20px;
   border-radius: 18px;
@@ -156,7 +156,7 @@
 }
 
 .agent-meter-window-value {
-  width: 130px;
+  min-width: 330px;
   text-align: right;
   font-size: 13px;
   font-weight: bold;
