@@ -41,6 +41,7 @@ install -Dm644 "$stage/agent-meter.service" "$debroot/usr/lib/systemd/user/agent
 install -Dm755 packaging/agent-meter-setup "$debroot/usr/bin/agent-meter-setup"
 mkdir -p "$debroot/usr/share/gnome-shell/extensions"
 cp -a gnome-extension/agent-meter@local "$debroot/usr/share/gnome-shell/extensions/"
+glib-compile-schemas --strict "$debroot/usr/share/gnome-shell/extensions/agent-meter@local/schemas"
 find "$debroot/usr/share/gnome-shell/extensions/agent-meter@local" -type d -exec chmod 755 {} +
 find "$debroot/usr/share/gnome-shell/extensions/agent-meter@local" -type f -exec chmod 644 {} +
 install -Dm644 README.md "$debroot/usr/share/doc/agent-meter/README.md"

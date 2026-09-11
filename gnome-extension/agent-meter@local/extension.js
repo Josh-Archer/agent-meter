@@ -3,6 +3,8 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
 import St from 'gi://St';
+import Meta from 'gi://Meta';
+import Shell from 'gi://Shell';
 
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
@@ -119,6 +121,7 @@ class AgentMeterIndicator extends PanelMenu.Button {
         super._init(0.0, 'Agent Meter');
         this._extension = extension;
         this._desktopVisible = true;
+        this._keyboardShown = false;
         this._dragState = null;
         this._dragGrab = null;
         this._dragEventId = null;
@@ -144,8 +147,10 @@ class AgentMeterIndicator extends PanelMenu.Button {
         this._desktop.set_position(posX, posY);
 
         Main.layoutManager.addChrome(this._desktop, {affectsInputRegion: true, trackFullscreen: false});
-        this._focusChangedId = global.display.connect('notify::focus-window', () =>
-            this._syncDesktopVisibility());
+        this._focusChangedId = global.display.connect('notify::focus-window', () => {
+            this._keyboardShown = false;
+            this._syncDesktopVisibility();
+        });
 
         this._refresh();
         this._syncDesktopVisibility();
@@ -201,7 +206,7 @@ class AgentMeterIndicator extends PanelMenu.Button {
 
     _finishDrag(persist = true) {
         if (this._dragEventId) {
-            global.stage.disconnect(this._dragEventId);
+            this._dragHandle.disconnect(this._dragEventId);
             this._dragEventId = null;
         }
         this._dragHandle?.remove_style_pseudo_class('active');
@@ -230,7 +235,8 @@ class AgentMeterIndicator extends PanelMenu.Button {
             this._dragHandle = handle;
             handle.add_style_pseudo_class('active');
             this._dragGrab = global.stage.grab(handle);
-            this._dragEventId = global.stage.connect('captured-event', (_stage, dragEvent) => {
+            // Pointer grabs bypass capture; handle normal events on the grabbed actor.
+            this._dragEventId = handle.connect('event', (_actor, dragEvent) => {
                 if (dragEvent.type() === Clutter.EventType.MOTION)
                     return this._moveDrag(dragEvent);
                 if (dragEvent.type() === Clutter.EventType.BUTTON_RELEASE &&
@@ -258,7 +264,20 @@ class AgentMeterIndicator extends PanelMenu.Button {
 
     _syncDesktopVisibility() {
         if (this._desktop)
-            this._desktop.visible = this._desktopVisible && global.display.focus_window === null;
+            this._desktop.visible = this._keyboardShown ||
+                (this._desktopVisible && global.display.focus_window === null);
+    }
+
+    toggleFromKeyboard() {
+        if (this._desktop.visible) {
+            this._keyboardShown = false;
+            this._desktopVisible = false;
+        } else {
+            this._desktopVisible = true;
+            this._keyboardShown = true;
+        }
+        this._syncDesktopVisibility();
+        this._queueClamp();
     }
 
     _readState() {
@@ -578,9 +597,13 @@ export default class AgentMeterExtension extends Extension {
     enable() {
         this._indicator = new AgentMeterIndicator(this);
         Main.panel.addToStatusArea(this.uuid, this._indicator, 0, 'right');
+        Main.wm.addKeybinding('toggle-widget', this.getSettings(),
+            Meta.KeyBindingFlags.NONE, Shell.ActionMode.NORMAL,
+            () => this._indicator.toggleFromKeyboard());
     }
 
     disable() {
+        Main.wm.removeKeybinding('toggle-widget');
         this._indicator?.destroy();
         this._indicator = null;
     }

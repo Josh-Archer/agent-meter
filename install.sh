@@ -27,6 +27,7 @@ install -Dm644 adapters/agent_meter_connect.py "$bin_dir/agent_meter_connect.py"
 install -Dm644 systemd/user/agent-meter.service "$HOME/.config/systemd/user/agent-meter.service"
 mkdir -p "$extension_dir"
 cp -a gnome-extension/agent-meter@local/. "$extension_dir/"
+glib-compile-schemas --strict "$extension_dir/schemas"
 
 # GitHub's SDK bundles the matching Copilot CLI runtime and owns its OAuth flow.
 copilot_sdk_dir="$data_dir/copilot-sdk"

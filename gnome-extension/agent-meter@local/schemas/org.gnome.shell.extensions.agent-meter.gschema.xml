@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.agent-meter" path="/org/gnome/shell/extensions/agent-meter/">
+    <key name="toggle-widget" type="as">
+      <default>['&lt;Super&gt;&lt;Alt&gt;u']</default>
+      <summary>Show or hide the Agent Meter desktop widget</summary>
+    </key>
+  </schema>
+</schemalist>

@@ -48,6 +48,19 @@ normal app gets focus. Drag the highlighted **Agent Meter** header to move it;
 the saved position is clamped to the monitor so the card cannot be lost
 off-screen. The top-bar row is always available.
 
+Press **Super+Alt+U** to show or hide the widget, even over an active app.
+Switching focus to another app restores desktop-only visibility. Drag the
+**Agent Meter** header to reposition it.
+
+To change the shortcut after package installation:
+
+```bash
+gsettings --schemadir /usr/share/gnome-shell/extensions/agent-meter@local/schemas \
+  set org.gnome.shell.extensions.agent-meter toggle-widget "['<Super><Alt>u']"
+```
+
+After an extension JavaScript update, log out and back in to load the new code.
+
 ## Progressive Quota Color Scale
 
 Agent Meter uses a continuous, high-contrast color scale to convey remaining quota across all GNOME Shell and GTK surfaces:
