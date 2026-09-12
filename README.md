@@ -61,6 +61,40 @@ gsettings --schemadir /usr/share/gnome-shell/extensions/agent-meter@local/schema
 
 After an extension JavaScript update, log out and back in to load the new code.
 
+## Resource use
+
+Provider polling remains every five minutes by default. The GNOME extension
+checks local state every 15 seconds, but preserves its existing actors when
+the data and display state are unchanged. New data, update timestamps, and
+manual-refresh state still trigger rendering. Active drags defer rendering.
+
+The Rust daemon is small; external provider CLIs can use substantially more
+memory temporarily. A single sequential measurement on an Ubuntu desktop
+(September 12, 2026) produced these GNU `time` maximum-RSS results:
+
+| Adapter | Peak RSS | Elapsed |
+| --- | ---: | ---: |
+| Codex | 119 MiB | 0.60 s |
+| Antigravity | 178 MiB | 5.07 s |
+| Grok / OMP | 226 MiB | 0.97 s |
+| Copilot | 54 MiB | 0.71 s |
+| Claude cached state | 14 MiB | 0.02 s |
+
+These are single-run process high-water marks, not simultaneous process-tree
+totals or guaranteed budgets. CLI versions and caches affect the results.
+The extension shares GNOME Shell's process, so Shell's total RSS is not the
+widget's own memory usage. Systemd service memory also includes reclaimable
+filesystem cache.
+
+For a local adapter measurement without exposing provider output:
+
+```bash
+profile=$(mktemp)
+/usr/bin/time -o "$profile" -f 'peak_rss_kib=%M elapsed_s=%e exit=%x' \
+  timeout 60 agent-meter-adapter grok >/dev/null 2>/dev/null
+cat "$profile"
+```
+
 ## Progressive Quota Color Scale
 
 Agent Meter uses a continuous, high-contrast color scale to convey remaining quota across all GNOME Shell and GTK surfaces:

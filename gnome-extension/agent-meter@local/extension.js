@@ -128,6 +128,7 @@ class AgentMeterIndicator extends PanelMenu.Button {
         this._dragHandle = null;
         this._clampIdle = null;
         this._refreshPending = false;
+        this._renderKey = null;
         this._spinnerActor = null;
         this._spinnerSource = null;
         this._spinnerAngle = 0;
@@ -325,6 +326,16 @@ class AgentMeterIndicator extends PanelMenu.Button {
         if (this._dragState)
             return;
         const state = this._readState();
+        // Keep existing actors, menu state, and spinner when nothing visible changed.
+        // generated_at is retained so the displayed update time still advances.
+        const key = JSON.stringify([state, this._refreshPending, this._desktopVisible]);
+        if (key === this._renderKey)
+            return;
+        this._renderState(state);
+        this._renderKey = key;
+    }
+
+    _renderState(state) {
         this._icons.destroy_all_children();
         this.menu.removeAll();
 
