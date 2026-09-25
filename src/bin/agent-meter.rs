@@ -61,7 +61,7 @@ fn provider_card(provider: &ProviderState) -> gtk::Box {
         let reset = window.reset_label.as_deref().unwrap_or("no reset time");
         row.append(
             &gtk::Label::builder()
-                .label(&format!("{:>3.0}%  {reset}", window.remaining_percent))
+                .label(format!("{:>3.0}%  {reset}", window.remaining_percent))
                 .xalign(1.0)
                 .build(),
         );
@@ -91,7 +91,7 @@ fn render(content: &gtk::Box, state: Result<AgentMeterState, anyhow::Error>) {
             }
             content.append(
                 &gtk::Label::builder()
-                    .label(&format!(
+                    .label(format!(
                         "Updated {}",
                         state.generated_at.format("%H:%M UTC")
                     ))
@@ -102,7 +102,7 @@ fn render(content: &gtk::Box, state: Result<AgentMeterState, anyhow::Error>) {
         }
         Err(error) => content.append(
             &gtk::Label::builder()
-                .label(&format!("Waiting for Agent Meter daemon: {error}"))
+                .label(format!("Waiting for Agent Meter daemon: {error}"))
                 .wrap(true)
                 .build(),
         ),

@@ -75,6 +75,103 @@ def test_codex_rateLimitsByLimitId() -> None:
     assert state["windows"][0]["remaining_percent"] == 90.0
 
 
+def test_codex_hung_app_server_times_out() -> None:
+    with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as f:
+        f.write(f"""#!/bin/sh
+exec {sys.executable} -c "import time; time.sleep(60)"
+""")
+        mock_script = f.name
+    os.chmod(mock_script, 0o755)
+    old_bin = os.environ.get("AGENT_METER_CODEX_BIN")
+    os.environ["AGENT_METER_CODEX_BIN"] = mock_script
+    try:
+        t0 = time.monotonic()
+        state = adapter.codex(timeout=0.1)
+        elapsed = time.monotonic() - t0
+        assert elapsed < 1.0, f"Expected timeout under 1.0s, took {elapsed}s"
+        assert state["id"] == "codex"
+        assert state["status"] == "unavailable"
+        assert "timed out" in state["detail"]
+    finally:
+        if old_bin is None:
+            os.environ.pop("AGENT_METER_CODEX_BIN", None)
+        else:
+            os.environ["AGENT_METER_CODEX_BIN"] = old_bin
+        os.remove(mock_script)
+
+
+def test_codex_hung_after_init_times_out() -> None:
+    with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as f:
+        f.write(f"""#!/bin/sh
+exec {sys.executable} -c '
+import sys, json, time
+for line in sys.stdin:
+    msg = json.loads(line)
+    if msg.get("id") == 1:
+        print(json.dumps({{"id": 1, "result": {{}}}}), flush=True)
+    elif msg.get("id") == 2:
+        time.sleep(60)
+'
+""")
+        mock_script = f.name
+    os.chmod(mock_script, 0o755)
+    old_bin = os.environ.get("AGENT_METER_CODEX_BIN")
+    os.environ["AGENT_METER_CODEX_BIN"] = mock_script
+    try:
+        t0 = time.monotonic()
+        state = adapter.codex(timeout=0.1)
+        elapsed = time.monotonic() - t0
+        assert elapsed < 1.0, f"Expected timeout under 1.0s, took {elapsed}s"
+        assert state["id"] == "codex"
+        assert state["status"] == "unavailable"
+        assert "timed out" in state["detail"]
+    finally:
+        if old_bin is None:
+            os.environ.pop("AGENT_METER_CODEX_BIN", None)
+        else:
+            os.environ["AGENT_METER_CODEX_BIN"] = old_bin
+        os.remove(mock_script)
+
+
+def test_codex_app_server_success() -> None:
+    with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as f:
+        f.write(f"""#!/bin/sh
+exec {sys.executable} -c '
+import sys, json
+for line in sys.stdin:
+    msg = json.loads(line)
+    if msg.get("id") == 1:
+        print(json.dumps({{"id": 1, "result": {{}}}}), flush=True)
+    elif msg.get("id") == 2:
+        print(json.dumps({{
+            "id": 2,
+            "result": {{
+                "rateLimits": {{
+                    "planType": "pro",
+                    "primary": {{"usedPercent": 25, "windowDurationMins": 300, "resetsAt": 1788000000}},
+                    "secondary": {{"usedPercent": 40, "windowDurationMins": 10080, "resetsAt": 1788500000}}
+                }}
+            }}
+        }}), flush=True)
+'
+""")
+        mock_script = f.name
+    os.chmod(mock_script, 0o755)
+    old_bin = os.environ.get("AGENT_METER_CODEX_BIN")
+    os.environ["AGENT_METER_CODEX_BIN"] = mock_script
+    try:
+        state = adapter.codex(timeout=2.0)
+        assert state["id"] == "codex"
+        assert state["status"] == "fresh"
+        assert [window["remaining_percent"] for window in state["windows"]] == [75.0, 60.0]
+    finally:
+        if old_bin is None:
+            os.environ.pop("AGENT_METER_CODEX_BIN", None)
+        else:
+            os.environ["AGENT_METER_CODEX_BIN"] = old_bin
+        os.remove(mock_script)
+
+
 # ---------------------------------------------------------------------------
 # normalize_agy
 # ---------------------------------------------------------------------------
@@ -412,6 +509,9 @@ if __name__ == "__main__":
     test_copilot_reset_validity()
     test_codex()
     test_codex_rateLimitsByLimitId()
+    test_codex_hung_app_server_times_out()
+    test_codex_hung_after_init_times_out()
+    test_codex_app_server_success()
     test_agy()
     test_agy_disabled_bucket_skipped()
     test_agy_provider_usage_command()
