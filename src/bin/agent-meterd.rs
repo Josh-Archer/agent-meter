@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 use clap::Parser;
 use serde::Deserialize;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
@@ -138,6 +139,16 @@ enum CommandError {
     Timeout,
 }
 
+fn kill_process_group(child: &mut std::process::Child) {
+    let pid = child.id() as libc::pid_t;
+    if pid > 1 {
+        unsafe {
+            libc::killpg(pid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+}
+
 fn run_command_with_timeout(
     program: &str,
     args: &[String],
@@ -148,6 +159,7 @@ fn run_command_with_timeout(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .process_group(0)
         .spawn()
         .map_err(|_| CommandError::Unavailable)?;
 
@@ -181,20 +193,17 @@ fn run_command_with_timeout(
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if start.elapsed() >= timeout {
-                    let _ = child.kill();
+                    kill_process_group(&mut child);
                     let _ = child.wait();
-                    let _ = stdout_thread.join();
-                    let _ = stderr_thread.join();
+                    // Reader threads are detached when dropped without joining
                     return Err(CommandError::Timeout);
                 }
                 thread::sleep(poll_interval);
                 poll_interval = (poll_interval * 2).min(max_poll_interval);
             }
             Err(_) => {
-                let _ = child.kill();
+                kill_process_group(&mut child);
                 let _ = child.wait();
-                let _ = stdout_thread.join();
-                let _ = stderr_thread.join();
                 return Err(CommandError::Unavailable);
             }
         }
@@ -322,6 +331,79 @@ mod tests {
         let elapsed = t0.elapsed();
         assert!(matches!(result, Err(CommandError::Timeout)));
         assert!(elapsed < StdDuration::from_secs(2));
+    }
+
+    #[test]
+    fn command_timeout_kills_process_group_including_grandchildren() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("grandchild.pid");
+        let script = format!("sleep 30 & echo $! > '{}' && wait", pid_file.display());
+
+        let t0 = std::time::Instant::now();
+        let result = run_command_with_timeout(
+            "sh",
+            &["-c".to_string(), script],
+            StdDuration::from_millis(300),
+        );
+        let elapsed = t0.elapsed();
+
+        assert!(matches!(result, Err(CommandError::Timeout)));
+        assert!(
+            elapsed < StdDuration::from_secs(2),
+            "Expected timeout within ~2s, took {:?}",
+            elapsed
+        );
+
+        let pid_str =
+            std::fs::read_to_string(&pid_file).expect("grandchild pid file should be written");
+        let grandchild_pid: libc::pid_t = pid_str.trim().parse().expect("valid grandchild pid");
+        assert!(grandchild_pid > 0);
+
+        // Confirm the grandchild process is terminated and not surviving.
+        let check_start = std::time::Instant::now();
+        let mut surviving = true;
+        while check_start.elapsed() < StdDuration::from_millis(1000) {
+            let ret = unsafe { libc::kill(grandchild_pid, 0) };
+            if ret != 0 {
+                surviving = false;
+                break;
+            }
+            if let Ok(status) = std::fs::read_to_string(format!("/proc/{grandchild_pid}/status")) {
+                if status
+                    .lines()
+                    .any(|l| l.starts_with("State:") && l.contains('Z'))
+                {
+                    surviving = false;
+                    break;
+                }
+            } else {
+                surviving = false;
+                break;
+            }
+            thread::sleep(StdDuration::from_millis(20));
+        }
+
+        if surviving {
+            let _ = unsafe { libc::kill(grandchild_pid, libc::SIGKILL) };
+            panic!("Grandchild process {grandchild_pid} survived after timeout");
+        }
+    }
+
+    #[test]
+    fn command_timeout_with_grandchild_pipe_returns_within_two_seconds() {
+        let t0 = std::time::Instant::now();
+        let result = run_command_with_timeout(
+            "sh",
+            &["-c".to_string(), "sleep 30 & wait".to_string()],
+            StdDuration::from_millis(300),
+        );
+        let elapsed = t0.elapsed();
+        assert!(matches!(result, Err(CommandError::Timeout)));
+        assert!(
+            elapsed < StdDuration::from_secs(2),
+            "Expected timeout within ~2s, took {:?}",
+            elapsed
+        );
     }
 
     #[test]
