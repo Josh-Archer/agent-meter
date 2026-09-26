@@ -106,7 +106,7 @@ impl AgentMeterState {
 pub fn runtime_state_path() -> PathBuf {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir());
+        .unwrap_or_else(std::env::temp_dir);
     runtime.join("agent-meter").join(STATE_FILE_NAME)
 }
 

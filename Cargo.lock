@@ -11,6 +11,7 @@ dependencies = [
  "clap",
  "dirs",
  "gtk4",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",

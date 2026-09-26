@@ -11,9 +11,11 @@ import argparse
 import datetime as dt
 import json
 import os
+import selectors
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any
 
 
@@ -98,39 +100,87 @@ def normalize_codex(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def codex() -> dict[str, Any]:
+def _read_lines_with_deadline(stream: Any, deadline: float):
+    sel = selectors.DefaultSelector()
+    sel.register(stream, selectors.EVENT_READ)
+    buffer = bytearray()
+    try:
+        while True:
+            newline_idx = buffer.find(b"\n")
+            if newline_idx != -1:
+                line = buffer[:newline_idx].decode("utf-8", errors="replace")
+                del buffer[:newline_idx + 1]
+                yield line
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Codex app server timed out")
+            events = sel.select(timeout=max(0.0, remaining))
+            if not events:
+                raise TimeoutError("Codex app server timed out")
+            chunk = os.read(stream.fileno(), 4096)
+            if not chunk:
+                if buffer:
+                    yield buffer.decode("utf-8", errors="replace")
+                    buffer.clear()
+                break
+            buffer.extend(chunk)
+    finally:
+        sel.close()
+
+
+def codex(timeout: float | None = None) -> dict[str, Any]:
     command = os.environ.get("AGENT_METER_CODEX_BIN", "codex")
+    if timeout is None:
+        timeout = float(os.environ.get("AGENT_METER_CODEX_TIMEOUT", "30"))
+    deadline = time.monotonic() + timeout
     try:
         child = subprocess.Popen(
             [command, "app-server", "--stdio"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            text=True,
-            bufsize=1,
         )
         assert child.stdin is not None and child.stdout is not None
         child.stdin.write(json.dumps({
             "id": 1,
             "method": "initialize",
             "params": {"clientInfo": {"name": "agent-meter", "version": "0.1.0"}},
-        }) + "\n")
+        }).encode("utf-8") + b"\n")
         child.stdin.flush()
+        lines = _read_lines_with_deadline(child.stdout, deadline)
         # Receive the initialization response before issuing account requests.
-        for line in child.stdout:
-            if json.loads(line).get("id") == 1:
+        initialized = False
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if msg.get("id") == 1:
+                initialized = True
                 break
-        child.stdin.write(json.dumps({"method": "initialized"}) + "\n")
-        child.stdin.write(json.dumps({"id": 2, "method": "account/rateLimits/read", "params": None}) + "\n")
+        if not initialized:
+            raise RuntimeError("Codex app server ended before returning initialization response")
+        child.stdin.write(json.dumps({"method": "initialized"}).encode("utf-8") + b"\n")
+        child.stdin.write(json.dumps({"id": 2, "method": "account/rateLimits/read", "params": None}).encode("utf-8") + b"\n")
         child.stdin.flush()
-        for line in child.stdout:
-            message = json.loads(line)
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
             if message.get("id") == 2:
                 if "error" in message:
                     raise RuntimeError("Codex did not authorize a rate-limit read")
                 return normalize_codex(message["result"])
         raise RuntimeError("Codex app server ended before returning rate limits")
-    except (OSError, ValueError, KeyError, RuntimeError, json.JSONDecodeError) as error:
+    except (OSError, ValueError, KeyError, RuntimeError, json.JSONDecodeError, TimeoutError) as error:
         return unavailable("codex", "Codex", "codex", f"Codex usage unavailable: {error}")
     finally:
         if "child" in locals():
