@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 use clap::Parser;
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
@@ -219,23 +220,84 @@ fn run_command_with_timeout(
     })
 }
 
+fn deduplicate_provider_ids(providers: &mut [ProviderState]) {
+    let mut seen = HashSet::new();
+    for provider in providers.iter_mut() {
+        if !seen.insert(provider.id.clone()) {
+            let base = provider.id.clone();
+            let mut count = 2;
+            loop {
+                let candidate = format!("{base}-{count}");
+                if seen.insert(candidate.clone()) {
+                    provider.id = candidate;
+                    break;
+                }
+                count += 1;
+            }
+        }
+    }
+}
+
+fn sanitize_state(state: &mut AgentMeterState) {
+    state.version = STATE_VERSION;
+    for (index, provider) in state.providers.iter_mut().enumerate() {
+        if let Err(err) = provider.validate() {
+            let hint = if !provider.id.is_empty() {
+                provider.id.clone()
+            } else {
+                format!("provider-{index}")
+            };
+            *provider = unavailable(&hint, &format!("Invalid provider document: {err}"));
+        }
+    }
+    deduplicate_provider_ids(&mut state.providers);
+}
+
 fn refresh(config: &Config) -> AgentMeterState {
-    let providers = config
+    let mut providers: Vec<ProviderState> = config
         .sources
         .iter()
         .enumerate()
         .map(|(index, source)| match source {
-            Source::Mock { provider } => provider.clone(),
-            Source::File { path } => match std::fs::read_to_string(path)
-                .ok()
-                .and_then(|raw| serde_json::from_str::<ProviderState>(&raw).ok())
-            {
-                Some(provider) => provider,
-                None => unavailable(
-                    &format!("source-{index}"),
-                    "File adapter could not read normalized state",
-                ),
-            },
+            Source::Mock { provider } => {
+                if let Err(err) = provider.validate() {
+                    let hint = if !provider.id.is_empty() {
+                        provider.id.as_str()
+                    } else {
+                        "mock"
+                    };
+                    unavailable(hint, &format!("Invalid provider document: {err}"))
+                } else {
+                    provider.clone()
+                }
+            }
+            Source::File { path } => {
+                let fallback_hint = format!("source-{index}");
+                match std::fs::read_to_string(path) {
+                    Ok(raw) => match serde_json::from_str::<ProviderState>(&raw) {
+                        Ok(provider) => {
+                            if let Err(err) = provider.validate() {
+                                let hint = if !provider.id.is_empty() {
+                                    provider.id.as_str()
+                                } else {
+                                    &fallback_hint
+                                };
+                                unavailable(hint, &format!("Invalid provider document: {err}"))
+                            } else {
+                                provider
+                            }
+                        }
+                        Err(_) => unavailable(
+                            &fallback_hint,
+                            "File adapter could not read normalized state",
+                        ),
+                    },
+                    Err(_) => unavailable(
+                        &fallback_hint,
+                        "File adapter could not read normalized state",
+                    ),
+                }
+            }
             Source::Command {
                 program,
                 args,
@@ -250,14 +312,24 @@ fn refresh(config: &Config) -> AgentMeterState {
                 let timeout = StdDuration::from_secs(secs);
                 match run_command_with_timeout(program, args, timeout) {
                     Ok(output) if output.status.success() => {
-                        serde_json::from_slice::<ProviderState>(&output.stdout).unwrap_or_else(
-                            |_| {
-                                unavailable(
-                                    program,
-                                    "Adapter did not emit a ProviderState JSON document",
-                                )
-                            },
-                        )
+                        match serde_json::from_slice::<ProviderState>(&output.stdout) {
+                            Ok(provider) => {
+                                if let Err(err) = provider.validate() {
+                                    let hint = if !provider.id.is_empty() {
+                                        provider.id.as_str()
+                                    } else {
+                                        program.as_str()
+                                    };
+                                    unavailable(hint, &format!("Invalid provider document: {err}"))
+                                } else {
+                                    provider
+                                }
+                            }
+                            Err(_) => unavailable(
+                                program,
+                                "Adapter did not emit a ProviderState JSON document",
+                            ),
+                        }
                     }
                     Ok(_) => unavailable(program, "Adapter exited unsuccessfully"),
                     Err(CommandError::Timeout) => unavailable(program, "Adapter timed out"),
@@ -268,6 +340,9 @@ fn refresh(config: &Config) -> AgentMeterState {
             }
         })
         .collect();
+
+    deduplicate_provider_ids(&mut providers);
+
     AgentMeterState {
         version: STATE_VERSION,
         generated_at: Utc::now(),
@@ -308,9 +383,32 @@ fn main() -> Result<()> {
     if config.refresh_seconds == 0 {
         anyhow::bail!("refresh_seconds must be greater than zero");
     }
+    let mut last_good_state: Option<AgentMeterState> = None;
     loop {
-        let state = refresh(&config);
-        write_state(&state_path, &state)?;
+        let mut state = refresh(&config);
+        if let Err(validation_err) = state.validate() {
+            eprintln!(
+                "agent-meterd: state validation failed: {validation_err}; writing sanitized state"
+            );
+            sanitize_state(&mut state);
+        }
+
+        match write_state(&state_path, &state) {
+            Ok(()) => {
+                last_good_state = Some(state);
+            }
+            Err(err) => {
+                eprintln!("agent-meterd: failed to write state: {err}");
+                if let Some(good) = &last_good_state {
+                    if let Err(e) = write_state(&state_path, good) {
+                        eprintln!("agent-meterd: failed to write last good state: {e}");
+                    }
+                } else if !args.watch {
+                    return Err(err);
+                }
+            }
+        }
+
         if !args.watch {
             break;
         }
@@ -451,7 +549,13 @@ mod tests {
             id: "test-provider".into(),
             label: "Test Provider".into(),
             icon: "test".into(),
-            windows: vec![],
+            windows: vec![UsageWindow {
+                id: "daily".into(),
+                label: "Daily".into(),
+                remaining_percent: 50.0,
+                resets_at: None,
+                reset_label: None,
+            }],
             status: "fresh".into(),
             detail: None,
             usage_url: None,
@@ -469,6 +573,7 @@ mod tests {
         };
         let state = refresh(&config);
         assert_eq!(state.providers.len(), 1);
+        assert!(state.validate().is_ok());
         let provider = &state.providers[0];
         assert_eq!(provider.id, "test-provider");
         assert_eq!(provider.status, "fresh");
@@ -517,5 +622,179 @@ mod tests {
             } => assert_eq!(*timeout_seconds, Some(5)),
             _ => panic!("Expected Source::Command"),
         }
+    }
+
+    #[test]
+    fn refresh_keeps_good_provider_when_one_document_is_malformed() {
+        let good_provider = ProviderState {
+            id: "good-provider".into(),
+            label: "Good Provider".into(),
+            icon: "good".into(),
+            windows: vec![UsageWindow {
+                id: "daily".into(),
+                label: "Daily".into(),
+                remaining_percent: 75.0,
+                resets_at: None,
+                reset_label: None,
+            }],
+            status: "fresh".into(),
+            detail: None,
+            usage_url: None,
+        };
+
+        // A malformed provider document: remaining_percent exceeds 100.
+        let malformed_json = r#"{
+            "id": "bad-provider",
+            "label": "Bad Provider",
+            "icon": "bad",
+            "windows": [{
+                "id": "daily",
+                "label": "Daily",
+                "remaining_percent": 150.0
+            }],
+            "status": "fresh"
+        }"#;
+
+        let config = Config {
+            refresh_seconds: 60,
+            command_timeout_seconds: 5,
+            sources: vec![
+                Source::Mock {
+                    provider: good_provider,
+                },
+                Source::Command {
+                    program: "sh".into(),
+                    args: vec!["-c".into(), format!("echo '{malformed_json}'")],
+                    timeout_seconds: None,
+                },
+            ],
+        };
+
+        let state = refresh(&config);
+        assert_eq!(state.providers.len(), 2);
+        assert!(state.validate().is_ok());
+
+        let good = state
+            .providers
+            .iter()
+            .find(|p| p.id == "good-provider")
+            .expect("good provider should be present");
+        assert_eq!(good.status, "fresh");
+        assert_eq!(good.windows[0].remaining_percent, 75.0);
+
+        let bad = state
+            .providers
+            .iter()
+            .find(|p| p.id == "bad-provider")
+            .expect("bad provider should be replaced with unavailable entry");
+        assert_eq!(bad.status, "unavailable");
+        assert!(
+            bad.detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Invalid provider document"),
+            "Expected detail to mention invalid provider document, got: {:?}",
+            bad.detail
+        );
+    }
+
+    #[test]
+    fn refresh_two_failed_commands_avoids_duplicate_id_validation_failure() {
+        let config = Config {
+            refresh_seconds: 60,
+            command_timeout_seconds: 5,
+            sources: vec![
+                Source::Command {
+                    program: "false".into(),
+                    args: vec![],
+                    timeout_seconds: None,
+                },
+                Source::Command {
+                    program: "false".into(),
+                    args: vec![],
+                    timeout_seconds: None,
+                },
+            ],
+        };
+
+        let state = refresh(&config);
+        assert_eq!(state.providers.len(), 2);
+        assert!(
+            state.validate().is_ok(),
+            "State should validate successfully with two failed commands, but got error: {:?}",
+            state.validate().err()
+        );
+        assert_ne!(state.providers[0].id, state.providers[1].id);
+        assert_eq!(state.providers[0].status, "unavailable");
+        assert_eq!(state.providers[1].status, "unavailable");
+    }
+
+    #[test]
+    fn refresh_handles_malformed_file_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad_file = dir.path().join("bad.json");
+        std::fs::write(
+            &bad_file,
+            r#"{"id": "bad", "label": "Bad", "icon": "b", "windows": [], "status": "fresh"}"#,
+        )
+        .unwrap();
+
+        let config = Config {
+            refresh_seconds: 60,
+            command_timeout_seconds: 5,
+            sources: vec![Source::File { path: bad_file }],
+        };
+
+        let state = refresh(&config);
+        assert_eq!(state.providers.len(), 1);
+        assert!(state.validate().is_ok());
+        let provider = &state.providers[0];
+        assert_eq!(provider.status, "unavailable");
+        assert!(provider
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Invalid provider document"));
+    }
+
+    #[test]
+    fn sanitize_state_fixes_invalid_providers_and_duplicate_ids() {
+        let mut state = AgentMeterState {
+            version: 99,
+            generated_at: Utc::now(),
+            providers: vec![
+                ProviderState {
+                    id: "duplicate".into(),
+                    label: "First".into(),
+                    icon: "icon".into(),
+                    windows: vec![],
+                    status: "fresh".into(),
+                    detail: None,
+                    usage_url: None,
+                },
+                ProviderState {
+                    id: "duplicate".into(),
+                    label: "Second".into(),
+                    icon: "icon".into(),
+                    windows: vec![UsageWindow {
+                        id: "win".into(),
+                        label: "Win".into(),
+                        remaining_percent: 50.0,
+                        resets_at: None,
+                        reset_label: None,
+                    }],
+                    status: "fresh".into(),
+                    detail: None,
+                    usage_url: None,
+                },
+            ],
+        };
+
+        assert!(state.validate().is_err());
+        sanitize_state(&mut state);
+        assert!(state.validate().is_ok());
+        assert_eq!(state.version, STATE_VERSION);
+        assert_eq!(state.providers.len(), 2);
+        assert_ne!(state.providers[0].id, state.providers[1].id);
     }
 }
