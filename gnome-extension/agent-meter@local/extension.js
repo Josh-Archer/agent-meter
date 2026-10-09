@@ -468,23 +468,42 @@ class AgentMeterIndicator extends PanelMenu.Button {
             ? [executable, ...(action === 'open' ? ['--mode', 'open'] : []), provider]
             : [executable, '--user', 'restart', 'agent-meter.service'];
         try {
+            Gio.Subprocess.new(argv, Gio.SubprocessFlags.NONE);
             if (action === 'refresh') {
                 this._refreshPending = true;
                 this._refresh();
             }
-            Gio.Subprocess.new(argv, Gio.SubprocessFlags.NONE);
             GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1500, () => {
-                if (action === 'refresh')
-                    this._refreshPending = false;
-                this._refresh();
+                try {
+                    if (action === 'refresh')
+                        this._refreshPending = false;
+                    this._refresh();
+                } catch (error) {
+                    if (action === 'refresh')
+                        this._refreshPending = false;
+                    console.warn(`Agent Meter refresh completion failed: ${error.message}`);
+                }
                 return GLib.SOURCE_REMOVE;
             });
             GLib.timeout_add(GLib.PRIORITY_DEFAULT, 3500, () => {
-                this._refresh();
+                try {
+                    this._refresh();
+                } catch (error) {
+                    console.warn(`Agent Meter refresh follow-up failed: ${error.message}`);
+                }
                 return GLib.SOURCE_REMOVE;
             });
         } catch (error) {
+            if (action === 'refresh')
+                this._refreshPending = false;
             console.warn(`Agent Meter could not ${action}: ${error.message}`);
+            if (action === 'refresh') {
+                try {
+                    this._refresh();
+                } catch (refreshError) {
+                    console.warn(`Agent Meter refresh recovery failed: ${refreshError.message}`);
+                }
+            }
         }
     }
 
