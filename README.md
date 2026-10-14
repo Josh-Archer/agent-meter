@@ -35,6 +35,8 @@ local adapter(s) -> agent-meterd (Rust) -> $XDG_RUNTIME_DIR/agent-meter/state.js
                                       +-- GTK desktop app (optional alternate surface)
 ```
 
+The daemon binary is `agent-meterd`. The systemd user unit that runs it is
+`agent-meter.service` (`systemctl --user restart agent-meter.service`).
 `agent-meterd` only accepts a normalized, credential-free `ProviderState`
 document from a fixed executable or local file. It never invokes a shell,
 persists provider tokens, stores raw provider responses, or sends data off the
@@ -206,10 +208,11 @@ agent-meter-setup
 
 ### Setup and Verification
 
-`apt` installs the daemon, GTK surface, provider adapters, systemd user unit,
-and GNOME extension. `agent-meter-setup` then creates
-`~/.config/agent-meter/sources.json`, installs GitHub's pinned Copilot SDK in
-your user data directory, enables the user service, and enables the extension.
+`apt` installs the `agent-meterd` binary, the GTK surface, provider adapters,
+the systemd user unit `agent-meter.service`, and the GNOME extension.
+`agent-meter-setup` then creates `~/.config/agent-meter/sources.json`, installs
+GitHub's pinned Copilot SDK in your user data directory, enables
+`agent-meter.service`, and enables the extension.
 It never copies provider credentials into the package or repository.
 
 Log out and back in once so GNOME Shell discovers the extension, then verify
@@ -217,8 +220,12 @@ the installation:
 
 ```bash
 systemctl --user status agent-meter.service
+systemctl --user restart agent-meter.service
 gnome-extensions info agent-meter@local
 ```
+
+`agent-meter.service` is the user unit. It starts the `agent-meterd` binary.
+Restart that unit; there is no `agent-meterd` unit.
 
 To update through standard system package management:
 
@@ -375,20 +382,61 @@ or usage-dashboard information if you need an alternative source.
 
 ### Muse
 
-Muse 1.4.7 has no `usage` subcommand. Agent Meter speaks the MSP JSON-RPC
-protocol over stdio: it runs `muse serve --no-session-log` in a temporary
-directory, sends `initialize`, `initialized`, and `usage/read`, then reads
-stdout until the `usage/read` response. A `usage/changed` notification that
-arrives before that response is accepted as the same SubscriptionUsage object.
-The account `tier` is not included in the provider state.
+Muse 1.4.7 has no `usage` subcommand and no passive place to read subscription
+usage. Checked against Muse 1.4.7:
 
-`usage/read` returns `{"usage": ...}` after Muse has observed a model call, and
-`{}` when the host has observed nothing. An empty result falls back to
+- Subscription usage lives only in the memory of the host process that made a
+  model call. It arrives as a frame on the model stream
+  (`/v1/chat/completions`). After `muse exec "Reply with just: ok"`, a fresh
+  `muse serve` `usage/read` returns `{}`.
+- The files Muse writes (`session.jsonl`, `cli-*.log`,
+  `local-tracing/bootstrap/*.log`, `.msp-view-v1` journal and snapshots,
+  `session-index.db`, `session-names.db`, `cron.db`, and `model-catalog/*.json`)
+  contain no `usedPercent`, reset, or rate-limit data.
+- The binary has no account or usage HTTP endpoint. The only `api.meta.ai`
+  paths are `/v1/chat/completions`, `/v1/models`, `/v1/asr/duplex`, `/v1/logs`,
+  `/v1/traces`, and `/v1/metrics`. Adapters never read `~/.config/muse/auth.json`.
+- `~/.local/share/muse/runtime/muse/ms-*.sock` is a stale peer-messaging
+  socket, not a shared host. The TUI and `muse exec` each spawn their own
+  in-process host, so a long-lived Agent Meter `muse serve` never sees the
+  user's real calls.
+
+There is no passive persistent source. The only way to observe usage is for
+Agent Meter's own `muse serve` process to make a model call.
+
+Agent Meter still tries a read-only MSP exchange first. It runs
+`muse serve --no-session-log` in a temporary directory, sends `initialize`,
+`initialized`, and `usage/read`, and reads stdout until the `usage/read`
+response. A `usage/changed` notification that arrives before that response is
+the same SubscriptionUsage object. The account `tier` is omitted.
+
+`usage/read` returns `{"usage": ...}` only after a model call in that same
+process, and `{}` otherwise. An empty result uses
 `$XDG_STATE_HOME/agent-meter/muse-usage.json` (default
-`~/.local/state/agent-meter/muse-usage.json`) when a previous observation was
-cached. With neither an observation nor a cache, the provider is
-`unavailable` and the detail explains that Muse only reports usage after a
-model call. A missing `muse` binary or a failed `serve` is also `unavailable`.
+`~/.local/state/agent-meter/muse-usage.json`) when Agent Meter has cached an
+earlier observation. With neither an observation nor a cache, the provider is
+`unavailable`. The detail says that Muse keeps subscription usage only in the
+memory of the process that made a model call and writes none to disk. A
+missing `muse` binary or a failed `serve` is also `unavailable`.
+
+An opt-in probe can fill that cache. It is off by default. Turn it on with
+`AGENT_METER_MUSE_PROBE=1` or with `~/.config/agent-meter/muse.json`:
+
+```json
+{"probe": true, "probe_interval_seconds": 3600}
+```
+
+When the probe is on and the cache is missing or older than
+`probe_interval_seconds` (default 3600, minimum 900), Agent Meter makes one
+minimal turn on that same `muse serve` host: `session/start` with a UUIDv7
+`commandId` and a temporary `workspaceRoot`, then `turn/start` with
+`reasoningEffort` `minimal` and the text `Reply with just: ok`. After
+`usage/changed` or `turn/completed`, it calls `usage/read` again and caches
+the result. The whole probe waits at most 120 seconds. A cache younger than
+the interval is reused and no turn is sent.
+
+That probe spends quota: one minimal Muse turn per interval. Leave it off if
+you do not want Agent Meter to call the model.
 
 The rolling window is exposed as id `session` (labeled from
 `windowDurationMins`, for example `5h`). The weekly window id is `weekly`.

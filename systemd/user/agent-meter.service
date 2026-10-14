@@ -1,5 +1,7 @@
 [Unit]
 Description=Agent Meter local usage-state daemon
+# Unit name: agent-meter.service. The program is the agent-meterd binary.
+# Restart with: systemctl --user restart agent-meter.service
 After=graphical-session.target
 
 [Service]

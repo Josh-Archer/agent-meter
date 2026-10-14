@@ -1,8 +1,10 @@
 //! Shared, credential-free state for Agent Meter.
 //!
-//! Providers are deliberately external command or file sources. The daemon only
-//! stores normalized availability data; it never persists credentials or raw
-//! provider responses.
+//! Providers are deliberately external command or file sources. The daemon
+//! binary is `agent-meterd`, started by the systemd user unit
+//! `agent-meter.service` (`systemctl --user restart agent-meter.service`).
+//! It only stores normalized availability data; it never persists credentials
+//! or raw provider responses.
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};

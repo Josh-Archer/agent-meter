@@ -784,10 +784,33 @@ def copilot() -> dict[str, Any]:
 
 
 _MUSE_CLIENT_VERSION = "0.2.0"
+_MUSE_PROBE_TIMEOUT_SECONDS = 120.0
+_MUSE_PROBE_INTERVAL_DEFAULT = 3600.0
+_MUSE_PROBE_INTERVAL_MIN = 900.0
+_MUSE_PROBE_TEXT = "Reply with just: ok"
+# Muse 1.4.7 keeps SubscriptionUsage only in the memory of the host process
+# that made a model call. Nothing on disk and no other process can read it.
 _MUSE_NOT_REPORTED = (
-    "Muse has not reported subscription usage yet; "
-    "Muse only reports usage after a model call (run muse once)"
+    "Muse keeps subscription usage only in the memory of the process that made a model call "
+    "and writes none to disk; enable the opt-in probe (AGENT_METER_MUSE_PROBE=1 or "
+    "~/.config/agent-meter/muse.json) to let agent-meter make one minimal Muse call per interval"
 )
+
+
+def uuid7() -> str:
+    """Return one lowercase RFC 9562 UUIDv7.
+
+    Muse command ids are client-minted UUIDv7s. The 48-bit prefix is the Unix
+    time in milliseconds, the version nibble is 7, and the variant bits are
+    the RFC 4122 value ``10``.
+    """
+    unix_ms = int(time.time() * 1000) & ((1 << 48) - 1)
+    random_bits = int.from_bytes(os.urandom(10), "big")
+    rand_a = (random_bits >> 62) & 0xFFF
+    rand_b = random_bits & ((1 << 62) - 1)
+    value = (unix_ms << 80) | (0x7 << 76) | (rand_a << 64) | (0b10 << 62) | rand_b
+    hexed = f"{value:032x}"
+    return f"{hexed[:8]}-{hexed[8:12]}-{hexed[12:16]}-{hexed[16:20]}-{hexed[20:]}"
 
 
 def _muse_max_age_seconds() -> float:
@@ -807,6 +830,62 @@ def _muse_timeout_seconds() -> float:
 def _muse_cache_path() -> str:
     state_home = os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state"))
     return os.path.join(state_home, "agent-meter", "muse-usage.json")
+
+
+def _muse_config_path() -> str:
+    config_home = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
+    return os.path.join(config_home, "agent-meter", "muse.json")
+
+
+def _muse_config() -> dict[str, Any]:
+    try:
+        with open(_muse_config_path(), encoding="utf-8") as stream:
+            payload = json.load(stream)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _muse_probe_enabled() -> bool:
+    """The probe is off unless the env switch or the config file turns it on."""
+    raw = os.environ.get("AGENT_METER_MUSE_PROBE")
+    if raw is not None and raw.strip().lower() in {"1", "true", "yes", "on"}:
+        return True
+    return _muse_config().get("probe") is True
+
+
+def _muse_probe_interval_seconds() -> float:
+    raw = _muse_config().get("probe_interval_seconds", _MUSE_PROBE_INTERVAL_DEFAULT)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return _MUSE_PROBE_INTERVAL_DEFAULT
+    if value != value:  # NaN
+        return _MUSE_PROBE_INTERVAL_DEFAULT
+    if value < _MUSE_PROBE_INTERVAL_MIN:
+        return _MUSE_PROBE_INTERVAL_MIN
+    return value
+
+
+def _muse_cache_age_seconds() -> float | None:
+    """Age of a usable cache file, or None when there is nothing to reuse."""
+    if _read_muse_cache() is None:
+        return None
+    try:
+        age = time.time() - os.path.getmtime(_muse_cache_path())
+    except OSError:
+        return None
+    return max(0.0, age)
+
+
+def _muse_should_probe() -> bool:
+    """Probe only when opted in and the cache is missing or past the interval."""
+    if not _muse_probe_enabled():
+        return False
+    age = _muse_cache_age_seconds()
+    if age is None:
+        return True
+    return age > _muse_probe_interval_seconds()
 
 
 def _read_muse_cache() -> dict[str, Any] | None:
@@ -988,14 +1067,161 @@ def _live_muse_usage(
     return None
 
 
-def _query_muse(command: str, timeout: float) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    """Run ``muse serve --no-session-log`` and read the usage/read result.
+def _write_muse_message(stdin: Any, payload: dict[str, Any]) -> None:
+    try:
+        stdin.write(json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\n")
+        stdin.flush()
+    except BrokenPipeError as error:
+        raise RuntimeError("muse serve closed its input") from error
 
-    Notifications are skipped, except ``usage/changed`` whose params use the
-    SubscriptionUsage shape and are kept if they arrive before the response.
-    Returns ``(result, notification)``. ``result`` is ``{}`` when the host has
-    observed nothing. A captured trace whose usage result id is not 2 is still
-    accepted when stdout ends, so fixture replay works.
+
+def _iter_muse_messages(lines: Any):
+    for line in lines:
+        if not isinstance(line, str):
+            continue
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            message = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(message, dict):
+            yield message
+
+
+def _collect_usage_read(
+    messages: Any,
+    request_id: int,
+    notification: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Read until ``usage/read`` answers, keeping a prior ``usage/changed``.
+
+    A captured trace whose usage result id is not the request id is still
+    accepted when stdout ends, so fixture replay works. ``result`` is ``{}``
+    when this host process has not observed a model call.
+    """
+    result: dict[str, Any] | None = None
+    fallback: dict[str, Any] | None = None
+    saw_response = False
+    for message in messages:
+        if message.get("method") == "usage/changed" and isinstance(message.get("params"), dict):
+            notification = message["params"]
+            continue
+        if message.get("id") == request_id and ("result" in message or "error" in message):
+            if "error" in message and "result" not in message:
+                raise RuntimeError("Muse usage/read failed")
+            if isinstance(message.get("result"), dict):
+                result = message["result"]
+            saw_response = True
+            break
+        body = message.get("result")
+        if isinstance(body, dict) and isinstance(body.get("usage"), dict):
+            fallback = body
+    if not saw_response and result is None:
+        result = fallback
+    return result, notification
+
+
+def _muse_read_is_empty(result: dict[str, Any] | None) -> bool:
+    """True when this host has not observed a model call."""
+    if result == {}:
+        return True
+    if not isinstance(result, dict) or "usage" not in result:
+        return False
+    usage = result.get("usage")
+    if not isinstance(usage, dict) or not usage:
+        return True
+    return not (
+        isinstance(usage.get("window"), dict) or isinstance(usage.get("weekly"), dict)
+    )
+
+
+def _muse_session_id(result: Any) -> str:
+    session = result.get("session") if isinstance(result, dict) else None
+    session_id = session.get("sessionId") if isinstance(session, dict) else None
+    if isinstance(session_id, str) and session_id:
+        return session_id
+    raise RuntimeError("Muse session/start did not return a session id")
+
+
+def _run_muse_probe(
+    stdin: Any,
+    messages: Any,
+    workspace: str,
+    notification: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """One minimal turn on this same ``muse serve`` host, then ``usage/read``.
+
+    The turn is what puts SubscriptionUsage in this process. ``session/start``
+    and ``turn/start`` each get a fresh UUIDv7 ``commandId``.
+    """
+    session_request_id = 3
+    _write_muse_message(stdin, {
+        "jsonrpc": "2.0",
+        "id": session_request_id,
+        "method": "session/start",
+        "params": {"commandId": uuid7(), "workspaceRoot": workspace},
+    })
+    session_id: str | None = None
+    for message in messages:
+        if message.get("method") == "usage/changed" and isinstance(message.get("params"), dict):
+            notification = message["params"]
+            continue
+        if message.get("id") != session_request_id:
+            continue
+        if "error" in message and "result" not in message:
+            raise RuntimeError("Muse session/start failed")
+        session_id = _muse_session_id(message.get("result"))
+        break
+    if session_id is None:
+        raise RuntimeError("muse serve ended before starting a session")
+
+    turn_request_id = 4
+    _write_muse_message(stdin, {
+        "jsonrpc": "2.0",
+        "id": turn_request_id,
+        "method": "turn/start",
+        "params": {
+            "commandId": uuid7(),
+            "sessionId": session_id,
+            "reasoningEffort": "minimal",
+            "input": [{"type": "text", "text": _MUSE_PROBE_TEXT}],
+        },
+    })
+    settled = False
+    for message in messages:
+        method = message.get("method")
+        if method == "usage/changed" and isinstance(message.get("params"), dict):
+            notification = message["params"]
+            settled = True
+            break
+        if method == "turn/completed":
+            settled = True
+            break
+        if message.get("id") == turn_request_id and "error" in message and "result" not in message:
+            raise RuntimeError("Muse turn/start failed")
+    if not settled:
+        raise RuntimeError("muse serve ended before the probe turn completed")
+
+    read_id = 5
+    _write_muse_message(stdin, {"jsonrpc": "2.0", "id": read_id, "method": "usage/read"})
+    return _collect_usage_read(messages, read_id, notification)
+
+
+def _query_muse(
+    command: str,
+    timeout: float,
+    *,
+    probe: bool,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Run ``muse serve --no-session-log`` and read usage from that process.
+
+    The read-only attempt is ``initialize``, ``initialized``, and ``usage/read``.
+    Notifications are skipped, except ``usage/changed``, whose params use the
+    SubscriptionUsage shape. When ``probe`` is set and that read is empty, one
+    minimal turn runs on the same host before a second ``usage/read``. The
+    ``timeout`` is the deadline for the whole exchange.
     """
     deadline = time.monotonic() + timeout
     with tempfile.TemporaryDirectory(prefix="agent-meter-muse-") as workdir:
@@ -1006,39 +1232,17 @@ def _query_muse(command: str, timeout: float) -> tuple[dict[str, Any] | None, di
             stderr=subprocess.DEVNULL,
             cwd=workdir,
         )
-        notification: dict[str, Any] | None = None
-        result: dict[str, Any] | None = None
         try:
             if child.stdin is None or child.stdout is None:
                 raise RuntimeError("muse serve did not provide stdio pipes")
             for payload in _muse_requests():
-                child.stdin.write(json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\n")
-            child.stdin.flush()
-            fallback: dict[str, Any] | None = None
-            saw_response = False
-            for line in _read_lines_with_deadline(child.stdout, deadline, "Muse serve timed out"):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    message = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(message, dict):
-                    continue
-                if message.get("method") == "usage/changed" and isinstance(message.get("params"), dict):
-                    notification = message["params"]
-                    continue
-                if message.get("id") == 2 and "result" in message:
-                    if isinstance(message.get("result"), dict):
-                        result = message["result"]
-                    saw_response = True
-                    break
-                body = message.get("result")
-                if isinstance(body, dict) and isinstance(body.get("usage"), dict):
-                    fallback = body
-            if not saw_response and result is None:
-                result = fallback
+                _write_muse_message(child.stdin, payload)
+            messages = _iter_muse_messages(
+                _read_lines_with_deadline(child.stdout, deadline, "Muse serve timed out")
+            )
+            result, notification = _collect_usage_read(messages, 2, None)
+            if probe and _muse_read_is_empty(result) and _live_muse_usage(result, notification) is None:
+                result, notification = _run_muse_probe(child.stdin, messages, workdir, notification)
             return result, notification
         finally:
             if child.stdin is not None:
@@ -1055,17 +1259,42 @@ def _query_muse(command: str, timeout: float) -> tuple[dict[str, Any] | None, di
                 child.wait()
 
 
+def _muse_from_cache(now: dt.datetime | None) -> dict[str, Any] | None:
+    cached = _read_muse_cache()
+    if cached is None:
+        return None
+    return normalize_muse(cached, now=now)
+
+
 def muse(now: dt.datetime | None = None) -> dict[str, Any]:
-    """Read Muse subscription usage over the MSP stdio protocol."""
+    """Read Muse subscription usage over the MSP stdio protocol.
+
+    A fresh ``muse serve`` has no subscription usage: Muse keeps that only in
+    the memory of the process that made a model call. The read-only
+    ``usage/read`` still runs. The opt-in probe, off by default, makes one
+    minimal turn in this same host when the cache is missing or older than
+    the probe interval.
+    """
     command = os.environ.get("AGENT_METER_MUSE_BIN", "muse")
+    probe = _muse_should_probe()
+    timeout = _MUSE_PROBE_TIMEOUT_SECONDS if probe else _muse_timeout_seconds()
     try:
-        result, notification = _query_muse(command, _muse_timeout_seconds())
+        result, notification = _query_muse(command, timeout, probe=probe)
     except FileNotFoundError:
         return unavailable(
             "muse", "Muse", "generic",
             "muse is not installed; install Muse and sign in to see usage.",
         )
-    except (OSError, TimeoutError, RuntimeError, json.JSONDecodeError) as error:
+    except (OSError, TimeoutError, RuntimeError, json.JSONDecodeError, ValueError) as error:
+        try:
+            cached_state = _muse_from_cache(now)
+        except (TypeError, ValueError) as cache_error:
+            return unavailable(
+                "muse", "Muse", "generic",
+                f"Muse usage unavailable: {cache_error}",
+            )
+        if cached_state is not None:
+            return cached_state
         return unavailable(
             "muse", "Muse", "generic",
             f"Muse usage unavailable: {error}",
@@ -1085,20 +1314,19 @@ def muse(now: dt.datetime | None = None) -> dict[str, Any]:
                 f"Muse usage unavailable: {error}",
             )
 
-    # usage/read returned an empty observation. Muse only fills this in after
-    # a model call, so a fresh host falls back to the last cached snapshot.
-    if result == {}:
-        cached = _read_muse_cache()
-        if cached is not None:
-            try:
-                return normalize_muse(cached, now=now)
-            except (TypeError, ValueError) as error:
-                return unavailable(
-                    "muse", "Muse", "generic",
-                    f"Muse usage unavailable: {error}",
-                )
+    # usage/read observed nothing in this process. Another Muse process's
+    # calls are not visible here. Reuse agent-meter's own cache when it exists.
+    try:
+        cached_state = _muse_from_cache(now)
+    except (TypeError, ValueError) as error:
+        return unavailable(
+            "muse", "Muse", "generic",
+            f"Muse usage unavailable: {error}",
+        )
+    if cached_state is not None:
+        return cached_state
+    if _muse_read_is_empty(result):
         return unavailable("muse", "Muse", "generic", _MUSE_NOT_REPORTED)
-
     return unavailable(
         "muse", "Muse", "generic",
         "Muse usage unavailable: muse serve ended before reporting usage",

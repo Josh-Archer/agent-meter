@@ -18,7 +18,8 @@ struct Args {
     /// Write a single refresh and exit.
     #[arg(long, conflicts_with = "watch")]
     once: bool,
-    /// Refresh indefinitely; intended for a systemd --user service.
+    /// Refresh indefinitely. The systemd user unit is agent-meter.service;
+    /// this binary is agent-meterd (`systemctl --user restart agent-meter.service`).
     #[arg(long)]
     watch: bool,
     /// Source configuration. Defaults to $XDG_CONFIG_HOME/agent-meter/sources.json.

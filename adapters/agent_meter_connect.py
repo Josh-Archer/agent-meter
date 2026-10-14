@@ -62,7 +62,7 @@ def main() -> None:
         print(f"{command[0]} is not installed; Agent Meter cannot start its sign-in flow.", file=sys.stderr)
         raise SystemExit(1)
 
-    # Wrap the command so that when sign-in finishes, agent-meter daemon immediately refreshes
+    # After sign-in, restart the user unit agent-meter.service (the agent-meterd binary).
     shell_cmd = shlex.join(command) + "; systemctl --user restart agent-meter.service"
     wrapped = ["bash", "-c", shell_cmd]
     terminal = terminal_command(wrapped)

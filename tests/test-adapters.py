@@ -46,6 +46,99 @@ if data and not data.endswith("\\n"):
 sys.stdout.flush()
 """
 
+# In-memory Muse: usage/read stays {} until a turn runs in this same process.
+MUSE_MEMORY_FAKE = """#!/usr/bin/env python3
+import json
+import os
+import sys
+
+if sys.argv[1:3] != ["serve", "--no-session-log"]:
+    sys.stderr.write("expected: serve --no-session-log\\n")
+    raise SystemExit(2)
+
+with open(os.environ["MUSE_USAGE_FIXTURE"], encoding="utf-8") as handle:
+    rows = [json.loads(line) for line in handle if line.strip()]
+usage = None
+changed = None
+for row in rows:
+    if row.get("method") == "usage/changed":
+        changed = row
+    result = row.get("result")
+    if isinstance(result, dict) and isinstance(result.get("usage"), dict):
+        usage = result["usage"]
+if usage is None:
+    sys.stderr.write("fixture has no usage\\n")
+    raise SystemExit(2)
+
+turned = False
+received = []
+log_path = os.environ.get("MUSE_REQUESTS_LOG")
+
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\\n")
+    sys.stdout.flush()
+
+
+def remember(msg):
+    received.append(msg)
+    if log_path:
+        with open(log_path, "w", encoding="utf-8") as handle:
+            json.dump(received, handle)
+
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        msg = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    remember(msg)
+    method = msg.get("method")
+    if method == "initialized":
+        continue
+    if method == "initialize":
+        emit({
+            "jsonrpc": "2.0",
+            "id": msg.get("id"),
+            "result": {"serverInfo": {"name": "muse", "version": "1.4.7"}},
+        })
+        continue
+    if method == "usage/read":
+        if turned:
+            emit({"jsonrpc": "2.0", "id": msg.get("id"), "result": {"usage": usage}})
+        else:
+            emit({"jsonrpc": "2.0", "id": msg.get("id"), "result": {}})
+        continue
+    if method == "session/start":
+        emit({
+            "jsonrpc": "2.0",
+            "id": msg.get("id"),
+            "result": {"session": {"sessionId": "sess-memory"}},
+        })
+        continue
+    if method == "turn/start":
+        turned = True
+        emit({
+            "jsonrpc": "2.0",
+            "id": msg.get("id"),
+            "result": {"status": "accepted", "turnId": "turn-memory"},
+        })
+        if changed is not None:
+            emit(changed)
+        else:
+            emit({"jsonrpc": "2.0", "method": "turn/completed", "params": {"terminal": "completed"}})
+        continue
+"""
+
+MUSE_UNAVAILABLE_REASON = (
+    "Muse keeps subscription usage only in the memory of the process that made a model call "
+    "and writes none to disk; enable the opt-in probe (AGENT_METER_MUSE_PROBE=1 or "
+    "~/.config/agent-meter/muse.json) to let agent-meter make one minimal Muse call per interval"
+)
+
 
 @contextmanager
 def patched_env(updates: dict[str, str | None]):
@@ -590,18 +683,65 @@ def test_copilot_env_allowance() -> None:
 # normalize_muse — real MSP SubscriptionUsage samples
 # ---------------------------------------------------------------------------
 
-def _muse_env(tmp: str, fixture: Path, requests_log: Path | None = None) -> dict[str, str]:
+def _muse_env(tmp: str, fixture: Path, requests_log: Path | None = None) -> dict[str, str | None]:
     fake = Path(tmp) / "muse"
     _write_executable(fake, MUSE_FAKE)
-    env = {
+    env: dict[str, str | None] = {
         "AGENT_METER_MUSE_BIN": str(fake),
         "AGENT_METER_MUSE_TIMEOUT": "5",
         "MUSE_FIXTURE": str(fixture),
         "XDG_STATE_HOME": str(Path(tmp) / "state"),
+        "XDG_CONFIG_HOME": str(Path(tmp) / "config"),
+        "AGENT_METER_MUSE_PROBE": None,
     }
     if requests_log is not None:
         env["MUSE_REQUESTS_LOG"] = str(requests_log)
     return env
+
+
+def _muse_memory_env(tmp: str, requests_log: Path | None = None) -> dict[str, str | None]:
+    fake = Path(tmp) / "muse"
+    _write_executable(fake, MUSE_MEMORY_FAKE)
+    env: dict[str, str | None] = {
+        "AGENT_METER_MUSE_BIN": str(fake),
+        "AGENT_METER_MUSE_TIMEOUT": "5",
+        "MUSE_USAGE_FIXTURE": str(FIXTURES / "muse-usage-observed.jsonl"),
+        "XDG_STATE_HOME": str(Path(tmp) / "state"),
+        "XDG_CONFIG_HOME": str(Path(tmp) / "config"),
+        "AGENT_METER_MUSE_PROBE": None,
+    }
+    if requests_log is not None:
+        env["MUSE_REQUESTS_LOG"] = str(requests_log)
+    return env
+
+
+def _muse_cache_path(tmp: str) -> Path:
+    return Path(tmp) / "state" / "agent-meter" / "muse-usage.json"
+
+
+def _seed_muse_cache(tmp: str, age_seconds: float) -> None:
+    usage = json.loads(json.dumps(_observed_muse_usage()))
+    usage.pop("tier", None)
+    path = _muse_cache_path(tmp)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(usage) + "\n", encoding="utf-8")
+    stamp = time.time() - age_seconds
+    os.utime(path, (stamp, stamp))
+
+
+def _write_muse_config(tmp: str, payload: dict) -> None:
+    path = Path(tmp) / "config" / "agent-meter" / "muse.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _assert_uuid7(value: object) -> None:
+    assert isinstance(value, str)
+    parts = value.split("-")
+    assert [len(part) for part in parts] == [8, 4, 4, 4, 12]
+    int(value.replace("-", ""), 16)
+    assert value[14] == "7"
+    assert value[19] in "89ab"
 
 
 def test_muse_empty_raises() -> None:
@@ -672,7 +812,11 @@ def test_muse_used_percent_above_100_clamps() -> None:
 
 
 def test_muse_replay_observed_fixture() -> None:
-    """A fake muse replays muse-usage-observed.jsonl over stdio."""
+    """Read-only usage/read is honored when this host process already has usage.
+
+    The fixture replays an observation that already lives in this process. A
+    later muse serve process does not inherit it.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         requests_log = Path(tmp) / "requests.json"
         env = _muse_env(tmp, FIXTURES / "muse-usage-observed.jsonl", requests_log)
@@ -721,12 +865,20 @@ def test_muse_empty_read_is_unavailable_without_cache() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         with patched_env(_muse_env(tmp, FIXTURES / "muse-usage-read.jsonl")):
             state = adapter.muse()
+        cache_exists = _muse_cache_path(tmp).exists()
     assert state["status"] == "unavailable"
     assert state["id"] == "muse"
+    assert state["detail"] == MUSE_UNAVAILABLE_REASON
     assert state["detail"] == adapter._MUSE_NOT_REPORTED
+    assert not cache_exists
 
 
 def test_muse_empty_read_falls_back_to_cache() -> None:
+    """An empty usage/read reuses agent-meter's cache, not Muse's disk.
+
+    The second serve is a new process and returns {}. The numbers come from
+    the cache file the first call wrote.
+    """
     usage = _observed_muse_usage()
     now = _ms(usage["observedAtMs"]) + adapter.dt.timedelta(hours=2)
     with tempfile.TemporaryDirectory() as tmp:
@@ -761,11 +913,134 @@ def test_muse_serve_failure_is_unavailable() -> None:
             "AGENT_METER_MUSE_BIN": str(fake),
             "AGENT_METER_MUSE_TIMEOUT": "5",
             "XDG_STATE_HOME": str(Path(tmp) / "state"),
+            "XDG_CONFIG_HOME": str(Path(tmp) / "config"),
+            "AGENT_METER_MUSE_PROBE": None,
         }):
             state = adapter.muse()
     assert state["status"] == "unavailable"
     assert state["id"] == "muse"
     assert state["detail"]
+
+
+def test_uuid7_helper() -> None:
+    first = adapter.uuid7()
+    second = adapter.uuid7()
+    _assert_uuid7(first)
+    _assert_uuid7(second)
+    assert first != second
+    unix_ms = int(first.replace("-", "")[:12], 16)
+    assert abs(unix_ms - int(time.time() * 1000)) < 5000
+
+
+def test_muse_probe_off_memory_host_is_unavailable() -> None:
+    """A fresh host returns {} and the probe does not run or write a cache."""
+    with tempfile.TemporaryDirectory() as tmp:
+        requests_log = Path(tmp) / "requests.json"
+        env = _muse_memory_env(tmp, requests_log)
+        with patched_env(env):
+            state = adapter.muse()
+        requests = json.loads(requests_log.read_text(encoding="utf-8"))
+        cache_exists = _muse_cache_path(tmp).exists()
+    assert state["status"] == "unavailable"
+    assert state["detail"] == MUSE_UNAVAILABLE_REASON
+    assert [item.get("method") for item in requests] == ["initialize", "initialized", "usage/read"]
+    assert not cache_exists
+
+
+def test_muse_probe_on_sends_one_turn_and_caches() -> None:
+    """The opt-in probe makes one minimal turn in the same muse serve process."""
+    usage = _observed_muse_usage()
+    now = _ms(usage["observedAtMs"]) + adapter.dt.timedelta(minutes=1)
+    with tempfile.TemporaryDirectory() as tmp:
+        requests_log = Path(tmp) / "requests.json"
+        env = _muse_memory_env(tmp, requests_log)
+        env["AGENT_METER_MUSE_PROBE"] = "1"
+        with patched_env(env):
+            state = adapter.muse(now=now)
+        requests = json.loads(requests_log.read_text(encoding="utf-8"))
+        cache_path = _muse_cache_path(tmp)
+        cache = json.loads(cache_path.read_text(encoding="utf-8"))
+        cache_text = cache_path.read_text(encoding="utf-8")
+        # A new process does not keep the turn's in-memory usage.
+        cache_path.unlink()
+        env["AGENT_METER_MUSE_PROBE"] = None
+        with patched_env(env):
+            fresh = adapter.muse(now=now)
+        assert not cache_path.exists()
+    methods = [item.get("method") for item in requests]
+    assert methods == [
+        "initialize", "initialized", "usage/read",
+        "session/start", "turn/start", "usage/read",
+    ]
+    session = requests[3]["params"]
+    turn = requests[4]["params"]
+    _assert_uuid7(session["commandId"])
+    _assert_uuid7(turn["commandId"])
+    assert session["commandId"] != turn["commandId"]
+    assert os.path.isabs(session["workspaceRoot"])
+    assert turn["sessionId"] == "sess-memory"
+    assert turn["reasoningEffort"] == "minimal"
+    assert turn["input"] == [{"type": "text", "text": "Reply with just: ok"}]
+    assert state["status"] == "fresh"
+    assert [window["id"] for window in state["windows"]] == ["session", "weekly"]
+    assert state["windows"][0]["remaining_percent"] == 100.0
+    assert state["windows"][1]["remaining_percent"] == 52.0
+    assert "tier" not in cache
+    assert "REDACTED_TIER" not in cache_text
+    assert cache["observedAtMs"] == usage["observedAtMs"]
+    assert fresh["status"] == "unavailable"
+    assert fresh["detail"] == MUSE_UNAVAILABLE_REASON
+
+
+def test_muse_probe_skips_turn_when_cache_is_fresh() -> None:
+    usage = _observed_muse_usage()
+    now = _ms(usage["observedAtMs"]) + adapter.dt.timedelta(minutes=1)
+    with tempfile.TemporaryDirectory() as tmp:
+        requests_log = Path(tmp) / "requests.json"
+        _seed_muse_cache(tmp, age_seconds=60)
+        env = _muse_memory_env(tmp, requests_log)
+        env["AGENT_METER_MUSE_PROBE"] = "1"
+        with patched_env(env):
+            state = adapter.muse(now=now)
+        requests = json.loads(requests_log.read_text(encoding="utf-8"))
+    assert [item.get("method") for item in requests] == ["initialize", "initialized", "usage/read"]
+    assert state["status"] == "fresh"
+    assert state["windows"][0]["remaining_percent"] == 100.0
+    assert state["windows"][1]["remaining_percent"] == 52.0
+
+
+def test_muse_probe_interval_minimum_suppresses_a_short_config() -> None:
+    """probe_interval_seconds below 900 is raised to 900, so a 500s cache waits."""
+    usage = _observed_muse_usage()
+    now = _ms(usage["observedAtMs"]) + adapter.dt.timedelta(minutes=1)
+    with tempfile.TemporaryDirectory() as tmp:
+        requests_log = Path(tmp) / "requests.json"
+        _write_muse_config(tmp, {"probe": True, "probe_interval_seconds": 60})
+        _seed_muse_cache(tmp, age_seconds=500)
+        with patched_env(_muse_memory_env(tmp, requests_log)):
+            state = adapter.muse(now=now)
+        requests = json.loads(requests_log.read_text(encoding="utf-8"))
+    assert "turn/start" not in [item.get("method") for item in requests]
+    assert "session/start" not in [item.get("method") for item in requests]
+    assert state["status"] == "fresh"
+
+
+def test_muse_probe_runs_when_cache_is_older_than_interval() -> None:
+    usage = _observed_muse_usage()
+    now = _ms(usage["observedAtMs"]) + adapter.dt.timedelta(minutes=1)
+    with tempfile.TemporaryDirectory() as tmp:
+        requests_log = Path(tmp) / "requests.json"
+        _write_muse_config(tmp, {"probe": True, "probe_interval_seconds": 900})
+        _seed_muse_cache(tmp, age_seconds=1000)
+        with patched_env(_muse_memory_env(tmp, requests_log)):
+            state = adapter.muse(now=now)
+        requests = json.loads(requests_log.read_text(encoding="utf-8"))
+        cache_text = _muse_cache_path(tmp).read_text(encoding="utf-8")
+    methods = [item.get("method") for item in requests]
+    assert methods.count("turn/start") == 1
+    assert methods.count("session/start") == 1
+    assert state["status"] == "fresh"
+    assert "tier" not in cache_text
 
 
 def test_grok_omp_data_is_always_fresh() -> None:
@@ -915,7 +1190,11 @@ def test_copilot_quota_sample_has_no_trustworthy_reset() -> None:
     for window in state["windows"]:
         assert "resets_at" not in window
         assert window["reset_label"] == "Reset unknown"
-    assert state["windows"][0]["remaining_percent"] == 0.0
+    premium = state["windows"][0]
+    assert premium["id"] == "premium_interactions"
+    assert premium["remaining_percent"] == 0.0
+    assert state["status"] == "fresh"
+    assert "200 of 200 used" in state["detail"]
 
 
 def test_resets_at_iso8601_all_providers() -> None:
@@ -1135,6 +1414,12 @@ if __name__ == "__main__":
     test_muse_empty_read_falls_back_to_cache()
     test_muse_unavailable_when_missing()
     test_muse_serve_failure_is_unavailable()
+    test_uuid7_helper()
+    test_muse_probe_off_memory_host_is_unavailable()
+    test_muse_probe_on_sends_one_turn_and_caches()
+    test_muse_probe_skips_turn_when_cache_is_fresh()
+    test_muse_probe_interval_minimum_suppresses_a_short_config()
+    test_muse_probe_runs_when_cache_is_older_than_interval()
     test_resets_at_iso8601_all_providers()
     test_json_schema_output()
     print("Adapter normalization checks passed")
