@@ -21,6 +21,8 @@ COMMANDS = {
     "copilot": [os.path.expanduser("~/.local/share/agent-meter/copilot-sdk/node_modules/.bin/copilot")],
     # Claude Code's /login is an interactive slash command, so start its TUI.
     "claude": ["claude"],
+    # Muse login flow.
+    "muse": ["muse", "login"],
 }
 
 OPEN_COMMANDS = {

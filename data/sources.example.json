@@ -22,6 +22,11 @@
       "args": ["copilot"]
     },
     {
+      "kind": "command",
+      "program": "/home/you/.local/bin/agent-meter-adapter",
+      "args": ["muse"]
+    },
+    {
       "kind": "file",
       "path": "/home/you/.local/state/agent-meter/claude.json"
     }

@@ -1,6 +1,6 @@
 [package]
 name = "agent-meter"
-version = "0.1.9"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 description = "A local GNOME usage meter for coding-agent harnesses"
@@ -16,7 +16,6 @@ path = "src/bin/agent-meterd.rs"
 [[bin]]
 name = "agent-meter"
 path = "src/bin/agent-meter.rs"
-required-features = ["desktop"]
 
 [features]
 default = []

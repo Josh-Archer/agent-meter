@@ -42,9 +42,18 @@ def reset_label(timestamp: int | float | str | None) -> tuple[str | None, str | 
         return None, None
     try:
         if isinstance(timestamp, str):
-            parsed = dt.datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            try:
+                parsed = dt.datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            except ValueError:
+                val = float(timestamp)
+                if val > 1e11:
+                    val /= 1000.0
+                parsed = dt.datetime.fromtimestamp(val, tz=dt.UTC)
         else:
-            parsed = dt.datetime.fromtimestamp(float(timestamp), tz=dt.UTC)
+            val = float(timestamp)
+            if val > 1e11:
+                val /= 1000.0
+            parsed = dt.datetime.fromtimestamp(val, tz=dt.UTC)
     except (TypeError, ValueError, OverflowError, OSError):
         return None, None
     if parsed.tzinfo is None:
@@ -347,16 +356,18 @@ def normalize_grok(records: list[Any], now: dt.datetime | None = None) -> dict[s
     }
 
 
-def normalize_omp_grok_usage(payload: dict[str, Any]) -> dict[str, Any]:
+def normalize_omp_grok_usage(payload: dict[str, Any], now: dt.datetime | None = None) -> dict[str, Any]:
     """Normalize OMP's credential-safe xAI OAuth usage report.
 
     OMP owns its OAuth session and refreshes it internally. Agent Meter only
     consumes its usage report on stdout; it never reads OMP's auth store.
     """
+    current = now or dt.datetime.now(dt.UTC)
     reports = payload.get("reports")
     if not isinstance(reports, list):
         raise ValueError("OMP returned no usage reports")
     choices: list[dict[str, Any]] = []
+    selected_report: dict[str, Any] | None = None
     for report in reports:
         if not isinstance(report, dict) or report.get("provider") != "xai-oauth":
             continue
@@ -369,7 +380,8 @@ def normalize_omp_grok_usage(payload: dict[str, Any]) -> dict[str, Any]:
             identifier = str(limit.get("id", ""))
             if identifier == "xai-oauth:credits:1w":
                 choices.append(limit)
-    if not choices:
+                selected_report = report
+    if not choices or selected_report is None:
         raise ValueError("OMP returned no shared Grok usage limit")
     selected = choices[0]
     amount = selected.get("amount")
@@ -381,7 +393,7 @@ def normalize_omp_grok_usage(payload: dict[str, Any]) -> dict[str, Any]:
     if remaining is None or not 0 <= remaining <= 100:
         raise ValueError("OMP Grok usage limit has no usable remaining percentage")
     reset_value = _number(window.get("resetsAt"))
-    reset_at, reset_text = reset_label(reset_value / 1000.0 if reset_value else None)
+    reset_at, reset_text = reset_label(reset_value)
     usage_window: dict[str, Any] = {
         "id": "weekly", "label": "Shared weekly",
         "remaining_percent": round(remaining, 1),
@@ -390,10 +402,39 @@ def normalize_omp_grok_usage(payload: dict[str, Any]) -> dict[str, Any]:
         usage_window["resets_at"] = reset_at
     if reset_text:
         usage_window["reset_label"] = reset_text
+
+    observed = None
+    for key in ("updatedAt", "updated_at", "timestamp", "ts", "fetchedAt", "fetched_at", "createdAt", "created_at"):
+        val = selected_report.get(key) if key in selected_report else payload.get(key)
+        if val is not None:
+            try:
+                if isinstance(val, (int, float)):
+                    t = float(val)
+                    if t > 1e11:
+                        t /= 1000.0
+                    observed = dt.datetime.fromtimestamp(t, tz=dt.UTC)
+                elif isinstance(val, str):
+                    observed = dt.datetime.fromisoformat(val.replace("Z", "+00:00"))
+                    if observed.tzinfo is None:
+                        observed = observed.replace(tzinfo=dt.UTC)
+                break
+            except (ValueError, TypeError, OverflowError, OSError):
+                pass
+
+    stale = False
+    snapshot_age = 0.0
+    if observed is not None:
+        snapshot_age = max(0.0, (current - observed).total_seconds())
+        stale = snapshot_age > float(os.environ.get("AGENT_METER_GROK_MAX_AGE_SECONDS", "1800"))
+
+    detail = "Grok shared weekly credits via OMP OAuth"
+    if stale:
+        detail = f"Grok OMP usage report is {snapshot_age / 60:.0f} minutes old; start OMP to refresh"
+
     return {
         "id": "grok", "label": "Grok", "icon": "grok",
-        "windows": [usage_window], "status": "fresh",
-        "detail": "Grok shared weekly credits via OMP OAuth",
+        "windows": [usage_window], "status": "stale" if stale else "fresh",
+        "detail": detail,
         "usage_url": "https://grok.com/#settings/usage",
     }
 
@@ -716,11 +757,108 @@ def copilot() -> dict[str, Any]:
         )
 
 
+def normalize_muse(payload: dict[str, Any]) -> dict[str, Any]:
+    """Normalize Muse CLI usage output to an Agent Meter ProviderState.
+
+    Muse may report rate-limit windows with remaining percentage and reset
+    times. The adapter defensively handles missing or partial data.
+    """
+    # Accept a top-level "usage" or "rate_limits" or "quota" key.
+    usage = None
+    for key in ("usage", "rate_limits", "quota", "quotaSummary"):
+        candidate = payload.get(key)
+        if isinstance(candidate, dict):
+            usage = candidate
+            break
+    if usage is None and isinstance(payload.get("windows"), list):
+        # Direct windows array at top level.
+        usage = payload
+
+    windows: list[dict[str, Any]] = []
+    buckets: list[Any] = []
+    if isinstance(usage, dict):
+        for key in ("windows", "buckets", "limits"):
+            candidate = usage.get(key)
+            if isinstance(candidate, list):
+                buckets = candidate
+                break
+        # Flat remaining_percent at usage level (single-window shorthand).
+        if not buckets:
+            remaining = _number(usage.get("remaining_percent")) or _number(usage.get("remaining_pct"))
+            if remaining is not None:
+                bucket: dict[str, Any] = {"remaining_percent": remaining}
+                for rk in ("resets_at", "reset_time", "resetTime", "resetsAt"):
+                    if rk in usage:
+                        bucket["resets_at"] = usage[rk]
+                        break
+                buckets = [bucket]
+
+    for item in buckets:
+        if not isinstance(item, dict):
+            continue
+        remaining = _number(item.get("remaining_percent")) or _number(item.get("remaining_pct"))
+        if remaining is None and isinstance(item.get("remaining_fraction"), (int, float)):
+            remaining = float(item["remaining_fraction"]) * 100.0
+        if remaining is None:
+            used = _number(item.get("used_percentage")) or _number(item.get("used_percent"))
+            if used is not None and 0 <= used <= 100:
+                remaining = 100.0 - used
+        if remaining is None or not 0 <= remaining <= 100:
+            continue
+        window_name = str(item.get("name") or item.get("id") or item.get("window") or "quota")
+        win_id = window_name.lower().replace(" ", "_")
+        reset_value = item.get("resets_at") or item.get("reset_time") or item.get("resetTime") or item.get("resetsAt")
+        if not reset_value and isinstance(usage, dict):
+            reset_value = usage.get("resets_at") or usage.get("reset_time") or usage.get("resetTime") or usage.get("resetsAt")
+        reset_at, label = reset_label(reset_value)
+        win: dict[str, Any] = {
+            "id": win_id,
+            "label": window_name,
+            "remaining_percent": max(0.0, min(100.0, round(float(remaining), 1))),
+        }
+        if reset_at:
+            win["resets_at"] = reset_at
+        if label:
+            win["reset_label"] = label
+        windows.append(win)
+
+    if not windows:
+        raise ValueError("Muse returned no usable usage windows")
+    return {
+        "id": "muse",
+        "label": "Muse",
+        "icon": "generic",
+        "windows": windows,
+        "status": "fresh",
+        "detail": "Muse CLI usage quota",
+    }
+
+
+def muse() -> dict[str, Any]:
+    command = os.environ.get("AGENT_METER_MUSE_BIN", "muse")
+    try:
+        output = subprocess.run(
+            [command, "usage", "--json"],
+            check=True, capture_output=True, text=True, timeout=30,
+        )
+        return normalize_muse(json.loads(output.stdout))
+    except FileNotFoundError:
+        return unavailable(
+            "muse", "Muse", "generic",
+            "muse is not installed; install Muse and sign in to see usage.",
+        )
+    except (OSError, ValueError, KeyError, json.JSONDecodeError, subprocess.SubprocessError) as error:
+        return unavailable(
+            "muse", "Muse", "generic",
+            f"Muse usage unavailable: {error}",
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Emit a normalized Agent Meter provider state")
-    parser.add_argument("provider", choices=["codex", "agy", "antigravity", "grok", "copilot", "claude"])
+    parser.add_argument("provider", choices=["codex", "agy", "antigravity", "grok", "copilot", "claude", "muse"])
     provider = parser.parse_args().provider
-    functions = {"codex": codex, "agy": agy, "antigravity": agy, "grok": grok, "copilot": copilot, "claude": claude}
+    functions = {"codex": codex, "agy": agy, "antigravity": agy, "grok": grok, "copilot": copilot, "claude": claude, "muse": muse}
     print(json.dumps(functions[provider](), separators=(",", ":")))
 
 

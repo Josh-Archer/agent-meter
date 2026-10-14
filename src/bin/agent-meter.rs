@@ -1,3 +1,87 @@
+use agent_meter::{read_state, runtime_state_path, stable_state_path, AgentMeterState, JsonOutput};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+fn load_json_output(custom_state: Option<&Path>) -> Result<JsonOutput, String> {
+    if let Some(path) = custom_state {
+        if let Ok(state) = read_state(path) {
+            return Ok(JsonOutput::from_state(&state));
+        }
+        let content = fs::read_to_string(path)
+            .map_err(|e| format!("reading state from {}: {e}", path.display()))?;
+        if let Ok(output) = serde_json::from_str::<JsonOutput>(&content) {
+            return Ok(output);
+        }
+        if let Ok(state) = serde_json::from_str::<AgentMeterState>(&content) {
+            return Ok(JsonOutput::from_state(&state));
+        }
+        return Err(format!("failed to parse state document from {}", path.display()));
+    }
+
+    let runtime = runtime_state_path();
+    if runtime.exists() {
+        if let Ok(state) = read_state(&runtime) {
+            return Ok(JsonOutput::from_state(&state));
+        }
+    }
+
+    let stable = stable_state_path();
+    if stable.exists() {
+        if let Ok(content) = fs::read_to_string(&stable) {
+            if let Ok(output) = serde_json::from_str::<JsonOutput>(&content) {
+                return Ok(output);
+            }
+            if let Ok(state) = serde_json::from_str::<AgentMeterState>(&content) {
+                return Ok(JsonOutput::from_state(&state));
+            }
+        }
+    }
+
+    Err(format!("reading state from {}", runtime.display()))
+}
+
+fn main() {
+    // Handle --json before initializing GTK.
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--json") {
+        let custom_state = args
+            .windows(2)
+            .find(|w| w[0] == "--state")
+            .map(|w| PathBuf::from(&w[1]));
+
+        match load_json_output(custom_state.as_deref()) {
+            Ok(output) => {
+                println!("{}", serde_json::to_string_pretty(&output).unwrap());
+            }
+            Err(err) => {
+                eprintln!("agent-meter: {err}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("Usage: agent-meter [OPTIONS]\n\nOptions:\n  --json          Output provider state as JSON to stdout\n  --state <PATH>  Read state from custom path\n  -h, --help      Print help");
+        return;
+    }
+
+    gui_main();
+}
+
+#[cfg(feature = "desktop")]
+fn gui_main() {
+    gui::run();
+}
+
+#[cfg(not(feature = "desktop"))]
+fn gui_main() {
+    eprintln!("agent-meter: built without desktop feature; use --json or rebuild with --features desktop");
+    std::process::exit(1);
+}
+
+#[cfg(feature = "desktop")]
+mod gui {
 use agent_meter::{read_state, runtime_state_path, AgentMeterState, ProviderState};
 use gtk::prelude::*;
 use gtk::{gdk, glib};
@@ -109,7 +193,7 @@ fn render(content: &gtk::Box, state: Result<AgentMeterState, anyhow::Error>) {
     }
 }
 
-fn main() {
+pub fn run() {
     let app = gtk::Application::builder()
         .application_id("org.agentmeter.Widget")
         .build();
@@ -157,4 +241,91 @@ fn main() {
         window.present();
     });
     app.run();
+}
+} // mod gui
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_meter::{write_stable_state, write_state, ProviderState, UsageWindow, STATE_VERSION};
+    use chrono::Utc;
+
+    #[test]
+    fn load_json_output_from_custom_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.json");
+        let state = AgentMeterState {
+            version: STATE_VERSION,
+            generated_at: Utc::now(),
+            providers: vec![ProviderState {
+                id: "codex".into(),
+                label: "Codex".into(),
+                icon: "codex".into(),
+                windows: vec![UsageWindow {
+                    id: "five_hour".into(),
+                    label: "5 hours".into(),
+                    remaining_percent: 80.0,
+                    resets_at: None,
+                    reset_label: None,
+                }],
+                status: "fresh".into(),
+                detail: None,
+                usage_url: None,
+            }],
+        };
+        write_state(&path, &state).unwrap();
+        let loaded = load_json_output(Some(&path)).unwrap();
+        assert_eq!(loaded.schema_version, 1);
+        assert_eq!(loaded.providers[0].provider, "codex");
+        assert_eq!(loaded.providers[0].windows[0].remaining_percent, 80.0);
+    }
+
+    #[test]
+    fn load_json_output_falls_back_to_stable_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prev_runtime = std::env::var_os("XDG_RUNTIME_DIR");
+        let prev_state = std::env::var_os("XDG_STATE_HOME");
+
+        let runtime_dir = tmp.path().join("runtime");
+        let state_dir = tmp.path().join("state");
+        std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir);
+        std::env::set_var("XDG_STATE_HOME", &state_dir);
+
+        let state = AgentMeterState {
+            version: STATE_VERSION,
+            generated_at: Utc::now(),
+            providers: vec![ProviderState {
+                id: "muse".into(),
+                label: "Muse".into(),
+                icon: "generic".into(),
+                windows: vec![UsageWindow {
+                    id: "weekly".into(),
+                    label: "Weekly".into(),
+                    remaining_percent: 92.0,
+                    resets_at: None,
+                    reset_label: None,
+                }],
+                status: "fresh".into(),
+                detail: None,
+                usage_url: None,
+            }],
+        };
+        // Write only stable state, leaving runtime absent
+        write_stable_state(&state).unwrap();
+
+        let loaded = load_json_output(None).unwrap();
+        assert_eq!(loaded.providers[0].provider, "muse");
+        assert_eq!(loaded.providers[0].windows[0].remaining_percent, 92.0);
+
+        if let Some(p) = prev_runtime {
+            std::env::set_var("XDG_RUNTIME_DIR", p);
+        } else {
+            std::env::remove_var("XDG_RUNTIME_DIR");
+        }
+        if let Some(p) = prev_state {
+            std::env::set_var("XDG_STATE_HOME", p);
+        } else {
+            std::env::remove_var("XDG_STATE_HOME");
+        }
+    }
 }

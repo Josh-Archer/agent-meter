@@ -375,6 +375,12 @@ fn unavailable(id_hint: &str, detail: &str) -> ProviderState {
     }
 }
 
+fn write_stable_json(state: &AgentMeterState) {
+    if let Err(e) = agent_meter::write_stable_state(state) {
+        eprintln!("agent-meterd: could not write stable JSON: {e}");
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     let config_path = args.config.unwrap_or_else(config_path);
@@ -395,6 +401,7 @@ fn main() -> Result<()> {
 
         match write_state(&state_path, &state) {
             Ok(()) => {
+                write_stable_json(&state);
                 last_good_state = Some(state);
             }
             Err(err) => {

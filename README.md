@@ -31,6 +31,7 @@ snapshots, not live usage.
 local adapter(s) -> agent-meterd (Rust) -> $XDG_RUNTIME_DIR/agent-meter/state.json
                                       |                    |
                                       |                    +-- GNOME extension: panel + desktop card
+                                      +-- $XDG_STATE_HOME/agent-meter/state.json (stable JSON)
                                       +-- GTK desktop app (optional alternate surface)
 ```
 
@@ -51,6 +52,64 @@ off-screen. The top-bar row is always available.
 Press **Super+Alt+U** to show or hide the widget, even over an active app.
 Switching focus to another app restores desktop-only visibility. Drag the
 **Agent Meter** header to reposition it.
+
+## JSON output (`--json`) and stable state file
+
+`agent-meter --json` prints the merged provider state to stdout in a stable,
+documented JSON format. The daemon also atomically writes this JSON to
+`$XDG_STATE_HOME/agent-meter/state.json` (defaults to
+`~/.local/state/agent-meter/state.json`) on every refresh. This path survives
+reboots, unlike the runtime state under `$XDG_RUNTIME_DIR`.
+
+**Schema version 1** — the `schema_version` field will only increment when
+breaking changes are made.
+
+```json
+{
+  "schema_version": 1,
+  "providers": [
+    {
+      "provider": "codex",
+      "windows": [
+        {
+          "name": "five_hour",
+          "remaining_percent": 72.0,
+          "resets_at": "2026-09-16T22:00:00+00:00"
+        },
+        {
+          "name": "weekly",
+          "remaining_percent": 51.0,
+          "resets_at": "2026-09-20T14:00:00+00:00"
+        }
+      ],
+      "updated_at": "2026-09-16T20:45:00+00:00",
+      "stale": false
+    },
+    {
+      "provider": "grok",
+      "windows": [
+        {
+          "name": "weekly",
+          "remaining_percent": 45.0,
+          "resets_at": "2026-09-20T01:45:30+00:00"
+        }
+      ],
+      "updated_at": "2026-09-16T20:45:00+00:00",
+      "stale": true
+    }
+  ]
+}
+```
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `schema_version` | `int` | Always `1` for this schema revision. |
+| `providers[].provider` | `string` | Lowercase provider identifier (e.g. `codex`, `grok`, `muse`). |
+| `providers[].windows[].name` | `string` | Stable window name: `five_hour`, `weekly`, `monthly`, etc. |
+| `providers[].windows[].remaining_percent` | `float` | Remaining quota from 0.0 to 100.0. |
+| `providers[].windows[].resets_at` | `string?` | ISO 8601 datetime with timezone offset. Absent when the provider does not report a reset time. |
+| `providers[].updated_at` | `string` | ISO 8601 timestamp of the last successful refresh. |
+| `providers[].stale` | `bool` | `true` when the data is cached, unavailable, or older than the freshness threshold. |
 
 To change the shortcut after package installation:
 
@@ -301,6 +360,15 @@ adapter communicates over its JSON-RPC stdio protocol and requests
 Use a status exporter you control from the locally available `/status` endpoint
 or usage-dashboard information if you need an alternative source.
 
+### Muse
+
+Muse usage is read from the provider-owned `muse usage --json` command. The
+adapter defensively parses multiple response shapes — windows arrays, bucket
+lists, flat remaining percentages, and used-percentage fields — so it handles
+both current and future Muse CLI output formats. If `muse` is not installed,
+the adapter returns `status: "unavailable"` without error. Override the binary
+path with `AGENT_METER_MUSE_BIN`.
+
 ## Validation included here
 
 ```bash
@@ -311,12 +379,13 @@ python3 tests/test-adapters.py
 `check-extension-layout.py` verifies that all six local symbols exist, the panel
 loops over all configured providers, and the desktop card uses the desktop-only
 focus rule. `test-adapters.py` validates all normalization paths: `normalize_codex`,
-`normalize_agy`, `normalize_grok`, `normalize_claude`, Copilot SDK quota and billing
-normalization, and the `claude()` state-file reader (both absent-file and
-pre-written cases).
+`normalize_agy`, `normalize_grok`, `normalize_claude`, `normalize_muse`, Copilot SDK
+quota and billing normalization, and the `claude()` state-file reader (both
+absent-file and pre-written cases).
 
-After installing Rust, `cargo test` validates the normalized state model and atomic
-state-file writes. An active GNOME session is still required for a visual smoke test.
+After installing Rust, `cargo test` validates the normalized state model, atomic
+state-file writes, and the `JsonOutput` public schema conversion. An active GNOME
+session is still required for a visual smoke test.
 
 ## Privacy and repository safety
 

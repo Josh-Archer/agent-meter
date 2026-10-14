@@ -110,6 +110,82 @@ pub fn runtime_state_path() -> PathBuf {
     runtime.join("agent-meter").join(STATE_FILE_NAME)
 }
 
+/// Persistent state path under `$XDG_STATE_HOME/agent-meter/state.json`.
+///
+/// Unlike `runtime_state_path`, this survives reboots.
+pub fn stable_state_path() -> PathBuf {
+    let state_home = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".local/state")
+        });
+    state_home.join("agent-meter").join(STATE_FILE_NAME)
+}
+
+/// A single usage window in the public JSON schema.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JsonWindow {
+    pub name: String,
+    pub remaining_percent: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<String>,
+}
+
+/// A provider entry in the public JSON schema.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JsonProvider {
+    pub provider: String,
+    pub windows: Vec<JsonWindow>,
+    pub updated_at: String,
+    pub stale: bool,
+}
+
+/// Top-level public JSON output written by `agent-meter --json` and to the
+/// stable state file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JsonOutput {
+    pub schema_version: u8,
+    pub providers: Vec<JsonProvider>,
+}
+
+impl JsonOutput {
+    /// Build a `JsonOutput` from the internal daemon state.
+    pub fn from_state(state: &AgentMeterState) -> Self {
+        let providers = state
+            .providers
+            .iter()
+            .map(|p| {
+                let windows = p
+                    .windows
+                    .iter()
+                    .map(|w| JsonWindow {
+                        name: w.id.clone(),
+                        remaining_percent: w.remaining_percent,
+                        resets_at: w
+                            .resets_at
+                            .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, false)),
+                    })
+                    .collect();
+                let stale = p.status != "fresh";
+                JsonProvider {
+                    provider: p.id.clone(),
+                    windows,
+                    updated_at: state
+                        .generated_at
+                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
+                    stale,
+                }
+            })
+            .collect();
+        JsonOutput {
+            schema_version: 1,
+            providers,
+        }
+    }
+}
+
 pub fn read_state(path: &Path) -> Result<AgentMeterState> {
     let contents = fs::read_to_string(path)
         .with_context(|| format!("reading state from {}", path.display()))?;
@@ -133,6 +209,22 @@ pub fn write_state(path: &Path, state: &AgentMeterState) -> Result<()> {
     fs::rename(&temporary, path)
         .with_context(|| format!("replacing state at {}", path.display()))?;
     Ok(())
+}
+
+/// Atomically write the stable JsonOutput state under `$XDG_STATE_HOME/agent-meter/state.json`.
+pub fn write_stable_state(state: &AgentMeterState) -> Result<PathBuf> {
+    let path = stable_state_path();
+    let output = JsonOutput::from_state(state);
+    let parent = path
+        .parent()
+        .context("stable state path has no parent directory")?;
+    fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    let temporary = parent.join(format!(".{}.{}.tmp", STATE_FILE_NAME, std::process::id()));
+    let encoded = serde_json::to_vec_pretty(&output)?;
+    fs::write(&temporary, encoded).with_context(|| format!("writing {}", temporary.display()))?;
+    fs::rename(&temporary, &path)
+        .with_context(|| format!("replacing stable state at {}", path.display()))?;
+    Ok(path)
 }
 
 /// Deterministic piecewise progressive color scale for remaining quota.
@@ -235,5 +327,139 @@ mod tests {
         assert_eq!(quota_color_hex(10.0, true), "#ff6644");
         assert_eq!(quota_color_hex(0.0, true), "#ff3b56");
         assert_eq!(quota_color_hex(50.0, false), "#8b949e");
+    }
+
+    #[test]
+    fn json_output_from_state() {
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-09-12T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let reset_ts = chrono::DateTime::parse_from_rfc3339("2026-09-12T15:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let state = AgentMeterState {
+            version: STATE_VERSION,
+            generated_at: ts,
+            providers: vec![ProviderState {
+                id: "codex".into(),
+                label: "Codex".into(),
+                icon: "codex".into(),
+                windows: vec![UsageWindow {
+                    id: "five_hour".into(),
+                    label: "5 hours".into(),
+                    remaining_percent: 72.0,
+                    resets_at: Some(reset_ts),
+                    reset_label: Some("in 1h".into()),
+                }],
+                status: "fresh".into(),
+                detail: None,
+                usage_url: None,
+            }],
+        };
+        let output = JsonOutput::from_state(&state);
+        assert_eq!(output.schema_version, 1);
+        assert_eq!(output.providers.len(), 1);
+        assert_eq!(output.providers[0].provider, "codex");
+        assert!(!output.providers[0].stale);
+        assert_eq!(output.providers[0].windows[0].name, "five_hour");
+        assert_eq!(output.providers[0].windows[0].remaining_percent, 72.0);
+        assert!(output.providers[0].windows[0].resets_at.is_some());
+        let resets_at = output.providers[0].windows[0].resets_at.as_ref().unwrap();
+        assert!(resets_at.contains("2026-09-12"));
+    }
+
+    #[test]
+    fn json_output_marks_stale_providers() {
+        let state = AgentMeterState {
+            version: STATE_VERSION,
+            generated_at: Utc::now(),
+            providers: vec![ProviderState {
+                id: "grok".into(),
+                label: "Grok".into(),
+                icon: "grok".into(),
+                windows: vec![UsageWindow {
+                    id: "weekly".into(),
+                    label: "Weekly".into(),
+                    remaining_percent: 45.0,
+                    resets_at: None,
+                    reset_label: None,
+                }],
+                status: "stale".into(),
+                detail: None,
+                usage_url: None,
+            }],
+        };
+        let output = JsonOutput::from_state(&state);
+        assert!(output.providers[0].stale);
+    }
+
+    #[test]
+    fn json_output_round_trips() {
+        let state = sample_state();
+        let output = JsonOutput::from_state(&state);
+        let serialized = serde_json::to_string_pretty(&output).unwrap();
+        let deserialized: JsonOutput = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(output, deserialized);
+    }
+
+    #[test]
+    fn stable_state_path_respects_env() {
+        let prev = std::env::var_os("XDG_STATE_HOME");
+        std::env::set_var("XDG_STATE_HOME", "/tmp/test-state");
+        let path = stable_state_path();
+        if let Some(p) = prev {
+            std::env::set_var("XDG_STATE_HOME", p);
+        } else {
+            std::env::remove_var("XDG_STATE_HOME");
+        }
+        assert_eq!(path, PathBuf::from("/tmp/test-state/agent-meter/state.json"));
+    }
+
+    #[test]
+    fn json_output_schema_structure() {
+        let state = sample_state();
+        let output = JsonOutput::from_state(&state);
+        let val: serde_json::Value = serde_json::to_value(&output).unwrap();
+        assert_eq!(val["schema_version"], 1);
+        let providers = val["providers"].as_array().expect("providers is array");
+        assert!(!providers.is_empty());
+        for p in providers {
+            assert!(p["provider"].is_string());
+            assert!(p["updated_at"].is_string());
+            assert!(p["stale"].is_boolean());
+            let windows = p["windows"].as_array().expect("windows is array");
+            assert!(!windows.is_empty());
+            for w in windows {
+                assert!(w["name"].is_string());
+                assert!(w["remaining_percent"].is_number());
+                if let Some(resets_at) = w.get("resets_at") {
+                    assert!(resets_at.is_string());
+                    // Verify it parses as RFC3339/ISO8601
+                    chrono::DateTime::parse_from_rfc3339(resets_at.as_str().unwrap()).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn write_stable_state_writes_atomic_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("XDG_STATE_HOME");
+        std::env::set_var("XDG_STATE_HOME", tmp.path());
+
+        let state = sample_state();
+        let written_path = write_stable_state(&state).unwrap();
+        assert!(written_path.exists());
+
+        let content = fs::read_to_string(&written_path).unwrap();
+        let parsed: JsonOutput = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed.schema_version, 1);
+        assert_eq!(parsed.providers.len(), state.providers.len());
+
+        if let Some(p) = prev {
+            std::env::set_var("XDG_STATE_HOME", p);
+        } else {
+            std::env::remove_var("XDG_STATE_HOME");
+        }
     }
 }
