@@ -109,7 +109,11 @@ def normalize_codex(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _read_lines_with_deadline(stream: Any, deadline: float):
+def _read_lines_with_deadline(
+    stream: Any,
+    deadline: float,
+    timeout_message: str = "Codex app server timed out",
+):
     sel = selectors.DefaultSelector()
     sel.register(stream, selectors.EVENT_READ)
     buffer = bytearray()
@@ -123,10 +127,10 @@ def _read_lines_with_deadline(stream: Any, deadline: float):
                 continue
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError("Codex app server timed out")
+                raise TimeoutError(timeout_message)
             events = sel.select(timeout=max(0.0, remaining))
             if not events:
-                raise TimeoutError("Codex app server timed out")
+                raise TimeoutError(timeout_message)
             chunk = os.read(stream.fileno(), 4096)
             if not chunk:
                 if buffer:
@@ -304,10 +308,25 @@ def agy() -> dict[str, Any]:
         )
 
 
+def _grok_max_age_seconds() -> float:
+    try:
+        return float(os.environ.get("AGENT_METER_GROK_MAX_AGE_SECONDS", "1800"))
+    except ValueError:
+        return 1800.0
+
+
 def normalize_grok(records: list[Any], now: dt.datetime | None = None) -> dict[str, Any]:
-    """Read only Grok's structured billing snapshots, never its auth state."""
+    """Read only Grok's structured billing snapshots, never its auth state.
+
+    Staleness comes from the billing record's own ``ts``. The newest snapshot
+    is kept even after its billing period ends; an ended period is stale and
+    does not keep a reset instant that is already in the past. This path does
+    not consult OMP.
+    """
     current = now or dt.datetime.now(dt.UTC)
-    candidates: list[tuple[dt.datetime, dict[str, Any]]] = []
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=dt.UTC)
+    candidates: list[tuple[dt.datetime, dt.datetime, dict[str, Any]]] = []
     for record in records:
         if not isinstance(record, dict) or record.get("msg") != "billing: fetched credits config":
             continue
@@ -327,31 +346,43 @@ def normalize_grok(records: list[Any], now: dt.datetime | None = None) -> dict[s
                 period_end = period_end.replace(tzinfo=dt.UTC)
         except (TypeError, ValueError):
             continue
-        if period_end > current:
-            candidates.append((observed, config))
+        candidates.append((observed, period_end, config))
     if not candidates:
-        raise ValueError("no current Grok billing snapshot; start Grok Build once to refresh it")
-    observed, config = max(candidates, key=lambda item: item[0])
+        raise ValueError("no Grok billing snapshot; start Grok Build once to refresh it")
+    observed, period_end, config = max(candidates, key=lambda item: item[0])
     snapshot_age = max(0.0, (current - observed).total_seconds())
+    period_ended = period_end <= current
+    age_stale = snapshot_age > _grok_max_age_seconds()
     reset_at, reset_text = reset_label(config["billingPeriodEnd"])
     window: dict[str, Any] = {
         "id": "weekly",
         "label": "Weekly",
         "remaining_percent": round(100.0 - float(config["creditUsagePercent"]), 1),
     }
-    if reset_at:
+    # A reset instant that has already passed is not the next reset.
+    if reset_at and not period_ended:
         window["resets_at"] = reset_at
-    if reset_text:
+    if reset_text and not period_ended:
         window["reset_label"] = reset_text
-    stale = snapshot_age > float(os.environ.get("AGENT_METER_GROK_MAX_AGE_SECONDS", "1800"))
+    if period_ended:
+        detail = (
+            "Grok usage snapshot is from a billing period that ended; "
+            "start Grok Build to refresh"
+        )
+        stale = True
+    elif age_stale:
+        detail = (
+            f"Grok usage snapshot is {snapshot_age / 60:.0f} minutes old; "
+            "start Grok Build to refresh"
+        )
+        stale = True
+    else:
+        detail = f"Grok weekly usage snapshot from {observed.astimezone().strftime('%a %-I:%M %p')}"
+        stale = False
     return {
         "id": "grok", "label": "Grok Build", "icon": "grok",
         "windows": [window], "status": "stale" if stale else "fresh",
-        "detail": (
-            f"Grok weekly usage snapshot from {observed.astimezone().strftime('%a %-I:%M %p')}"
-            if not stale else
-            f"Grok usage snapshot is {snapshot_age / 60:.0f} minutes old; start Grok Build to refresh"
-        ),
+        "detail": detail,
         "usage_url": "https://grok.com/#settings/usage",
     }
 
@@ -361,8 +392,15 @@ def normalize_omp_grok_usage(payload: dict[str, Any], now: dt.datetime | None = 
 
     OMP owns its OAuth session and refreshes it internally. Agent Meter only
     consumes its usage report on stdout; it never reads OMP's auth store.
+
+    A successful OMP read is a live report. ``now`` stamps that fetch. Payload
+    clocks are not an observation age; Grok Build log staleness is separate.
     """
-    current = now or dt.datetime.now(dt.UTC)
+    # Stamp the live fetch. Callers pass ``now`` as the fetch time; the report
+    # is fresh relative to that instant, so payload timestamps are ignored.
+    fetched_at = now or dt.datetime.now(dt.UTC)
+    if fetched_at.tzinfo is None:
+        fetched_at = fetched_at.replace(tzinfo=dt.UTC)
     reports = payload.get("reports")
     if not isinstance(reports, list):
         raise ValueError("OMP returned no usage reports")
@@ -403,43 +441,20 @@ def normalize_omp_grok_usage(payload: dict[str, Any], now: dt.datetime | None = 
     if reset_text:
         usage_window["reset_label"] = reset_text
 
-    observed = None
-    for key in ("updatedAt", "updated_at", "timestamp", "ts", "fetchedAt", "fetched_at", "createdAt", "created_at"):
-        val = selected_report.get(key) if key in selected_report else payload.get(key)
-        if val is not None:
-            try:
-                if isinstance(val, (int, float)):
-                    t = float(val)
-                    if t > 1e11:
-                        t /= 1000.0
-                    observed = dt.datetime.fromtimestamp(t, tz=dt.UTC)
-                elif isinstance(val, str):
-                    observed = dt.datetime.fromisoformat(val.replace("Z", "+00:00"))
-                    if observed.tzinfo is None:
-                        observed = observed.replace(tzinfo=dt.UTC)
-                break
-            except (ValueError, TypeError, OverflowError, OSError):
-                pass
-
-    stale = False
-    snapshot_age = 0.0
-    if observed is not None:
-        snapshot_age = max(0.0, (current - observed).total_seconds())
-        stale = snapshot_age > float(os.environ.get("AGENT_METER_GROK_MAX_AGE_SECONDS", "1800"))
-
-    detail = "Grok shared weekly credits via OMP OAuth"
-    if stale:
-        detail = f"Grok OMP usage report is {snapshot_age / 60:.0f} minutes old; start OMP to refresh"
-
+    # ``fetched_at`` is the observation time. Age is zero for a report that
+    # OMP just returned, including when the payload carries an older clock.
+    if fetched_at.tzinfo is None:  # pragma: no cover - normalized above
+        raise ValueError("OMP fetch stamp must be timezone-aware")
     return {
         "id": "grok", "label": "Grok", "icon": "grok",
-        "windows": [usage_window], "status": "stale" if stale else "fresh",
-        "detail": detail,
+        "windows": [usage_window], "status": "fresh",
+        "detail": "Grok shared weekly credits via OMP OAuth",
         "usage_url": "https://grok.com/#settings/usage",
     }
 
 
-def grok() -> dict[str, Any]:
+def _grok_from_omp(now: dt.datetime | None = None) -> dict[str, Any] | None:
+    """Return a live OMP report stamped with the fetch time, or None."""
     omp = os.environ.get("AGENT_METER_OMP_BIN", "omp")
     if omp == "omp":
         bun_omp = os.path.expanduser("~/.bun/bin/omp")
@@ -454,11 +469,14 @@ def grok() -> dict[str, Any]:
             [omp, "usage", "--json", "--provider", "xai-oauth"],
             check=True, capture_output=True, text=True, timeout=30, env=environment,
         )
-        return normalize_omp_grok_usage(json.loads(output.stdout))
+        fetched_at = now or dt.datetime.now(dt.UTC)
+        return normalize_omp_grok_usage(json.loads(output.stdout), now=fetched_at)
     except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError):
-        # OMP is optional. Preserve the existing local-log fallback for users
-        # who use Grok Build directly without OMP.
-        pass
+        return None
+
+
+def _grok_from_log(now: dt.datetime | None = None) -> dict[str, Any]:
+    """Normalize the Grok Build log. This path does not invoke OMP."""
     log_path = os.environ.get("AGENT_METER_GROK_LOG", os.path.expanduser("~/.grok/logs/unified.jsonl"))
     try:
         records: list[Any] = []
@@ -468,12 +486,20 @@ def grok() -> dict[str, Any]:
                     records.append(json.loads(line))
                 except json.JSONDecodeError:
                     continue
-        return normalize_grok(records)
+        return normalize_grok(records, now=now)
     except (OSError, ValueError, TypeError) as error:
         return unavailable(
             "grok", "Grok Build", "grok",
             f"Grok usage unavailable; start Grok Build once after signing in: {error}",
         )
+
+
+def grok(now: dt.datetime | None = None) -> dict[str, Any]:
+    """Prefer a live OMP report; otherwise read the Grok Build log on its own."""
+    omp_state = _grok_from_omp(now)
+    if omp_state is not None:
+        return omp_state
+    return _grok_from_log(now)
 
 
 def unavailable_provider(name: str) -> dict[str, Any]:
@@ -757,101 +783,326 @@ def copilot() -> dict[str, Any]:
         )
 
 
-def normalize_muse(payload: dict[str, Any]) -> dict[str, Any]:
-    """Normalize Muse CLI usage output to an Agent Meter ProviderState.
+_MUSE_CLIENT_VERSION = "0.2.0"
+_MUSE_NOT_REPORTED = (
+    "Muse has not reported subscription usage yet; "
+    "Muse only reports usage after a model call (run muse once)"
+)
 
-    Muse may report rate-limit windows with remaining percentage and reset
-    times. The adapter defensively handles missing or partial data.
+
+def _muse_max_age_seconds() -> float:
+    try:
+        return float(os.environ.get("AGENT_METER_MUSE_MAX_AGE_SECONDS", "1800"))
+    except ValueError:
+        return 1800.0
+
+
+def _muse_timeout_seconds() -> float:
+    try:
+        return float(os.environ.get("AGENT_METER_MUSE_TIMEOUT", "20"))
+    except ValueError:
+        return 20.0
+
+
+def _muse_cache_path() -> str:
+    state_home = os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state"))
+    return os.path.join(state_home, "agent-meter", "muse-usage.json")
+
+
+def _read_muse_cache() -> dict[str, Any] | None:
+    try:
+        with open(_muse_cache_path(), encoding="utf-8") as stream:
+            payload = json.load(stream)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    payload.pop("tier", None)
+    if isinstance(payload.get("window"), dict) or isinstance(payload.get("weekly"), dict):
+        return payload
+    return None
+
+
+def _coerce_muse_usage(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Accept a SubscriptionUsage object or a ``{"usage": SubscriptionUsage}`` wrapper.
+
+    ``tier`` is an account id and is never kept.
     """
-    # Accept a top-level "usage" or "rate_limits" or "quota" key.
-    usage = None
-    for key in ("usage", "rate_limits", "quota", "quotaSummary"):
-        candidate = payload.get(key)
-        if isinstance(candidate, dict):
-            usage = candidate
-            break
-    if usage is None and isinstance(payload.get("windows"), list):
-        # Direct windows array at top level.
-        usage = payload
+    if not isinstance(payload, dict):
+        return None
+    usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else payload
+    if not isinstance(usage, dict) or not usage:
+        return None
+    if not (
+        isinstance(usage.get("window"), dict)
+        or isinstance(usage.get("weekly"), dict)
+        or "observedAtMs" in usage
+    ):
+        return None
+    cleaned = dict(usage)
+    cleaned.pop("tier", None)
+    return cleaned
 
+
+def _muse_duration_label(bucket: dict[str, Any]) -> str:
+    mins = bucket.get("windowDurationMins")
+    if isinstance(mins, bool) or not isinstance(mins, (int, float)):
+        return "Session"
+    whole = int(mins)
+    if whole > 0 and whole % 60 == 0:
+        return f"{whole // 60}h"
+    if whole > 0:
+        return f"{whole}m"
+    return "Session"
+
+
+def _muse_window(
+    identifier: str,
+    label: str,
+    bucket: Any,
+    now: dt.datetime,
+) -> tuple[dict[str, Any] | None, bool]:
+    if not isinstance(bucket, dict):
+        return None, False
+    used = _number(bucket.get("usedPercent"))
+    if used is None:
+        return None, False
+    # usedPercent may exceed 100. Remaining is clamped to 0..100.
+    remaining = max(0.0, min(100.0, 100.0 - float(used)))
+    window: dict[str, Any] = {
+        "id": identifier,
+        "label": label,
+        "remaining_percent": round(remaining, 1),
+    }
+    reset_ms = _number(bucket.get("resetsAtMs"))
+    if reset_ms is None:
+        return window, False
+    try:
+        reset_dt = dt.datetime.fromtimestamp(float(reset_ms) / 1000.0, tz=dt.UTC)
+    except (OverflowError, OSError, ValueError):
+        return window, False
+    if reset_dt <= now:
+        window["remaining_percent"] = 100.0
+        return window, True
+    reset_at, reset_text = reset_label(reset_ms)
+    if reset_at:
+        window["resets_at"] = reset_at
+    if reset_text:
+        window["reset_label"] = reset_text
+    return window, False
+
+
+def normalize_muse(payload: dict[str, Any], now: dt.datetime | None = None) -> dict[str, Any]:
+    """Normalize a Muse SubscriptionUsage observation.
+
+    ``window`` becomes the ``session`` window (its label comes from
+    ``windowDurationMins``, for example ``5h``). ``weekly`` stays ``weekly``.
+    ``tier`` is omitted. A reset instant that has already passed reports 100%
+    remaining, drops ``resets_at``, and marks the provider stale. Age is taken
+    from ``observedAtMs``.
+    """
+    current = now or dt.datetime.now(dt.UTC)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=dt.UTC)
+    usage = _coerce_muse_usage(payload)
+    if usage is None:
+        raise ValueError("Muse returned no subscription usage")
     windows: list[dict[str, Any]] = []
-    buckets: list[Any] = []
-    if isinstance(usage, dict):
-        for key in ("windows", "buckets", "limits"):
-            candidate = usage.get(key)
-            if isinstance(candidate, list):
-                buckets = candidate
-                break
-        # Flat remaining_percent at usage level (single-window shorthand).
-        if not buckets:
-            remaining = _number(usage.get("remaining_percent")) or _number(usage.get("remaining_pct"))
-            if remaining is not None:
-                bucket: dict[str, Any] = {"remaining_percent": remaining}
-                for rk in ("resets_at", "reset_time", "resetTime", "resetsAt"):
-                    if rk in usage:
-                        bucket["resets_at"] = usage[rk]
-                        break
-                buckets = [bucket]
-
-    for item in buckets:
-        if not isinstance(item, dict):
-            continue
-        remaining = _number(item.get("remaining_percent")) or _number(item.get("remaining_pct"))
-        if remaining is None and isinstance(item.get("remaining_fraction"), (int, float)):
-            remaining = float(item["remaining_fraction"]) * 100.0
-        if remaining is None:
-            used = _number(item.get("used_percentage")) or _number(item.get("used_percent"))
-            if used is not None and 0 <= used <= 100:
-                remaining = 100.0 - used
-        if remaining is None or not 0 <= remaining <= 100:
-            continue
-        window_name = str(item.get("name") or item.get("id") or item.get("window") or "quota")
-        win_id = window_name.lower().replace(" ", "_")
-        reset_value = item.get("resets_at") or item.get("reset_time") or item.get("resetTime") or item.get("resetsAt")
-        if not reset_value and isinstance(usage, dict):
-            reset_value = usage.get("resets_at") or usage.get("reset_time") or usage.get("resetTime") or usage.get("resetsAt")
-        reset_at, label = reset_label(reset_value)
-        win: dict[str, Any] = {
-            "id": win_id,
-            "label": window_name,
-            "remaining_percent": max(0.0, min(100.0, round(float(remaining), 1))),
-        }
-        if reset_at:
-            win["resets_at"] = reset_at
-        if label:
-            win["reset_label"] = label
-        windows.append(win)
-
+    reset_passed = False
+    session_bucket = usage.get("window")
+    if isinstance(session_bucket, dict):
+        window, passed = _muse_window("session", _muse_duration_label(session_bucket), session_bucket, current)
+        if window:
+            windows.append(window)
+            reset_passed = reset_passed or passed
+    weekly_bucket = usage.get("weekly")
+    if isinstance(weekly_bucket, dict):
+        window, passed = _muse_window("weekly", "Weekly", weekly_bucket, current)
+        if window:
+            windows.append(window)
+            reset_passed = reset_passed or passed
     if not windows:
         raise ValueError("Muse returned no usable usage windows")
-    return {
+
+    observed_ms = _number(usage.get("observedAtMs"))
+    age_seconds: float | None
+    if observed_ms is None:
+        age_stale = True
+        age_seconds = None
+    else:
+        observed = dt.datetime.fromtimestamp(float(observed_ms) / 1000.0, tz=dt.UTC)
+        age_seconds = max(0.0, (current - observed).total_seconds())
+        age_stale = age_seconds > _muse_max_age_seconds()
+    stale = age_stale or reset_passed
+    if reset_passed:
+        detail = "Muse usage window has reset; run muse once to refresh"
+    elif age_stale:
+        minutes = 0.0 if age_seconds is None else age_seconds / 60.0
+        detail = f"Muse usage snapshot is {minutes:.0f} minutes old; run muse once to refresh"
+    else:
+        detail = "Muse subscription usage"
+    state = {
         "id": "muse",
         "label": "Muse",
         "icon": "generic",
         "windows": windows,
-        "status": "fresh",
-        "detail": "Muse CLI usage quota",
+        "status": "stale" if stale else "fresh",
+        "detail": detail,
     }
+    encoded = json.dumps(state)
+    if "tier" in state or "REDACTED_TIER" in encoded:
+        raise ValueError("Muse tier must not be included in provider output")
+    return state
 
 
-def muse() -> dict[str, Any]:
+def _muse_requests() -> list[dict[str, Any]]:
+    return [
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"clientInfo": {"name": "agent_meter", "version": _MUSE_CLIENT_VERSION}},
+        },
+        {"jsonrpc": "2.0", "method": "initialized"},
+        {"jsonrpc": "2.0", "id": 2, "method": "usage/read"},
+    ]
+
+
+def _live_muse_usage(
+    result: dict[str, Any] | None,
+    notification: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Prefer usage/read's SubscriptionUsage, else a prior usage/changed params."""
+    if isinstance(result, dict) and isinstance(result.get("usage"), dict):
+        usage = _coerce_muse_usage(result)
+        if usage is not None and (
+            isinstance(usage.get("window"), dict) or isinstance(usage.get("weekly"), dict)
+        ):
+            return usage
+    if isinstance(notification, dict):
+        usage = _coerce_muse_usage(notification)
+        if usage is not None and (
+            isinstance(usage.get("window"), dict) or isinstance(usage.get("weekly"), dict)
+        ):
+            return usage
+    return None
+
+
+def _query_muse(command: str, timeout: float) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Run ``muse serve --no-session-log`` and read the usage/read result.
+
+    Notifications are skipped, except ``usage/changed`` whose params use the
+    SubscriptionUsage shape and are kept if they arrive before the response.
+    Returns ``(result, notification)``. ``result`` is ``{}`` when the host has
+    observed nothing. A captured trace whose usage result id is not 2 is still
+    accepted when stdout ends, so fixture replay works.
+    """
+    deadline = time.monotonic() + timeout
+    with tempfile.TemporaryDirectory(prefix="agent-meter-muse-") as workdir:
+        child = subprocess.Popen(
+            [command, "serve", "--no-session-log"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            cwd=workdir,
+        )
+        notification: dict[str, Any] | None = None
+        result: dict[str, Any] | None = None
+        try:
+            if child.stdin is None or child.stdout is None:
+                raise RuntimeError("muse serve did not provide stdio pipes")
+            for payload in _muse_requests():
+                child.stdin.write(json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\n")
+            child.stdin.flush()
+            fallback: dict[str, Any] | None = None
+            saw_response = False
+            for line in _read_lines_with_deadline(child.stdout, deadline, "Muse serve timed out"):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(message, dict):
+                    continue
+                if message.get("method") == "usage/changed" and isinstance(message.get("params"), dict):
+                    notification = message["params"]
+                    continue
+                if message.get("id") == 2 and "result" in message:
+                    if isinstance(message.get("result"), dict):
+                        result = message["result"]
+                    saw_response = True
+                    break
+                body = message.get("result")
+                if isinstance(body, dict) and isinstance(body.get("usage"), dict):
+                    fallback = body
+            if not saw_response and result is None:
+                result = fallback
+            return result, notification
+        finally:
+            if child.stdin is not None:
+                try:
+                    child.stdin.close()
+                except BrokenPipeError:
+                    pass
+            if child.poll() is None:
+                child.kill()
+            try:
+                child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
+
+
+def muse(now: dt.datetime | None = None) -> dict[str, Any]:
+    """Read Muse subscription usage over the MSP stdio protocol."""
     command = os.environ.get("AGENT_METER_MUSE_BIN", "muse")
     try:
-        output = subprocess.run(
-            [command, "usage", "--json"],
-            check=True, capture_output=True, text=True, timeout=30,
-        )
-        return normalize_muse(json.loads(output.stdout))
+        result, notification = _query_muse(command, _muse_timeout_seconds())
     except FileNotFoundError:
         return unavailable(
             "muse", "Muse", "generic",
             "muse is not installed; install Muse and sign in to see usage.",
         )
-    except (OSError, ValueError, KeyError, json.JSONDecodeError, subprocess.SubprocessError) as error:
+    except (OSError, TimeoutError, RuntimeError, json.JSONDecodeError) as error:
         return unavailable(
             "muse", "Muse", "generic",
             f"Muse usage unavailable: {error}",
         )
+
+    live = _live_muse_usage(result, notification)
+    if live is not None:
+        try:
+            write_state_file(_muse_cache_path(), live)
+        except OSError:
+            pass
+        try:
+            return normalize_muse(live, now=now)
+        except (TypeError, ValueError) as error:
+            return unavailable(
+                "muse", "Muse", "generic",
+                f"Muse usage unavailable: {error}",
+            )
+
+    # usage/read returned an empty observation. Muse only fills this in after
+    # a model call, so a fresh host falls back to the last cached snapshot.
+    if result == {}:
+        cached = _read_muse_cache()
+        if cached is not None:
+            try:
+                return normalize_muse(cached, now=now)
+            except (TypeError, ValueError) as error:
+                return unavailable(
+                    "muse", "Muse", "generic",
+                    f"Muse usage unavailable: {error}",
+                )
+        return unavailable("muse", "Muse", "generic", _MUSE_NOT_REPORTED)
+
+    return unavailable(
+        "muse", "Muse", "generic",
+        "Muse usage unavailable: muse serve ended before reporting usage",
+    )
 
 
 def main() -> None:

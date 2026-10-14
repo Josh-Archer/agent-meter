@@ -3,6 +3,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 fn load_json_output(custom_state: Option<&Path>) -> Result<JsonOutput, String> {
+    load_json_output_at(custom_state, &runtime_state_path(), &stable_state_path())
+}
+
+fn load_json_output_at(
+    custom_state: Option<&Path>,
+    runtime: &Path,
+    stable: &Path,
+) -> Result<JsonOutput, String> {
     if let Some(path) = custom_state {
         if let Ok(state) = read_state(path) {
             return Ok(JsonOutput::from_state(&state));
@@ -15,19 +23,20 @@ fn load_json_output(custom_state: Option<&Path>) -> Result<JsonOutput, String> {
         if let Ok(state) = serde_json::from_str::<AgentMeterState>(&content) {
             return Ok(JsonOutput::from_state(&state));
         }
-        return Err(format!("failed to parse state document from {}", path.display()));
+        return Err(format!(
+            "failed to parse state document from {}",
+            path.display()
+        ));
     }
 
-    let runtime = runtime_state_path();
     if runtime.exists() {
-        if let Ok(state) = read_state(&runtime) {
+        if let Ok(state) = read_state(runtime) {
             return Ok(JsonOutput::from_state(&state));
         }
     }
 
-    let stable = stable_state_path();
     if stable.exists() {
-        if let Ok(content) = fs::read_to_string(&stable) {
+        if let Ok(content) = fs::read_to_string(stable) {
             if let Ok(output) = serde_json::from_str::<JsonOutput>(&content) {
                 return Ok(output);
             }
@@ -247,7 +256,7 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_meter::{write_stable_state, write_state, ProviderState, UsageWindow, STATE_VERSION};
+    use agent_meter::{write_json_output, write_state, ProviderState, UsageWindow, STATE_VERSION};
     use chrono::Utc;
 
     #[test]
@@ -283,13 +292,12 @@ mod tests {
     #[test]
     fn load_json_output_falls_back_to_stable_state() {
         let tmp = tempfile::tempdir().unwrap();
-        let prev_runtime = std::env::var_os("XDG_RUNTIME_DIR");
-        let prev_state = std::env::var_os("XDG_STATE_HOME");
-
-        let runtime_dir = tmp.path().join("runtime");
-        let state_dir = tmp.path().join("state");
-        std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir);
-        std::env::set_var("XDG_STATE_HOME", &state_dir);
+        let runtime = tmp.path().join("runtime").join("state.json");
+        let stable = tmp
+            .path()
+            .join("state")
+            .join("agent-meter")
+            .join("state.json");
 
         let state = AgentMeterState {
             version: STATE_VERSION,
@@ -310,22 +318,13 @@ mod tests {
                 usage_url: None,
             }],
         };
-        // Write only stable state, leaving runtime absent
-        write_stable_state(&state).unwrap();
+        // Write only stable state, leaving runtime absent.
+        write_json_output(&stable, &state).unwrap();
 
-        let loaded = load_json_output(None).unwrap();
+        let loaded = load_json_output_at(None, &runtime, &stable).unwrap();
         assert_eq!(loaded.providers[0].provider, "muse");
         assert_eq!(loaded.providers[0].windows[0].remaining_percent, 92.0);
-
-        if let Some(p) = prev_runtime {
-            std::env::set_var("XDG_RUNTIME_DIR", p);
-        } else {
-            std::env::remove_var("XDG_RUNTIME_DIR");
-        }
-        if let Some(p) = prev_state {
-            std::env::set_var("XDG_STATE_HOME", p);
-        } else {
-            std::env::remove_var("XDG_STATE_HOME");
-        }
+        assert!(loaded.providers[0].available);
+        assert!(!loaded.providers[0].stale);
     }
 }

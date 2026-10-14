@@ -1,13 +1,93 @@
 #!/usr/bin/env python3
 import json
 import os
+import stat
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "adapters"))
 import agent_meter_adapter as adapter
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+MUSE_FAKE = """#!/usr/bin/env python3
+import json
+import os
+import sys
+
+if sys.argv[1:3] != ["serve", "--no-session-log"]:
+    sys.stderr.write("expected: serve --no-session-log\\n")
+    raise SystemExit(2)
+received = []
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        msg = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    received.append(msg)
+    if msg.get("method") == "usage/read":
+        break
+log_path = os.environ.get("MUSE_REQUESTS_LOG")
+if log_path:
+    with open(log_path, "w", encoding="utf-8") as handle:
+        json.dump(received, handle)
+fixture = os.environ["MUSE_FIXTURE"]
+with open(fixture, encoding="utf-8") as handle:
+    data = handle.read()
+sys.stdout.write(data)
+if data and not data.endswith("\\n"):
+    sys.stdout.write("\\n")
+sys.stdout.flush()
+"""
+
+
+@contextmanager
+def patched_env(updates: dict[str, str | None]):
+    previous = {key: os.environ.get(key) for key in updates}
+    try:
+        for key, value in updates.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _jsonl(name: str) -> list:
+    rows = []
+    for line in (FIXTURES / name).read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            rows.append(json.loads(line))
+    return rows
+
+
+def _write_executable(path: Path, text: str) -> None:
+    path.write_text(text, encoding="utf-8")
+    path.chmod(path.stat().st_mode | stat.S_IEXEC)
+
+
+def _observed_muse_usage() -> dict:
+    for row in _jsonl("muse-usage-observed.jsonl"):
+        result = row.get("result")
+        if isinstance(result, dict) and isinstance(result.get("usage"), dict):
+            return result["usage"]
+    raise AssertionError("muse-usage-observed.jsonl has no usage result")
+
+
+def _ms(value: int) -> adapter.dt.datetime:
+    return adapter.dt.datetime.fromtimestamp(value / 1000, tz=adapter.dt.UTC)
 
 
 def test_reset_calendar_and_timezone() -> None:
@@ -453,16 +533,18 @@ def test_omp_grok_shared_statuses() -> None:
             pass
 
 
-def test_grok_ignores_expired_snapshot() -> None:
+def test_grok_ended_period_is_stale_without_past_reset() -> None:
+    """An ended billing period is returned stale, not dropped."""
     now = adapter.dt.datetime(2026, 8, 30, tzinfo=adapter.dt.UTC)
-    try:
-        adapter.normalize_grok([{"ts": "2026-08-20T00:00:00Z", "msg": "billing: fetched credits config", "ctx": {"config": {
-            "creditUsagePercent": 47,
-            "billingPeriodEnd": "2026-08-25T00:00:00Z",
-        }}}], now=now)
-        assert False, "Expected ValueError"
-    except ValueError:
-        pass
+    state = adapter.normalize_grok([{"ts": "2026-08-20T00:00:00Z", "msg": "billing: fetched credits config", "ctx": {"config": {
+        "creditUsagePercent": 47,
+        "billingPeriodEnd": "2026-08-25T00:00:00Z",
+    }}}], now=now)
+    assert state["status"] == "stale"
+    assert state["windows"][0]["remaining_percent"] == 53.0
+    assert "resets_at" not in state["windows"][0]
+    assert "billing period that ended" in state["detail"]
+    assert "Grok Build" in state["detail"]
 
 
 def test_grok_marks_old_snapshot_stale() -> None:
@@ -505,47 +587,21 @@ def test_copilot_env_allowance() -> None:
 
 
 # ---------------------------------------------------------------------------
-# normalize_muse
+# normalize_muse — real MSP SubscriptionUsage samples
 # ---------------------------------------------------------------------------
 
-def test_muse_usage_with_windows() -> None:
-    state = adapter.normalize_muse({"usage": {"windows": [
-        {"name": "five_hour", "remaining_percent": 65.0, "resets_at": "2026-09-16T21:52:00Z"},
-        {"name": "weekly", "remaining_percent": 80.0, "resets_at": "2026-09-20T00:00:00Z"},
-    ]}})
-    assert state["id"] == "muse"
-    assert state["status"] == "fresh"
-    assert len(state["windows"]) == 2
-    assert state["windows"][0]["remaining_percent"] == 65.0
-    assert state["windows"][0]["resets_at"] == "2026-09-16T21:52:00Z"
-    assert state["windows"][1]["remaining_percent"] == 80.0
-
-
-def test_muse_usage_with_buckets() -> None:
-    state = adapter.normalize_muse({"quota": {"buckets": [
-        {"name": "hourly", "remaining_fraction": 0.42, "reset_time": 1788000000},
-    ]}})
-    assert state["windows"][0]["remaining_percent"] == 42.0
-
-
-def test_muse_flat_remaining() -> None:
-    state = adapter.normalize_muse({"usage": {"remaining_percent": 55.0, "resets_at": "2026-09-20T00:00:00Z"}})
-    assert len(state["windows"]) == 1
-    assert state["windows"][0]["remaining_percent"] == 55.0
-
-
-def test_muse_used_percentage() -> None:
-    state = adapter.normalize_muse({"usage": {"windows": [
-        {"name": "daily", "used_percentage": 30},
-    ]}})
-    assert state["windows"][0]["remaining_percent"] == 70.0
-
-
-def test_muse_direct_windows() -> None:
-    state = adapter.normalize_muse({"windows": [
-        {"name": "weekly", "remaining_percent": 88.5},
-    ]})
-    assert state["windows"][0]["remaining_percent"] == 88.5
+def _muse_env(tmp: str, fixture: Path, requests_log: Path | None = None) -> dict[str, str]:
+    fake = Path(tmp) / "muse"
+    _write_executable(fake, MUSE_FAKE)
+    env = {
+        "AGENT_METER_MUSE_BIN": str(fake),
+        "AGENT_METER_MUSE_TIMEOUT": "5",
+        "MUSE_FIXTURE": str(fixture),
+        "XDG_STATE_HOME": str(Path(tmp) / "state"),
+    }
+    if requests_log is not None:
+        env["MUSE_REQUESTS_LOG"] = str(requests_log)
+    return env
 
 
 def test_muse_empty_raises() -> None:
@@ -556,19 +612,160 @@ def test_muse_empty_raises() -> None:
         pass
 
 
-def test_muse_unavailable_when_missing() -> None:
-    """muse() gracefully returns unavailable when the binary is not found."""
-    old = os.environ.get("AGENT_METER_MUSE_BIN")
-    os.environ["AGENT_METER_MUSE_BIN"] = "/nonexistent/muse-for-test"
-    try:
-        state = adapter.muse()
-    finally:
-        if old is None:
-            os.environ.pop("AGENT_METER_MUSE_BIN", None)
-        else:
-            os.environ["AGENT_METER_MUSE_BIN"] = old
+def test_muse_observed_sample_windows() -> None:
+    """Populated usage/read result from muse-usage-observed.jsonl."""
+    usage = _observed_muse_usage()
+    now = _ms(usage["observedAtMs"]) + adapter.dt.timedelta(minutes=1)
+    state = adapter.normalize_muse({"usage": usage}, now=now)
+    assert state["id"] == "muse"
+    assert state["status"] == "fresh"
+    assert state["detail"] == "Muse subscription usage"
+    assert [window["id"] for window in state["windows"]] == ["session", "weekly"]
+    session, weekly = state["windows"]
+    assert session["label"] == "5h"
+    assert session["remaining_percent"] == 100.0
+    assert session["resets_at"] == "2026-10-14T05:50:15Z"
+    assert weekly["label"] == "Weekly"
+    assert weekly["remaining_percent"] == 52.0
+    assert weekly["resets_at"] == "2026-10-19T00:00:00Z"
+    encoded = json.dumps(state)
+    assert "REDACTED_TIER" not in encoded
+    assert "tier" not in state
+
+
+def test_muse_observed_sample_stale_by_age() -> None:
+    usage = _observed_muse_usage()
+    now = _ms(usage["observedAtMs"]) + adapter.dt.timedelta(minutes=31)
+    state = adapter.normalize_muse(usage, now=now)
+    assert state["status"] == "stale"
+    assert "minutes old" in state["detail"]
+    session, weekly = state["windows"]
+    assert session["remaining_percent"] == 100.0
+    assert session["resets_at"] == "2026-10-14T05:50:15Z"
+    assert weekly["remaining_percent"] == 52.0
+    assert "resets_at" in weekly
+
+
+def test_muse_observed_sample_reset_passed() -> None:
+    usage = _observed_muse_usage()
+    now = _ms(usage["window"]["resetsAtMs"]) + adapter.dt.timedelta(seconds=1)
+    state = adapter.normalize_muse(usage, now=now)
+    assert state["status"] == "stale"
+    session = state["windows"][0]
+    weekly = state["windows"][1]
+    assert session["id"] == "session"
+    assert session["remaining_percent"] == 100.0
+    assert "resets_at" not in session
+    assert weekly["id"] == "weekly"
+    assert weekly["remaining_percent"] == 52.0
+    assert weekly["resets_at"] == "2026-10-19T00:00:00Z"
+    assert "reset" in state["detail"]
+
+
+def test_muse_used_percent_above_100_clamps() -> None:
+    usage = json.loads(json.dumps(_observed_muse_usage()))
+    usage["window"]["usedPercent"] = 130
+    now = _ms(usage["observedAtMs"]) + adapter.dt.timedelta(seconds=10)
+    state = adapter.normalize_muse(usage, now=now)
+    assert state["windows"][0]["remaining_percent"] == 0.0
+    assert "resets_at" in state["windows"][0]
+
+
+def test_muse_replay_observed_fixture() -> None:
+    """A fake muse replays muse-usage-observed.jsonl over stdio."""
+    with tempfile.TemporaryDirectory() as tmp:
+        requests_log = Path(tmp) / "requests.json"
+        env = _muse_env(tmp, FIXTURES / "muse-usage-observed.jsonl", requests_log)
+        usage = _observed_muse_usage()
+        now = _ms(usage["observedAtMs"]) + adapter.dt.timedelta(minutes=1)
+        with patched_env(env):
+            state = adapter.muse(now=now)
+        requests = json.loads(requests_log.read_text(encoding="utf-8"))
+        cache_path = Path(tmp) / "state" / "agent-meter" / "muse-usage.json"
+        cache_text = cache_path.read_text(encoding="utf-8")
+        cache = json.loads(cache_text)
+    assert [item.get("method") for item in requests] == ["initialize", "initialized", "usage/read"]
+    assert requests[0]["jsonrpc"] == "2.0"
+    assert requests[0]["id"] == 1
+    assert requests[0]["params"]["clientInfo"] == {"name": "agent_meter", "version": "0.2.0"}
+    assert "id" not in requests[1]
+    assert requests[2]["id"] == 2
+    assert requests[2]["jsonrpc"] == "2.0"
+    assert state["status"] == "fresh"
+    assert [window["id"] for window in state["windows"]] == ["session", "weekly"]
+    assert state["windows"][0]["label"] == "5h"
+    assert state["windows"][0]["remaining_percent"] == 100.0
+    assert state["windows"][1]["remaining_percent"] == 52.0
+    assert "tier" not in cache
+    assert "REDACTED_TIER" not in cache_text
+    assert cache["observedAtMs"] == usage["observedAtMs"]
+
+
+def test_muse_replay_usage_changed_notification() -> None:
+    """usage/changed params are accepted when they arrive before a usage/read result."""
+    usage = _observed_muse_usage()
+    notification = _jsonl("muse-usage-observed.jsonl")[0]
+    assert notification["method"] == "usage/changed"
+    with tempfile.TemporaryDirectory() as tmp:
+        fixture = Path(tmp) / "changed.jsonl"
+        fixture.write_text(json.dumps(notification) + "\n", encoding="utf-8")
+        now = _ms(usage["observedAtMs"]) + adapter.dt.timedelta(minutes=1)
+        with patched_env(_muse_env(tmp, fixture)):
+            state = adapter.muse(now=now)
+    assert state["status"] == "fresh"
+    assert [window["id"] for window in state["windows"]] == ["session", "weekly"]
+    assert "REDACTED_TIER" not in json.dumps(state)
+
+
+def test_muse_empty_read_is_unavailable_without_cache() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        with patched_env(_muse_env(tmp, FIXTURES / "muse-usage-read.jsonl")):
+            state = adapter.muse()
     assert state["status"] == "unavailable"
     assert state["id"] == "muse"
+    assert state["detail"] == adapter._MUSE_NOT_REPORTED
+
+
+def test_muse_empty_read_falls_back_to_cache() -> None:
+    usage = _observed_muse_usage()
+    now = _ms(usage["observedAtMs"]) + adapter.dt.timedelta(hours=2)
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _muse_env(tmp, FIXTURES / "muse-usage-observed.jsonl")
+        with patched_env(env):
+            seeded = adapter.muse(now=_ms(usage["observedAtMs"]) + adapter.dt.timedelta(minutes=1))
+            env["MUSE_FIXTURE"] = str(FIXTURES / "muse-usage-read.jsonl")
+            with patched_env(env):
+                state = adapter.muse(now=now)
+    assert seeded["status"] == "fresh"
+    assert state["status"] == "stale"
+    assert state["windows"][0]["remaining_percent"] == 100.0
+    assert state["windows"][1]["remaining_percent"] == 52.0
+    assert "resets_at" in state["windows"][0]
+    assert "minutes old" in state["detail"]
+
+
+def test_muse_unavailable_when_missing() -> None:
+    """muse() returns unavailable when the binary is not installed."""
+    with patched_env({"AGENT_METER_MUSE_BIN": "/nonexistent/muse-for-test"}):
+        state = adapter.muse()
+    assert state["status"] == "unavailable"
+    assert state["id"] == "muse"
+    assert "not installed" in state["detail"]
+
+
+def test_muse_serve_failure_is_unavailable() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        fake = Path(tmp) / "muse"
+        _write_executable(fake, "#!/bin/sh\nexit 2\n")
+        with patched_env({
+            "AGENT_METER_MUSE_BIN": str(fake),
+            "AGENT_METER_MUSE_TIMEOUT": "5",
+            "XDG_STATE_HOME": str(Path(tmp) / "state"),
+        }):
+            state = adapter.muse()
+    assert state["status"] == "unavailable"
+    assert state["id"] == "muse"
+    assert state["detail"]
 
 
 def test_grok_omp_data_is_always_fresh() -> None:
@@ -581,10 +778,9 @@ def test_grok_omp_data_is_always_fresh() -> None:
     assert state["status"] == "fresh"
 
 
-def test_grok_omp_marks_old_report_stale() -> None:
-    """OMP OAuth data older than 30 minutes must be marked stale: true."""
+def test_grok_omp_live_fetch_ignores_payload_age() -> None:
+    """OMP usage is a live report, stamped with the fetch time, not a payload clock."""
     now = adapter.dt.datetime(2026, 9, 15, 12, 0, 0, tzinfo=adapter.dt.UTC)
-    # 45 minutes old
     old_ts = (now - adapter.dt.timedelta(minutes=45)).isoformat()
     state = adapter.normalize_omp_grok_usage({
         "reports": [{
@@ -598,8 +794,8 @@ def test_grok_omp_marks_old_report_stale() -> None:
             }],
         }],
     }, now=now)
-    assert state["status"] == "stale"
-    assert "old" in state["detail"]
+    assert state["status"] == "fresh"
+    assert "OMP OAuth" in state["detail"]
 
 
 def test_grok_omp_marks_recent_report_fresh() -> None:
@@ -636,20 +832,99 @@ def test_grok_log_marks_recent_snapshot_fresh() -> None:
     assert state["status"] == "fresh"
 
 
-def test_muse_rate_limits_key() -> None:
-    """Muse adapter accepts rate_limits key."""
-    state = adapter.normalize_muse({"rate_limits": {
-        "windows": [
-            {"name": "five_hour", "remaining_percent": 85.0, "resets_at": "2026-09-16T21:52:00Z"},
-        ]
-    }})
-    assert state["id"] == "muse"
-    assert state["windows"][0]["remaining_percent"] == 85.0
-    assert state["windows"][0]["resets_at"] == "2026-09-16T21:52:00Z"
+def _grok_sample_records() -> list:
+    return _jsonl("grok-unified-sample.jsonl")
+
+
+def test_grok_sample_fresh_within_period() -> None:
+    """Newest billing snapshot, shortly after its ts and still inside the period."""
+    now = adapter.dt.datetime(2026, 10, 9, 22, 50, tzinfo=adapter.dt.UTC)
+    state = adapter.normalize_grok(_grok_sample_records(), now=now)
+    assert state["status"] == "fresh"
+    assert state["windows"][0]["id"] == "weekly"
+    assert state["windows"][0]["remaining_percent"] == 0.0
+    assert state["windows"][0]["resets_at"] == "2026-10-10T01:45:30.851142Z"
+
+
+def test_grok_sample_stale_within_period() -> None:
+    """More than 30 minutes after the snapshot, billing period still open."""
+    now = adapter.dt.datetime(2026, 10, 9, 23, 30, tzinfo=adapter.dt.UTC)
+    state = adapter.normalize_grok(_grok_sample_records(), now=now)
+    assert state["status"] == "stale"
+    assert "minutes old" in state["detail"]
+    assert state["windows"][0]["remaining_percent"] == 0.0
+    assert state["windows"][0]["resets_at"] == "2026-10-10T01:45:30.851142Z"
+
+
+def test_grok_sample_after_period_end() -> None:
+    """Ended period stays visible, stale, with no reset instant in the past."""
+    now = adapter.dt.datetime(2026, 10, 10, 2, 0, tzinfo=adapter.dt.UTC)
+    state = adapter.normalize_grok(_grok_sample_records(), now=now)
+    assert state["status"] == "stale"
+    assert state["windows"][0]["remaining_percent"] == 0.0
+    assert "resets_at" not in state["windows"][0]
+    assert "billing period that ended" in state["detail"]
+    assert "start Grok Build to refresh" in state["detail"]
+
+
+def test_grok_sample_without_billing_records_is_unavailable() -> None:
+    records = [row for row in _grok_sample_records() if row.get("msg") != "billing: fetched credits config"]
+    assert records, "sample should include non-billing log lines"
+    try:
+        adapter.normalize_grok(records, now=adapter.dt.datetime(2026, 10, 12, tzinfo=adapter.dt.UTC))
+        raise AssertionError("expected ValueError")
+    except ValueError:
+        pass
+    with tempfile.TemporaryDirectory() as tmp:
+        log_path = Path(tmp) / "unified.jsonl"
+        log_path.write_text("".join(json.dumps(row) + "\n" for row in records), encoding="utf-8")
+        with patched_env({
+            "AGENT_METER_OMP_BIN": "/nonexistent/omp-for-test",
+            "AGENT_METER_GROK_LOG": str(log_path),
+        }):
+            state = adapter.grok()
+    assert state["status"] == "unavailable"
+    assert state["id"] == "grok"
+    assert "Grok usage unavailable" in state["detail"]
+
+
+def test_grok_log_used_when_omp_missing() -> None:
+    """OMP missing must not block the Grok Build log path."""
+    now = adapter.dt.datetime(2026, 10, 9, 22, 50, tzinfo=adapter.dt.UTC)
+    with patched_env({
+        "AGENT_METER_OMP_BIN": "/nonexistent/omp-for-test",
+        "AGENT_METER_GROK_LOG": str(FIXTURES / "grok-unified-sample.jsonl"),
+    }):
+        state = adapter.grok(now=now)
+    assert state["status"] == "fresh"
+    assert state["windows"][0]["remaining_percent"] == 0.0
+    assert state["windows"][0]["resets_at"] == "2026-10-10T01:45:30.851142Z"
+    assert "OMP" not in state["detail"]
+
+
+def test_copilot_quota_sample_has_no_trustworthy_reset() -> None:
+    """Copilot SDK resetDate matches the fetch time, so it is not a reset instant.
+
+    The captured account.getQuota sample reports every resetDate within a second
+    of fetched_at. Those windows omit resets_at and use reset_label "Reset unknown".
+    """
+    payload = json.loads((FIXTURES / "copilot-quota.json").read_text(encoding="utf-8"))
+    now = adapter.dt.datetime.fromisoformat(payload["fetched_at"].replace("Z", "+00:00"))
+    state = adapter.normalize_copilot_quota(payload, now=now)
+    assert state["windows"], "sample should produce quota windows"
+    for window in state["windows"]:
+        assert "resets_at" not in window
+        assert window["reset_label"] == "Reset unknown"
+    assert state["windows"][0]["remaining_percent"] == 0.0
 
 
 def test_resets_at_iso8601_all_providers() -> None:
-    """Every provider window must provide resets_at in ISO8601 when reset time is available."""
+    """Provider windows expose resets_at as ISO 8601 when a trustworthy reset exists.
+
+    Copilot is excluded. The Copilot SDK account.getQuota returns resetDate equal
+    to the fetch time, so no trustworthy reset instant exists. See
+    test_copilot_quota_sample_has_no_trustworthy_reset.
+    """
     now = adapter.dt.datetime(2026, 9, 1, 12, 0, 0, tzinfo=adapter.dt.UTC)
 
     # 1. Codex
@@ -719,28 +994,13 @@ def test_resets_at_iso8601_all_providers() -> None:
         assert "resets_at" in w
         adapter.dt.datetime.fromisoformat(w["resets_at"].replace("Z", "+00:00"))
 
-    # 6. Copilot
-    copilot_state = adapter.normalize_copilot_quota({
-        "quotaSnapshots": {
-            "premium_interactions": {
-                "remainingPercentage": 80,
-                "resetDate": "2026-10-01T00:00:00Z",
-            }
-        }
-    }, now=now)
-    for w in copilot_state["windows"]:
-        assert "resets_at" in w
-        adapter.dt.datetime.fromisoformat(w["resets_at"].replace("Z", "+00:00"))
+    # 6. Copilot is intentionally not asserted here. account.getQuota's resetDate
+    # equals the fetch time, so the windows have no ISO 8601 resets_at.
 
-    # 7. Muse
-    muse_state = adapter.normalize_muse({
-        "usage": {
-            "windows": [
-                {"name": "five_hour", "remaining_percent": 60.0, "resets_at": "2026-09-16T21:52:00Z"},
-                {"name": "weekly", "remaining_percent": 85.0, "reset_time": 1788000000},
-            ]
-        }
-    })
+    # 7. Muse, from the captured SubscriptionUsage sample, before either reset.
+    usage = _observed_muse_usage()
+    muse_now = _ms(usage["observedAtMs"]) + adapter.dt.timedelta(minutes=1)
+    muse_state = adapter.normalize_muse(usage, now=muse_now)
     for w in muse_state["windows"]:
         assert "resets_at" in w
         adapter.dt.datetime.fromisoformat(w["resets_at"].replace("Z", "+00:00"))
@@ -778,6 +1038,15 @@ def test_json_schema_output() -> None:
                     ],
                     "status": "stale",
                 },
+                {
+                    "id": "muse",
+                    "label": "Muse",
+                    "icon": "generic",
+                    "windows": [
+                        {"id": "availability", "label": "Availability", "remaining_percent": 0.0},
+                    ],
+                    "status": "unavailable",
+                },
             ],
         }
         state_file.write_text(json.dumps(sample_state))
@@ -788,10 +1057,11 @@ def test_json_schema_output() -> None:
         data = json.loads(proc.stdout)
         assert data["schema_version"] == 1
         assert isinstance(data["providers"], list)
-        assert len(data["providers"]) == 2
+        assert len(data["providers"]) == 3
 
         codex = data["providers"][0]
         assert codex["provider"] == "codex"
+        assert codex["available"] is True
         assert codex["stale"] is False
         assert isinstance(codex["updated_at"], str)
         assert len(codex["windows"]) == 2
@@ -801,8 +1071,14 @@ def test_json_schema_output() -> None:
 
         grok = data["providers"][1]
         assert grok["provider"] == "grok"
+        assert grok["available"] is True
         assert grok["stale"] is True
         assert grok["windows"][0]["name"] == "weekly"
+
+        muse = data["providers"][2]
+        assert muse["provider"] == "muse"
+        assert muse["available"] is False
+        assert muse["stale"] is False
 
 
 if __name__ == "__main__":
@@ -835,21 +1111,30 @@ if __name__ == "__main__":
     test_grok_billing_snapshot()
     test_omp_grok_usage_uses_shared_limit()
     test_omp_grok_shared_statuses()
-    test_grok_ignores_expired_snapshot()
+    test_grok_ended_period_is_stale_without_past_reset()
     test_grok_marks_old_snapshot_stale()
     test_grok_never_infers_quota_from_auth_file()
     test_grok_omp_data_is_always_fresh()
-    test_grok_omp_marks_old_report_stale()
+    test_grok_omp_live_fetch_ignores_payload_age()
     test_grok_omp_marks_recent_report_fresh()
     test_grok_log_marks_recent_snapshot_fresh()
-    test_muse_usage_with_windows()
-    test_muse_usage_with_buckets()
-    test_muse_flat_remaining()
-    test_muse_used_percentage()
-    test_muse_direct_windows()
+    test_grok_sample_fresh_within_period()
+    test_grok_sample_stale_within_period()
+    test_grok_sample_after_period_end()
+    test_grok_sample_without_billing_records_is_unavailable()
+    test_grok_log_used_when_omp_missing()
+    test_copilot_quota_sample_has_no_trustworthy_reset()
     test_muse_empty_raises()
+    test_muse_observed_sample_windows()
+    test_muse_observed_sample_stale_by_age()
+    test_muse_observed_sample_reset_passed()
+    test_muse_used_percent_above_100_clamps()
+    test_muse_replay_observed_fixture()
+    test_muse_replay_usage_changed_notification()
+    test_muse_empty_read_is_unavailable_without_cache()
+    test_muse_empty_read_falls_back_to_cache()
     test_muse_unavailable_when_missing()
-    test_muse_rate_limits_key()
+    test_muse_serve_failure_is_unavailable()
     test_resets_at_iso8601_all_providers()
     test_json_schema_output()
     print("Adapter normalization checks passed")

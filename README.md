@@ -83,6 +83,7 @@ breaking changes are made.
         }
       ],
       "updated_at": "2026-09-16T20:45:00+00:00",
+      "available": true,
       "stale": false
     },
     {
@@ -95,6 +96,7 @@ breaking changes are made.
         }
       ],
       "updated_at": "2026-09-16T20:45:00+00:00",
+      "available": true,
       "stale": true
     }
   ]
@@ -105,11 +107,12 @@ breaking changes are made.
 | --- | --- | --- |
 | `schema_version` | `int` | Always `1` for this schema revision. |
 | `providers[].provider` | `string` | Lowercase provider identifier (e.g. `codex`, `grok`, `muse`). |
-| `providers[].windows[].name` | `string` | Stable window name: `five_hour`, `weekly`, `monthly`, etc. |
+| `providers[].windows[].name` | `string` | Stable window name: `five_hour`, `weekly`, `session`, `monthly`, etc. |
 | `providers[].windows[].remaining_percent` | `float` | Remaining quota from 0.0 to 100.0. |
-| `providers[].windows[].resets_at` | `string?` | ISO 8601 datetime with timezone offset. Absent when the provider does not report a reset time. |
+| `providers[].windows[].resets_at` | `string?` | ISO 8601 datetime with timezone offset. Absent when the provider does not report a trustworthy reset time. Copilot is excluded from the expectation that every window has this field: the Copilot SDK `account.getQuota` returns `resetDate` equal to the fetch time, so no trustworthy reset instant exists. |
 | `providers[].updated_at` | `string` | ISO 8601 timestamp of the last successful refresh. |
-| `providers[].stale` | `bool` | `true` when the data is cached, unavailable, or older than the freshness threshold. |
+| `providers[].available` | `bool` | `false` only when the provider status is `unavailable` or `error`. Fresh and stale providers are available. |
+| `providers[].stale` | `bool` | `true` only when the provider status is `stale`. Unavailable providers are not stale. |
 
 To change the shortcut after package installation:
 
@@ -321,6 +324,11 @@ The **Connect** action launches that provider-owned Copilot CLI. Enter `/login` 
 the terminal if it is not already authenticated. Agent Meter never receives or
 reads the OAuth credential; the SDK runtime uses the system keychain.
 
+Copilot windows do not include `resets_at`. `account.getQuota` returns
+`resetDate` equal to the fetch time, so that timestamp is not a quota reset.
+The window's reset label is `Reset unknown`. Copilot is excluded from the rule
+that every provider window carries an ISO 8601 `resets_at`.
+
 ### Antigravity
 
 Antigravity quota is read directly from the provider-owned command
@@ -335,19 +343,24 @@ and displays only **Shared weekly** credits. Product-specific Build, Imagine,
 and Chat quotas are not substituted for this shared pool. Low and exhausted
 quotas remain visible as valid percentages, including 0%, rather than being
 treated as connection failures. OMP manages its own session refresh; Agent
-Meter never reads its credential store.
+Meter never reads its credential store. That report is live, so the adapter
+stamps it with the fetch time and does not judge its age from a payload clock.
 
-Without a usable OMP report, the legacy local-log fallback works as follows.
-Grok Build writes a structured weekly billing snapshot to its private local log
-after the CLI starts. The adapter reads only records named
-`billing: fetched credits config`, selecting the newest unexpired period. It never
-opens `~/.grok/auth.json` or reads tokens, identity, prompts, or model output.
+Without a usable OMP report, the Grok Build log path runs on its own and does
+not depend on OMP. Grok Build writes a structured weekly billing snapshot to
+`~/.grok/logs/unified.jsonl` after the CLI starts. The adapter reads only
+records named `billing: fetched credits config` and keeps the newest snapshot,
+including one whose billing period has already ended. It never opens
+`~/.grok/auth.json` or reads tokens, identity, prompts, or model output.
 The provider's `creditUsagePercent` field is usage consumed, so Agent Meter
 converts it to the remaining percentage shown in the widget.
-Start Grok Build once after login to refresh the snapshot. Because Grok does not
-publish a live quota RPC for the CLI, snapshots older than 30 minutes are marked
-`stale` while their last known percentage remains visible. You can tune that
-honest freshness boundary with `AGENT_METER_GROK_MAX_AGE_SECONDS`.
+Staleness uses that record's own `ts`. Snapshots older than 30 minutes are
+marked `stale` while their last known percentage remains visible. A snapshot
+from a billing period that has ended is also `stale`: the percentage from the
+snapshot is kept, and a reset instant already in the past is omitted. Start
+Grok Build to refresh it. You can tune the age boundary with
+`AGENT_METER_GROK_MAX_AGE_SECONDS` (default 1800). A log with no billing
+records is `unavailable`.
 Stale means usage data needs refreshing, not that the saved Grok sign-in has
 expired; Agent Meter only offers **Connect** when a provider is actually
 unavailable.
@@ -362,12 +375,29 @@ or usage-dashboard information if you need an alternative source.
 
 ### Muse
 
-Muse usage is read from the provider-owned `muse usage --json` command. The
-adapter defensively parses multiple response shapes — windows arrays, bucket
-lists, flat remaining percentages, and used-percentage fields — so it handles
-both current and future Muse CLI output formats. If `muse` is not installed,
-the adapter returns `status: "unavailable"` without error. Override the binary
-path with `AGENT_METER_MUSE_BIN`.
+Muse 1.4.7 has no `usage` subcommand. Agent Meter speaks the MSP JSON-RPC
+protocol over stdio: it runs `muse serve --no-session-log` in a temporary
+directory, sends `initialize`, `initialized`, and `usage/read`, then reads
+stdout until the `usage/read` response. A `usage/changed` notification that
+arrives before that response is accepted as the same SubscriptionUsage object.
+The account `tier` is not included in the provider state.
+
+`usage/read` returns `{"usage": ...}` after Muse has observed a model call, and
+`{}` when the host has observed nothing. An empty result falls back to
+`$XDG_STATE_HOME/agent-meter/muse-usage.json` (default
+`~/.local/state/agent-meter/muse-usage.json`) when a previous observation was
+cached. With neither an observation nor a cache, the provider is
+`unavailable` and the detail explains that Muse only reports usage after a
+model call. A missing `muse` binary or a failed `serve` is also `unavailable`.
+
+The rolling window is exposed as id `session` (labeled from
+`windowDurationMins`, for example `5h`). The weekly window id is `weekly`.
+Remaining percentage is `100 - usedPercent`, clamped to 0 through 100
+(`usedPercent` may exceed 100). Reset times are ISO 8601 UTC instants from
+`resetsAtMs`. An observation older than `AGENT_METER_MUSE_MAX_AGE_SECONDS`
+(default 1800), counted from `observedAtMs`, is `stale`. A window whose reset
+time has already passed reports 100% remaining, omits `resets_at`, and marks
+the provider `stale`. Override the binary with `AGENT_METER_MUSE_BIN`.
 
 ## Validation included here
 

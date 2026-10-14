@@ -8,6 +8,7 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -103,25 +104,43 @@ impl AgentMeterState {
     }
 }
 
-pub fn runtime_state_path() -> PathBuf {
-    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+/// Resolve the runtime state file from an explicit `XDG_RUNTIME_DIR` value.
+///
+/// `None` uses the process temp directory. Callers pass environment values in
+/// so tests do not mutate the process environment.
+pub fn runtime_state_path_from(xdg_runtime_dir: Option<OsString>) -> PathBuf {
+    let runtime = xdg_runtime_dir
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
     runtime.join("agent-meter").join(STATE_FILE_NAME)
 }
 
+pub fn runtime_state_path() -> PathBuf {
+    runtime_state_path_from(std::env::var_os("XDG_RUNTIME_DIR"))
+}
+
+/// Resolve `$XDG_STATE_HOME/agent-meter/state.json` from explicit env values.
+///
+/// When `xdg_state_home` is missing, the path is `$home/.local/state`. When
+/// `home` is also missing, the prefix is `.local/state`.
+pub fn state_path_from(xdg_state_home: Option<OsString>, home: Option<OsString>) -> PathBuf {
+    let state_home = match xdg_state_home {
+        Some(dir) => PathBuf::from(dir),
+        None => home
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".local/state"),
+    };
+    state_home.join("agent-meter").join(STATE_FILE_NAME)
+}
+
 /// Persistent state path under `$XDG_STATE_HOME/agent-meter/state.json`.
 ///
-/// Unlike `runtime_state_path`, this survives reboots.
+/// Unlike `runtime_state_path`, this survives reboots. An empty `HOME` is
+/// treated as unset, matching the usual XDG fallback.
 pub fn stable_state_path() -> PathBuf {
-    let state_home = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".local/state")
-        });
-    state_home.join("agent-meter").join(STATE_FILE_NAME)
+    let home = std::env::var_os("HOME").filter(|value| !value.is_empty());
+    state_path_from(std::env::var_os("XDG_STATE_HOME"), home)
 }
 
 /// A single usage window in the public JSON schema.
@@ -139,6 +158,9 @@ pub struct JsonProvider {
     pub provider: String,
     pub windows: Vec<JsonWindow>,
     pub updated_at: String,
+    /// False only when the provider status is `unavailable` or `error`.
+    pub available: bool,
+    /// True only when the provider status is `stale`.
     pub stale: bool,
 }
 
@@ -168,13 +190,15 @@ impl JsonOutput {
                             .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, false)),
                     })
                     .collect();
-                let stale = p.status != "fresh";
+                let available = p.status != "unavailable" && p.status != "error";
+                let stale = p.status == "stale";
                 JsonProvider {
                     provider: p.id.clone(),
                     windows,
                     updated_at: state
                         .generated_at
                         .to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
+                    available,
                     stale,
                 }
             })
@@ -211,19 +235,26 @@ pub fn write_state(path: &Path, state: &AgentMeterState) -> Result<()> {
     Ok(())
 }
 
-/// Atomically write the stable JsonOutput state under `$XDG_STATE_HOME/agent-meter/state.json`.
-pub fn write_stable_state(state: &AgentMeterState) -> Result<PathBuf> {
-    let path = stable_state_path();
+/// Atomically write the public JSON document to an explicit path.
+pub fn write_json_output(path: &Path, state: &AgentMeterState) -> Result<()> {
+    state.validate()?;
     let output = JsonOutput::from_state(state);
     let parent = path
         .parent()
-        .context("stable state path has no parent directory")?;
+        .context("json output path has no parent directory")?;
     fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     let temporary = parent.join(format!(".{}.{}.tmp", STATE_FILE_NAME, std::process::id()));
     let encoded = serde_json::to_vec_pretty(&output)?;
     fs::write(&temporary, encoded).with_context(|| format!("writing {}", temporary.display()))?;
-    fs::rename(&temporary, &path)
-        .with_context(|| format!("replacing stable state at {}", path.display()))?;
+    fs::rename(&temporary, path)
+        .with_context(|| format!("replacing json output at {}", path.display()))?;
+    Ok(())
+}
+
+/// Atomically write the stable JsonOutput state under `$XDG_STATE_HOME/agent-meter/state.json`.
+pub fn write_stable_state(state: &AgentMeterState) -> Result<PathBuf> {
+    let path = stable_state_path();
+    write_json_output(&path, state)?;
     Ok(path)
 }
 
@@ -360,6 +391,7 @@ mod tests {
         assert_eq!(output.schema_version, 1);
         assert_eq!(output.providers.len(), 1);
         assert_eq!(output.providers[0].provider, "codex");
+        assert!(output.providers[0].available);
         assert!(!output.providers[0].stale);
         assert_eq!(output.providers[0].windows[0].name, "five_hour");
         assert_eq!(output.providers[0].windows[0].remaining_percent, 72.0);
@@ -390,7 +422,33 @@ mod tests {
             }],
         };
         let output = JsonOutput::from_state(&state);
+        assert!(output.providers[0].available);
         assert!(output.providers[0].stale);
+    }
+
+    fn provider_with_status(status: &str) -> AgentMeterState {
+        let mut state = sample_state();
+        state.providers[0].status = status.into();
+        state
+    }
+
+    #[test]
+    fn json_output_available_and_stale_follow_status() {
+        let fresh = JsonOutput::from_state(&provider_with_status("fresh"));
+        assert!(fresh.providers[0].available);
+        assert!(!fresh.providers[0].stale);
+
+        let stale = JsonOutput::from_state(&provider_with_status("stale"));
+        assert!(stale.providers[0].available);
+        assert!(stale.providers[0].stale);
+
+        let unavailable = JsonOutput::from_state(&provider_with_status("unavailable"));
+        assert!(!unavailable.providers[0].available);
+        assert!(!unavailable.providers[0].stale);
+
+        let error = JsonOutput::from_state(&provider_with_status("error"));
+        assert!(!error.providers[0].available);
+        assert!(!error.providers[0].stale);
     }
 
     #[test]
@@ -403,16 +461,51 @@ mod tests {
     }
 
     #[test]
-    fn stable_state_path_respects_env() {
-        let prev = std::env::var_os("XDG_STATE_HOME");
-        std::env::set_var("XDG_STATE_HOME", "/tmp/test-state");
-        let path = stable_state_path();
-        if let Some(p) = prev {
-            std::env::set_var("XDG_STATE_HOME", p);
-        } else {
-            std::env::remove_var("XDG_STATE_HOME");
-        }
-        assert_eq!(path, PathBuf::from("/tmp/test-state/agent-meter/state.json"));
+    fn state_path_from_prefers_xdg_state_home() {
+        let path = state_path_from(
+            Some(OsString::from("/tmp/test-state")),
+            Some(OsString::from("/home/someone")),
+        );
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/test-state/agent-meter/state.json")
+        );
+    }
+
+    #[test]
+    fn state_path_from_falls_back_to_home() {
+        let path = state_path_from(None, Some(OsString::from("/home/someone")));
+        assert_eq!(
+            path,
+            PathBuf::from("/home/someone/.local/state/agent-meter/state.json")
+        );
+    }
+
+    #[test]
+    fn state_path_from_without_home_uses_relative_default() {
+        let path = state_path_from(None, None);
+        assert_eq!(
+            path,
+            PathBuf::from(".")
+                .join(".local/state")
+                .join("agent-meter")
+                .join(STATE_FILE_NAME)
+        );
+    }
+
+    #[test]
+    fn runtime_state_path_from_uses_explicit_dir() {
+        let path = runtime_state_path_from(Some(OsString::from("/tmp/runtime")));
+        assert_eq!(path, PathBuf::from("/tmp/runtime/agent-meter/state.json"));
+    }
+
+    #[test]
+    fn runtime_state_path_from_defaults_to_temp() {
+        let path = runtime_state_path_from(None);
+        assert_eq!(
+            path,
+            std::env::temp_dir().join("agent-meter").join(STATE_FILE_NAME)
+        );
     }
 
     #[test]
@@ -426,6 +519,7 @@ mod tests {
         for p in providers {
             assert!(p["provider"].is_string());
             assert!(p["updated_at"].is_string());
+            assert!(p["available"].is_boolean());
             assert!(p["stale"].is_boolean());
             let windows = p["windows"].as_array().expect("windows is array");
             assert!(!windows.is_empty());
@@ -442,24 +536,18 @@ mod tests {
     }
 
     #[test]
-    fn write_stable_state_writes_atomic_file() {
+    fn write_json_output_writes_atomic_file() {
         let tmp = tempfile::tempdir().unwrap();
-        let prev = std::env::var_os("XDG_STATE_HOME");
-        std::env::set_var("XDG_STATE_HOME", tmp.path());
-
+        let path = tmp.path().join("agent-meter").join(STATE_FILE_NAME);
         let state = sample_state();
-        let written_path = write_stable_state(&state).unwrap();
-        assert!(written_path.exists());
+        write_json_output(&path, &state).unwrap();
+        assert!(path.exists());
 
-        let content = fs::read_to_string(&written_path).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
         let parsed: JsonOutput = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed.schema_version, 1);
         assert_eq!(parsed.providers.len(), state.providers.len());
-
-        if let Some(p) = prev {
-            std::env::set_var("XDG_STATE_HOME", p);
-        } else {
-            std::env::remove_var("XDG_STATE_HOME");
-        }
+        assert!(parsed.providers[0].available);
+        assert!(!parsed.providers[0].stale);
     }
 }
