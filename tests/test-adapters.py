@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
+import io
 import json
 import os
 import stat
 import sys
 import tempfile
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "adapters"))
@@ -130,6 +131,113 @@ for line in sys.stdin:
             emit(changed)
         else:
             emit({"jsonrpc": "2.0", "method": "turn/completed", "params": {"terminal": "completed"}})
+        continue
+"""
+
+# Probe stand-in. MUSE_PROBE_MODE is error, exit, hang, empty, or ok.
+# Turn count goes to MUSE_TURN_COUNTER. The muse-probe.json contents at the
+# moment turn/start arrives are copied to MUSE_PROBE_SNAPSHOT.
+MUSE_PROBE_FAKE = """#!/usr/bin/env python3
+import json
+import os
+import sys
+import time
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\\n")
+    sys.stdout.flush()
+
+def count_turn():
+    path = os.environ.get("MUSE_TURN_COUNTER")
+    if not path:
+        return
+    current = 0
+    if os.path.exists(path):
+        raw = open(path, encoding="utf-8").read().strip()
+        current = int(raw or "0")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(str(current + 1))
+
+def snapshot_probe_state():
+    dest = os.environ.get("MUSE_PROBE_SNAPSHOT")
+    if not dest:
+        return
+    source = os.path.join(os.environ.get("XDG_STATE_HOME", ""), "agent-meter", "muse-probe.json")
+    try:
+        data = open(source, encoding="utf-8").read()
+    except OSError as exc:
+        data = "unreadable:" + str(exc)
+    with open(dest, "w", encoding="utf-8") as handle:
+        handle.write(data)
+
+if sys.argv[1:3] != ["serve", "--no-session-log"]:
+    sys.stderr.write("expected: serve --no-session-log\\n")
+    raise SystemExit(2)
+
+mode = os.environ.get("MUSE_PROBE_MODE", "ok")
+usage = None
+if mode == "ok":
+    with open(os.environ["MUSE_USAGE_FIXTURE"], encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            result = row.get("result")
+            if isinstance(result, dict) and isinstance(result.get("usage"), dict):
+                usage = result["usage"]
+    if usage is None:
+        sys.stderr.write("fixture has no usage\\n")
+        raise SystemExit(2)
+
+for raw in sys.stdin:
+    raw = raw.strip()
+    if not raw:
+        continue
+    try:
+        msg = json.loads(raw)
+    except json.JSONDecodeError:
+        continue
+    method = msg.get("method")
+    if method == "initialized":
+        continue
+    if method == "initialize":
+        emit({
+            "jsonrpc": "2.0",
+            "id": msg.get("id"),
+            "result": {"serverInfo": {"name": "muse", "version": "1.4.7"}},
+        })
+        continue
+    if method == "usage/read":
+        if mode == "ok" and usage is not None and os.environ.get("MUSE_TURN_SEEN") == "1":
+            emit({"jsonrpc": "2.0", "id": msg.get("id"), "result": {"usage": usage}})
+        else:
+            emit({"jsonrpc": "2.0", "id": msg.get("id"), "result": {}})
+        continue
+    if method == "session/start":
+        emit({
+            "jsonrpc": "2.0",
+            "id": msg.get("id"),
+            "result": {"session": {"sessionId": "sess-probe"}},
+        })
+        continue
+    if method == "turn/start":
+        count_turn()
+        snapshot_probe_state()
+        os.environ["MUSE_TURN_SEEN"] = "1"
+        if mode == "exit":
+            raise SystemExit(2)
+        if mode == "error":
+            emit({
+                "jsonrpc": "2.0",
+                "id": msg.get("id"),
+                "error": {"code": -32000, "message": "probe rejected"},
+            })
+            continue
+        if mode == "hang":
+            time.sleep(30)
+            continue
+        emit({"jsonrpc": "2.0", "method": "turn/completed", "params": {"terminal": "completed"}})
         continue
 """
 
@@ -735,6 +843,113 @@ def _write_muse_config(tmp: str, payload: dict) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
+def _probe_state_path(tmp: str) -> Path:
+    return Path(tmp) / "state" / "agent-meter" / "muse-probe.json"
+
+
+def _probe_log_path(tmp: str) -> Path:
+    return Path(tmp) / "state" / "agent-meter" / "muse-probe.log"
+
+
+def _turn_count(path: Path) -> int:
+    if not path.exists():
+        return 0
+    return int(path.read_text(encoding="utf-8").strip() or "0")
+
+
+def _probe_fake_env(tmp: str, mode: str, counter: Path, snapshot: Path | None = None) -> dict[str, str | None]:
+    fake = Path(tmp) / "muse"
+    _write_executable(fake, MUSE_PROBE_FAKE)
+    env: dict[str, str | None] = {
+        "AGENT_METER_MUSE_BIN": str(fake),
+        "AGENT_METER_MUSE_TIMEOUT": "5",
+        "AGENT_METER_MUSE_PROBE": "1",
+        "AGENT_METER_MUSE_PROBE_TIMEOUT_SECONDS": None,
+        "MUSE_PROBE_MODE": mode,
+        "MUSE_TURN_COUNTER": str(counter),
+        "MUSE_USAGE_FIXTURE": str(FIXTURES / "muse-usage-observed.jsonl"),
+        "XDG_STATE_HOME": str(Path(tmp) / "state"),
+        "XDG_CONFIG_HOME": str(Path(tmp) / "config"),
+    }
+    if snapshot is not None:
+        env["MUSE_PROBE_SNAPSHOT"] = str(snapshot)
+    return env
+
+
+def _call_muse(now: adapter.dt.datetime | None = None) -> tuple[dict, str]:
+    buffer = io.StringIO()
+    with redirect_stderr(buffer):
+        state = adapter.muse() if now is None else adapter.muse(now=now)
+    return state, buffer.getvalue()
+
+
+def _stderr_probe_lines(text: str) -> list[dict]:
+    rows = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped:
+            rows.append(json.loads(stripped))
+    return rows
+
+
+def _assert_private_file(path: Path) -> None:
+    assert path.is_file()
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
+def _load_probe_state(tmp: str) -> dict:
+    path = _probe_state_path(tmp)
+    _assert_private_file(path)
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _load_probe_log(tmp: str) -> list[dict]:
+    path = _probe_log_path(tmp)
+    _assert_private_file(path)
+    text = path.read_text(encoding="utf-8")
+    assert "REDACTED_TIER" not in text
+    assert "token" not in text.lower()
+    rows = [json.loads(line) for line in text.splitlines() if line.strip()]
+    for row in rows:
+        assert "tier" not in row["detail"].lower()
+        assert "token" not in row["detail"].lower()
+    return rows
+
+
+def _assert_log_outcome(tmp: str, outcome: str, detail: str) -> dict:
+    rows = _load_probe_log(tmp)
+    row = rows[-1]
+    assert row["outcome"] == outcome
+    assert row["detail"] == detail
+    assert isinstance(row["duration_ms"], int) and row["duration_ms"] >= 0
+    assert isinstance(row["ts"], str) and row["ts"].endswith("Z")
+    state = _load_probe_state(tmp)
+    assert state["outcome"] == outcome
+    assert state["detail"] == detail
+    assert isinstance(state["last_attempt_at"], str) and state["last_attempt_at"].endswith("Z")
+    return row
+
+
+def _expected_throttle_detail(payload: dict, interval: float = 3600.0) -> str:
+    last = adapter.dt.datetime.fromisoformat(payload["last_attempt_at"].replace("Z", "+00:00"))
+    nxt = (last + adapter.dt.timedelta(seconds=interval)).astimezone(adapter.dt.UTC)
+    return (
+        f"Muse probe throttled: last attempt at {adapter._utc_stamp(last)} "
+        f"outcome {payload['outcome']}; next probe allowed at {adapter._utc_stamp(nxt)}"
+    )
+
+
+def _assert_started_before_turn(snapshot: Path) -> dict:
+    assert snapshot.is_file()
+    raw = snapshot.read_text(encoding="utf-8")
+    assert "REDACTED_TIER" not in raw
+    started = json.loads(raw)
+    assert started["outcome"] == "started"
+    assert started["detail"] == adapter._MUSE_PROBE_DETAIL_STARTED
+    assert started["last_attempt_at"].endswith("Z")
+    return started
+
+
 def _assert_uuid7(value: object) -> None:
     assert isinstance(value, str)
     parts = value.split("-")
@@ -1041,6 +1256,236 @@ def test_muse_probe_runs_when_cache_is_older_than_interval() -> None:
     assert methods.count("session/start") == 1
     assert state["status"] == "fresh"
     assert "tier" not in cache_text
+
+
+def _probe_failure_then_refresh(mode: str, detail: str, *, cap_log: bool = False) -> None:
+    """A failed probe records one turn; a second refresh inside the interval sends none."""
+    with tempfile.TemporaryDirectory() as tmp:
+        counter = Path(tmp) / "turns"
+        snapshot = Path(tmp) / "started.json"
+        env = _probe_fake_env(tmp, mode, counter, snapshot)
+        if cap_log:
+            log_path = _probe_log_path(tmp)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            seeded = [
+                json.dumps({
+                    "ts": "2020-01-01T00:00:00Z",
+                    "outcome": "failure",
+                    "duration_ms": 1,
+                    "detail": f"old-{index}",
+                }, separators=(",", ":"))
+                for index in range(200)
+            ]
+            log_path.write_text("\n".join(seeded) + "\n", encoding="utf-8")
+        with patched_env(env):
+            first, first_err = _call_muse()
+            assert _turn_count(counter) == 1
+            second, second_err = _call_muse()
+        assert _turn_count(counter) == 1
+        started = _assert_started_before_turn(snapshot)
+        final = _load_probe_state(tmp)
+        assert final["last_attempt_at"] == started["last_attempt_at"]
+        assert final["outcome"] == "failure"
+        assert final["detail"] == detail
+        row = _assert_log_outcome(tmp, "failure", detail)
+        stderr_rows = _stderr_probe_lines(first_err)
+        assert len(stderr_rows) == 1
+        assert stderr_rows[0]["outcome"] == "failure"
+        assert stderr_rows[0]["detail"] == detail
+        assert stderr_rows[0]["duration_ms"] == row["duration_ms"]
+        assert _stderr_probe_lines(second_err) == []
+        assert first["status"] == "unavailable"
+        assert second["status"] == "unavailable"
+        assert second["detail"] == _expected_throttle_detail(final)
+        assert "tier" not in second["detail"].lower()
+        if cap_log:
+            rows = _load_probe_log(tmp)
+            assert len(rows) == 200
+            assert rows[0]["detail"] == "old-1"
+            assert rows[-1]["detail"] == detail
+            assert all(item["detail"] != "old-0" for item in rows)
+
+
+def test_muse_probe_rpc_error_is_not_retried_within_interval() -> None:
+    """(a) JSON-RPC error on the probe turn. The next refresh sends no turn."""
+    _probe_failure_then_refresh("error", "Muse turn/start failed", cap_log=True)
+
+
+def test_muse_probe_exit_is_not_retried_within_interval() -> None:
+    """(a) The fake exits nonzero after the turn. The next refresh sends no turn."""
+    _probe_failure_then_refresh("exit", "muse serve ended before the probe turn completed")
+
+
+def test_muse_probe_timeout_is_not_retried_within_interval() -> None:
+    """(b) A hanging fake times out; the next refresh sends no turn."""
+    with tempfile.TemporaryDirectory() as tmp:
+        counter = Path(tmp) / "turns"
+        snapshot = Path(tmp) / "started.json"
+        env = _probe_fake_env(tmp, "hang", counter, snapshot)
+        env["AGENT_METER_MUSE_PROBE_TIMEOUT_SECONDS"] = "2"
+        with patched_env(env):
+            first, first_err = _call_muse()
+            assert _turn_count(counter) == 1
+            second, second_err = _call_muse()
+        assert _turn_count(counter) == 1
+        started = _assert_started_before_turn(snapshot)
+        final = _load_probe_state(tmp)
+        assert final["last_attempt_at"] == started["last_attempt_at"]
+        assert final["outcome"] == "timeout"
+        detail = adapter._MUSE_PROBE_DETAIL_TIMEOUT
+        row = _assert_log_outcome(tmp, "timeout", detail)
+        assert row["duration_ms"] < 15000
+        stderr_rows = _stderr_probe_lines(first_err)
+        assert len(stderr_rows) == 1
+        assert stderr_rows[0]["outcome"] == "timeout"
+        assert stderr_rows[0]["detail"] == detail
+        assert _stderr_probe_lines(second_err) == []
+        assert first["status"] == "unavailable"
+        assert second["status"] == "unavailable"
+        assert second["detail"] == _expected_throttle_detail(final)
+
+
+def test_muse_probe_empty_is_not_retried_within_interval() -> None:
+    """(c) A turn whose usage/read is {} does not run again inside the interval."""
+    with tempfile.TemporaryDirectory() as tmp:
+        counter = Path(tmp) / "turns"
+        snapshot = Path(tmp) / "started.json"
+        env = _probe_fake_env(tmp, "empty", counter, snapshot)
+        with patched_env(env):
+            first, first_err = _call_muse()
+            assert _turn_count(counter) == 1
+            second, second_err = _call_muse()
+        assert _turn_count(counter) == 1
+        started = _assert_started_before_turn(snapshot)
+        final = _load_probe_state(tmp)
+        assert final["last_attempt_at"] == started["last_attempt_at"]
+        detail = adapter._MUSE_PROBE_DETAIL_EMPTY
+        assert final["outcome"] == "empty"
+        assert final["detail"] == detail
+        _assert_log_outcome(tmp, "empty", detail)
+        stderr_rows = _stderr_probe_lines(first_err)
+        assert len(stderr_rows) == 1
+        assert stderr_rows[0]["outcome"] == "empty"
+        assert _stderr_probe_lines(second_err) == []
+        assert first["status"] == "unavailable"
+        assert first["detail"] == MUSE_UNAVAILABLE_REASON
+        assert second["status"] == "unavailable"
+        assert second["detail"] == _expected_throttle_detail(final)
+        assert not _muse_cache_path(tmp).exists()
+
+
+def test_muse_probe_bad_usage_cache_and_recent_attempt_does_not_reprobe() -> None:
+    """(d) Corrupt or unreadable muse-usage.json plus a recent attempt sends no turn."""
+    for bad in ("corrupt", "unreadable"):
+        with tempfile.TemporaryDirectory() as tmp:
+            counter = Path(tmp) / "turns"
+            snapshot = Path(tmp) / "started.json"
+            env = _probe_fake_env(tmp, "error", counter, snapshot)
+            with patched_env(env):
+                _call_muse()
+                assert _turn_count(counter) == 1
+                recorded = _load_probe_state(tmp)
+                cache = _muse_cache_path(tmp)
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                if bad == "corrupt":
+                    cache.write_text("{", encoding="utf-8")
+                else:
+                    cache.mkdir()
+                second, second_err = _call_muse()
+            assert _turn_count(counter) == 1, bad
+            final = _load_probe_state(tmp)
+            assert final == recorded
+            assert final["outcome"] == "failure"
+            _assert_log_outcome(tmp, "failure", "Muse turn/start failed")
+            assert len(_load_probe_log(tmp)) == 1
+            assert _stderr_probe_lines(second_err) == []
+            assert second["status"] == "unavailable"
+            assert second["detail"] == _expected_throttle_detail(final)
+
+
+def test_muse_probe_corrupt_state_fails_closed() -> None:
+    """(e) A corrupt muse-probe.json does not probe, and the file is rewritten."""
+    samples = ["{not-json", '{"outcome": "success"}', None]
+    for sample in samples:
+        with tempfile.TemporaryDirectory() as tmp:
+            counter = Path(tmp) / "turns"
+            env = _probe_fake_env(tmp, "ok", counter)
+            path = _probe_state_path(tmp)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if sample is None:
+                path.mkdir()
+            else:
+                path.write_text(sample, encoding="utf-8")
+            with patched_env(env):
+                state, err = _call_muse()
+                again, again_err = _call_muse()
+            assert _turn_count(counter) == 0
+            detail = adapter._MUSE_PROBE_DETAIL_UNREADABLE
+            final = _load_probe_state(tmp)
+            assert final["outcome"] == "failure"
+            assert final["detail"] == detail
+            last = adapter.dt.datetime.fromisoformat(final["last_attempt_at"].replace("Z", "+00:00"))
+            assert abs((adapter.dt.datetime.now(adapter.dt.UTC) - last).total_seconds()) < 30
+            rows = _load_probe_log(tmp)
+            assert len(rows) == 1
+            assert rows[0]["outcome"] == "failure"
+            assert rows[0]["detail"] == detail
+            assert rows[0]["duration_ms"] == 0
+            stderr_rows = _stderr_probe_lines(err)
+            assert len(stderr_rows) == 1
+            assert stderr_rows[0]["outcome"] == "failure"
+            assert stderr_rows[0]["detail"] == detail
+            assert _stderr_probe_lines(again_err) == []
+            assert state["status"] == "unavailable"
+            assert state["detail"] == _expected_throttle_detail(final)
+            assert again["detail"] == state["detail"]
+            assert _turn_count(counter) == 0
+
+
+def test_muse_probe_after_interval_probes_once() -> None:
+    """(f) An attempt older than the interval probes once, even with a fresh usage cache."""
+    usage = _observed_muse_usage()
+    now = _ms(usage["observedAtMs"]) + adapter.dt.timedelta(minutes=1)
+    with tempfile.TemporaryDirectory() as tmp:
+        counter = Path(tmp) / "turns"
+        snapshot = Path(tmp) / "started.json"
+        env = _probe_fake_env(tmp, "ok", counter, snapshot)
+        _seed_muse_cache(tmp, age_seconds=30)
+        previous = adapter.dt.datetime.now(adapter.dt.UTC) - adapter.dt.timedelta(hours=3)
+        path = _probe_state_path(tmp)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "last_attempt_at": adapter._utc_stamp(previous),
+            "outcome": "failure",
+            "detail": "previous failure",
+        }) + "\n", encoding="utf-8")
+        with patched_env(env):
+            state, err = _call_muse(now)
+            assert _turn_count(counter) == 1
+            second, second_err = _call_muse(now)
+        assert _turn_count(counter) == 1
+        started = _assert_started_before_turn(snapshot)
+        final = _load_probe_state(tmp)
+        assert final["last_attempt_at"] == started["last_attempt_at"]
+        detail = adapter._MUSE_PROBE_DETAIL_SUCCESS
+        assert final["outcome"] == "success"
+        assert final["detail"] == detail
+        rows = _load_probe_log(tmp)
+        assert len(rows) == 1
+        assert rows[0]["outcome"] == "success"
+        assert rows[0]["detail"] == detail
+        assert "REDACTED_TIER" not in _probe_log_path(tmp).read_text(encoding="utf-8")
+        assert "REDACTED_TIER" not in path.read_text(encoding="utf-8")
+        stderr_rows = _stderr_probe_lines(err)
+        assert len(stderr_rows) == 1
+        assert stderr_rows[0]["outcome"] == "success"
+        assert _stderr_probe_lines(second_err) == []
+        assert state["status"] == "fresh"
+        assert [window["id"] for window in state["windows"]] == ["session", "weekly"]
+        assert second["status"] == "fresh"
+        cache_text = _muse_cache_path(tmp).read_text(encoding="utf-8")
+        assert "tier" not in json.loads(cache_text)
+        assert "REDACTED_TIER" not in cache_text
 
 
 def test_grok_omp_data_is_always_fresh() -> None:
@@ -1420,6 +1865,13 @@ if __name__ == "__main__":
     test_muse_probe_skips_turn_when_cache_is_fresh()
     test_muse_probe_interval_minimum_suppresses_a_short_config()
     test_muse_probe_runs_when_cache_is_older_than_interval()
+    test_muse_probe_rpc_error_is_not_retried_within_interval()
+    test_muse_probe_exit_is_not_retried_within_interval()
+    test_muse_probe_timeout_is_not_retried_within_interval()
+    test_muse_probe_empty_is_not_retried_within_interval()
+    test_muse_probe_bad_usage_cache_and_recent_attempt_does_not_reprobe()
+    test_muse_probe_corrupt_state_fails_closed()
+    test_muse_probe_after_interval_probes_once()
     test_resets_at_iso8601_all_providers()
     test_json_schema_output()
     print("Adapter normalization checks passed")

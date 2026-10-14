@@ -426,17 +426,50 @@ An opt-in probe can fill that cache. It is off by default. Turn it on with
 {"probe": true, "probe_interval_seconds": 3600}
 ```
 
-When the probe is on and the cache is missing or older than
-`probe_interval_seconds` (default 3600, minimum 900), Agent Meter makes one
-minimal turn on that same `muse serve` host: `session/start` with a UUIDv7
-`commandId` and a temporary `workspaceRoot`, then `turn/start` with
-`reasoningEffort` `minimal` and the text `Reply with just: ok`. After
-`usage/changed` or `turn/completed`, it calls `usage/read` again and caches
-the result. The whole probe waits at most 120 seconds. A cache younger than
-the interval is reused and no turn is sent.
+When the probe is on, Agent Meter sends one minimal turn on that same
+`muse serve` host only when the last probe attempt is older than
+`probe_interval_seconds` (default 3600, minimum 900). The gate is
+`$XDG_STATE_HOME/agent-meter/muse-probe.json` (default
+`~/.local/state/agent-meter/muse-probe.json`): `last_attempt_at` plus the
+interval, for every outcome, and for every state of `muse-usage.json`. A
+failed probe, a timeout, an empty `usage/read`, and a missing, unreadable, or
+corrupt usage cache all wait until that attempt is due again.
 
-That probe spends quota: one minimal Muse turn per interval. Leave it off if
-you do not want Agent Meter to call the model.
+Before the probe turn starts, Agent Meter writes `muse-probe.json` with
+`last_attempt_at` (ISO 8601 UTC), `outcome` `started`, and a short `detail`.
+The write is atomic (temporary file, then rename) and the mode is `0600`.
+When the attempt finishes, the same file is updated to `success`, `failure`,
+`timeout`, or `empty`, keeping the original `last_attempt_at`. The file has
+no tokens and no account tier.
+
+If `muse-probe.json` is missing, a usable `muse-usage.json` that is still
+inside the interval suppresses the turn. That keeps a cache written before
+attempt tracking from firing a probe on the next refresh. Once
+`muse-probe.json` exists, only its attempt time gates the next turn, including
+when the usage cache is fresh. If `muse-probe.json` is unreadable or corrupt,
+Agent Meter skips the turn, rewrites the file with the current time, `outcome`
+`failure`, and detail `probe state unreadable`, and counts that rewrite as an
+attempt.
+
+Each finished attempt appends one JSON line to
+`$XDG_STATE_HOME/agent-meter/muse-probe.log` (`ts`, `outcome`, `duration_ms`,
+`detail`) and prints that same line to stderr. The log keeps the last 200
+lines. It has no tokens and no tier id.
+
+The turn is `session/start` with a UUIDv7 `commandId` and a temporary
+`workspaceRoot`, then `turn/start` with `reasoningEffort` `minimal` and the
+text `Reply with just: ok`. After `usage/changed` or `turn/completed`, it
+calls `usage/read` again and, on success, caches the result. The probe waits
+at most 120 seconds. `AGENT_METER_MUSE_PROBE_TIMEOUT_SECONDS` overrides that
+deadline. An attempt still inside the interval sends no turn.
+
+If the probe is throttled and there is no usable cache, the provider is
+`unavailable`. The detail says when the last probe ran, its outcome, and when
+the next probe is allowed.
+
+That probe spends quota: one minimal Muse turn per interval, counted from the
+last attempt, including attempts that failed, timed out, or returned no usage.
+Leave it off if you do not want Agent Meter to call the model.
 
 The rolling window is exposed as id `session` (labeled from
 `windowDurationMins`, for example `5h`). The weekly window id is `weekly`.

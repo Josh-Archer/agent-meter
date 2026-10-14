@@ -787,7 +787,13 @@ _MUSE_CLIENT_VERSION = "0.2.0"
 _MUSE_PROBE_TIMEOUT_SECONDS = 120.0
 _MUSE_PROBE_INTERVAL_DEFAULT = 3600.0
 _MUSE_PROBE_INTERVAL_MIN = 900.0
+_MUSE_PROBE_LOG_MAX_LINES = 200
 _MUSE_PROBE_TEXT = "Reply with just: ok"
+_MUSE_PROBE_DETAIL_STARTED = "probe started"
+_MUSE_PROBE_DETAIL_SUCCESS = "usage observed"
+_MUSE_PROBE_DETAIL_TIMEOUT = "probe timed out"
+_MUSE_PROBE_DETAIL_EMPTY = "usage/read returned no usage"
+_MUSE_PROBE_DETAIL_UNREADABLE = "probe state unreadable"
 # Muse 1.4.7 keeps SubscriptionUsage only in the memory of the host process
 # that made a model call. Nothing on disk and no other process can read it.
 _MUSE_NOT_REPORTED = (
@@ -827,9 +833,35 @@ def _muse_timeout_seconds() -> float:
         return 20.0
 
 
-def _muse_cache_path() -> str:
+def _muse_probe_timeout_seconds() -> float:
+    """Probe deadline. ``AGENT_METER_MUSE_PROBE_TIMEOUT_SECONDS`` overrides the 120s default."""
+    raw = os.environ.get("AGENT_METER_MUSE_PROBE_TIMEOUT_SECONDS")
+    if raw is None or not raw.strip():
+        return _MUSE_PROBE_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return _MUSE_PROBE_TIMEOUT_SECONDS
+    if value <= 0 or value != value or value == float("inf"):
+        return _MUSE_PROBE_TIMEOUT_SECONDS
+    return value
+
+
+def _muse_state_dir() -> str:
     state_home = os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state"))
-    return os.path.join(state_home, "agent-meter", "muse-usage.json")
+    return os.path.join(state_home, "agent-meter")
+
+
+def _muse_cache_path() -> str:
+    return os.path.join(_muse_state_dir(), "muse-usage.json")
+
+
+def _muse_probe_state_path() -> str:
+    return os.path.join(_muse_state_dir(), "muse-probe.json")
+
+
+def _muse_probe_log_path() -> str:
+    return os.path.join(_muse_state_dir(), "muse-probe.log")
 
 
 def _muse_config_path() -> str:
@@ -878,14 +910,244 @@ def _muse_cache_age_seconds() -> float | None:
     return max(0.0, age)
 
 
-def _muse_should_probe() -> bool:
-    """Probe only when opted in and the cache is missing or past the interval."""
-    if not _muse_probe_enabled():
+def _utc_stamp(moment: dt.datetime) -> str:
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=dt.UTC)
+    return moment.astimezone(dt.UTC).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_utc_timestamp(value: Any) -> dt.datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(dt.UTC)
+
+
+def _safe_probe_detail(detail: str) -> str:
+    """Short probe text. Never keep tokens, authorization material, or the tier id."""
+    text = " ".join(str(detail).split())
+    lowered = text.lower()
+    if any(word in lowered for word in ("tier", "token", "bearer", "authorization", "secret")):
+        return "probe failed"
+    if len(text) > 180:
+        text = text[:180]
+    return text or "probe failed"
+
+
+class _ProbeAttempt:
+    """One opt-in probe, from the pre-turn ``started`` record through the final outcome."""
+
+    def __init__(self) -> None:
+        self.started_at: dt.datetime | None = None
+        self.started_monotonic: float | None = None
+        self.marked = False
+        self.finished = False
+
+
+def _read_muse_probe_state() -> tuple[str, dict[str, Any] | None]:
+    """Return ``missing``, ``ok``, or ``unreadable`` plus the payload when it is ok.
+
+    A missing file means this host has not recorded an attempt yet. Anything
+    we cannot parse fails closed so a broken file cannot cause a probe on
+    every refresh.
+    """
+    path = _muse_probe_state_path()
+    try:
+        with open(path, encoding="utf-8") as stream:
+            payload = json.load(stream)
+    except FileNotFoundError:
+        return "missing", None
+    except (OSError, json.JSONDecodeError):
+        return "unreadable", None
+    if not isinstance(payload, dict):
+        return "unreadable", None
+    if _parse_utc_timestamp(payload.get("last_attempt_at")) is None:
+        return "unreadable", None
+    outcome = payload.get("outcome")
+    detail = payload.get("detail")
+    if not isinstance(outcome, str) or not outcome or not isinstance(detail, str):
+        return "unreadable", None
+    return "ok", payload
+
+
+def _write_probe_file(payload: dict[str, Any]) -> None:
+    """Atomically publish muse-probe.json (tmp + rename, mode 600)."""
+    path = _muse_probe_state_path()
+    # A directory where the state file should be is unreadable as JSON.
+    # Remove an empty one so the rewrite can land; a non-empty one still fails closed.
+    if os.path.isdir(path):
+        os.rmdir(path)
+    write_state_file(path, payload)
+
+
+def _append_probe_log(when: dt.datetime, outcome: str, duration_ms: int, detail: str) -> None:
+    """Append one JSON line and print the same line to stderr. Keep the last 200."""
+    entry = {
+        "ts": _utc_stamp(when),
+        "outcome": outcome,
+        "duration_ms": int(duration_ms),
+        "detail": detail,
+    }
+    line = json.dumps(entry, separators=(",", ":"))
+    try:
+        sys.stderr.write(line + "\n")
+        sys.stderr.flush()
+    except OSError:
+        pass
+    path = _muse_probe_log_path()
+    directory = os.path.dirname(path)
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+    except OSError:
+        return
+    kept: list[str] = []
+    try:
+        with open(path, encoding="utf-8") as stream:
+            for existing in stream:
+                stripped = existing.strip()
+                if stripped:
+                    kept.append(stripped)
+    except FileNotFoundError:
+        kept = []
+    except OSError:
+        return
+    kept.append(line)
+    if len(kept) > _MUSE_PROBE_LOG_MAX_LINES:
+        kept = kept[-_MUSE_PROBE_LOG_MAX_LINES:]
+    fd, temporary = tempfile.mkstemp(prefix=".agent-meter-", dir=directory, text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write("\n".join(kept) + "\n")
+            stream.flush()
+            os.fchmod(stream.fileno(), 0o600)
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _emit_probe_record(
+    when: dt.datetime,
+    outcome: str,
+    detail: str,
+    *,
+    duration_ms: int | None = None,
+) -> dict[str, Any]:
+    """Write muse-probe.json. Final outcomes also append the log line."""
+    safe = _safe_probe_detail(detail)
+    payload = {
+        "last_attempt_at": _utc_stamp(when),
+        "outcome": outcome,
+        "detail": safe,
+    }
+    _write_probe_file(payload)
+    if outcome != "started":
+        _append_probe_log(dt.datetime.now(dt.UTC), outcome, 0 if duration_ms is None else duration_ms, safe)
+    return payload
+
+
+def _mark_probe_started(attempt: _ProbeAttempt) -> None:
+    """Record ``started`` before any probe turn so a hang still counts as an attempt."""
+    if attempt.marked:
+        return
+    attempt.started_at = dt.datetime.now(dt.UTC)
+    attempt.started_monotonic = time.monotonic()
+    _emit_probe_record(attempt.started_at, "started", _MUSE_PROBE_DETAIL_STARTED)
+    attempt.marked = True
+
+
+def _probe_duration_ms(attempt: _ProbeAttempt) -> int:
+    if attempt.started_monotonic is None:
+        return 0
+    return max(0, int(round((time.monotonic() - attempt.started_monotonic) * 1000)))
+
+
+def _finish_probe(attempt: _ProbeAttempt, outcome: str, detail: str) -> None:
+    """Replace ``started`` with the final outcome, keeping the original attempt time."""
+    if not attempt.marked or attempt.finished:
+        return
+    when = attempt.started_at or dt.datetime.now(dt.UTC)
+    try:
+        _emit_probe_record(when, outcome, detail, duration_ms=_probe_duration_ms(attempt))
+    except OSError:
+        try:
+            sys.stderr.write(
+                json.dumps({
+                    "ts": _utc_stamp(dt.datetime.now(dt.UTC)),
+                    "outcome": outcome,
+                    "duration_ms": _probe_duration_ms(attempt),
+                    "detail": _safe_probe_detail(detail),
+                }, separators=(",", ":"))
+                + "\n"
+            )
+        except OSError:
+            pass
+    attempt.finished = True
+
+
+def _probe_throttle_detail(payload: dict[str, Any]) -> str:
+    """Unavailable detail: when the last probe ran, its outcome, and when the next one is allowed."""
+    last_dt = _parse_utc_timestamp(payload.get("last_attempt_at"))
+    outcome = payload.get("outcome")
+    if last_dt is None or not isinstance(outcome, str) or not outcome:
+        return "Muse probe throttled: probe state unreadable"
+    next_dt = last_dt + dt.timedelta(seconds=_muse_probe_interval_seconds())
+    return (
+        f"Muse probe throttled: last attempt at {_utc_stamp(last_dt)} "
+        f"outcome {outcome}; next probe allowed at {_utc_stamp(next_dt)}"
+    )
+
+
+def _attempt_is_due(payload: dict[str, Any]) -> bool:
+    last_dt = _parse_utc_timestamp(payload.get("last_attempt_at"))
+    if last_dt is None:
         return False
+    elapsed = (dt.datetime.now(dt.UTC) - last_dt).total_seconds()
+    return elapsed > _muse_probe_interval_seconds()
+
+
+def _muse_probe_gate() -> tuple[bool, dict[str, Any] | None]:
+    """Return ``(should_probe, throttle_state)``.
+
+    Every probe is gated on ``last_attempt_at + probe_interval_seconds``,
+    whatever the previous outcome and whatever ``muse-usage.json`` contains.
+    A missing attempt file still honors a fresh usage cache so an upgrade
+    does not immediately spend a turn. An unreadable attempt file fails
+    closed: no probe, rewrite it as a failure, and treat that as an attempt.
+    """
+    if not _muse_probe_enabled():
+        return False, None
+    status, payload = _read_muse_probe_state()
+    if status == "unreadable":
+        try:
+            recorded = _emit_probe_record(
+                dt.datetime.now(dt.UTC),
+                "failure",
+                _MUSE_PROBE_DETAIL_UNREADABLE,
+                duration_ms=0,
+            )
+        except OSError:
+            recorded = {
+                "last_attempt_at": _utc_stamp(dt.datetime.now(dt.UTC)),
+                "outcome": "failure",
+                "detail": _MUSE_PROBE_DETAIL_UNREADABLE,
+            }
+        return False, recorded
+    if status == "ok" and payload is not None:
+        if _attempt_is_due(payload):
+            return True, None
+        return False, payload
     age = _muse_cache_age_seconds()
-    if age is None:
-        return True
-    return age > _muse_probe_interval_seconds()
+    if age is None or age > _muse_probe_interval_seconds():
+        return True, None
+    return False, None
 
 
 def _read_muse_cache() -> dict[str, Any] | None:
@@ -1214,6 +1476,7 @@ def _query_muse(
     timeout: float,
     *,
     probe: bool,
+    attempt: _ProbeAttempt | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Run ``muse serve --no-session-log`` and read usage from that process.
 
@@ -1222,6 +1485,9 @@ def _query_muse(
     SubscriptionUsage shape. When ``probe`` is set and that read is empty, one
     minimal turn runs on the same host before a second ``usage/read``. The
     ``timeout`` is the deadline for the whole exchange.
+
+    A probe records ``started`` after the process is up and before the turn,
+    so a hang or a failed turn still counts toward the interval.
     """
     deadline = time.monotonic() + timeout
     with tempfile.TemporaryDirectory(prefix="agent-meter-muse-") as workdir:
@@ -1235,13 +1501,20 @@ def _query_muse(
         try:
             if child.stdin is None or child.stdout is None:
                 raise RuntimeError("muse serve did not provide stdio pipes")
+            do_probe = probe
+            if do_probe and attempt is not None:
+                try:
+                    _mark_probe_started(attempt)
+                except OSError:
+                    # Cannot record the attempt: do not send a turn.
+                    do_probe = False
             for payload in _muse_requests():
                 _write_muse_message(child.stdin, payload)
             messages = _iter_muse_messages(
                 _read_lines_with_deadline(child.stdout, deadline, "Muse serve timed out")
             )
             result, notification = _collect_usage_read(messages, 2, None)
-            if probe and _muse_read_is_empty(result) and _live_muse_usage(result, notification) is None:
+            if do_probe and _muse_read_is_empty(result) and _live_muse_usage(result, notification) is None:
                 result, notification = _run_muse_probe(child.stdin, messages, workdir, notification)
             return result, notification
         finally:
@@ -1266,41 +1539,94 @@ def _muse_from_cache(now: dt.datetime | None) -> dict[str, Any] | None:
     return normalize_muse(cached, now=now)
 
 
+def _muse_without_live_usage(
+    now: dt.datetime | None,
+    *,
+    error: BaseException | None,
+    throttle_state: dict[str, Any] | None,
+    empty: bool,
+    probed: bool,
+) -> dict[str, Any]:
+    """Cache, then a throttled unavailable detail, then the read-only messages."""
+    try:
+        cached_state = _muse_from_cache(now)
+    except (TypeError, ValueError) as cache_error:
+        return unavailable(
+            "muse", "Muse", "generic",
+            f"Muse usage unavailable: {cache_error}",
+        )
+    if cached_state is not None:
+        return cached_state
+    # A probe that just ran reports its own error. A later refresh, with no
+    # usable cache, reports when the last attempt was and when the next is allowed.
+    if throttle_state is not None and not probed:
+        return unavailable("muse", "Muse", "generic", _probe_throttle_detail(throttle_state))
+    if empty:
+        return unavailable("muse", "Muse", "generic", _MUSE_NOT_REPORTED)
+    if error is None:
+        return unavailable(
+            "muse", "Muse", "generic",
+            "Muse usage unavailable: muse serve ended before reporting usage",
+        )
+    return unavailable(
+        "muse", "Muse", "generic",
+        f"Muse usage unavailable: {error}",
+    )
+
+
+def _classify_probe_result(
+    attempt: _ProbeAttempt,
+    result: dict[str, Any] | None,
+    notification: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Write the final probe outcome and return live usage when the attempt produced any."""
+    live = _live_muse_usage(result, notification)
+    if not attempt.marked:
+        return live
+    if live is not None:
+        _finish_probe(attempt, "success", _MUSE_PROBE_DETAIL_SUCCESS)
+    elif _muse_read_is_empty(result):
+        _finish_probe(attempt, "empty", _MUSE_PROBE_DETAIL_EMPTY)
+    else:
+        _finish_probe(attempt, "failure", "muse serve ended before reporting usage")
+    return live
+
+
 def muse(now: dt.datetime | None = None) -> dict[str, Any]:
     """Read Muse subscription usage over the MSP stdio protocol.
 
     A fresh ``muse serve`` has no subscription usage: Muse keeps that only in
     the memory of the process that made a model call. The read-only
     ``usage/read`` still runs. The opt-in probe, off by default, makes one
-    minimal turn in this same host when the cache is missing or older than
-    the probe interval.
+    minimal turn in this same host only when the last probe attempt is older
+    than the probe interval. The gate is that attempt time, including when
+    ``muse-usage.json`` is missing, stale, or unusable.
     """
     command = os.environ.get("AGENT_METER_MUSE_BIN", "muse")
-    probe = _muse_should_probe()
-    timeout = _MUSE_PROBE_TIMEOUT_SECONDS if probe else _muse_timeout_seconds()
+    should_probe, throttle_state = _muse_probe_gate()
+    timeout = _muse_probe_timeout_seconds() if should_probe else _muse_timeout_seconds()
+    attempt = _ProbeAttempt()
     try:
-        result, notification = _query_muse(command, timeout, probe=probe)
+        result, notification = _query_muse(
+            command, timeout, probe=should_probe, attempt=attempt,
+        )
     except FileNotFoundError:
         return unavailable(
             "muse", "Muse", "generic",
             "muse is not installed; install Muse and sign in to see usage.",
         )
-    except (OSError, TimeoutError, RuntimeError, json.JSONDecodeError, ValueError) as error:
-        try:
-            cached_state = _muse_from_cache(now)
-        except (TypeError, ValueError) as cache_error:
-            return unavailable(
-                "muse", "Muse", "generic",
-                f"Muse usage unavailable: {cache_error}",
-            )
-        if cached_state is not None:
-            return cached_state
-        return unavailable(
-            "muse", "Muse", "generic",
-            f"Muse usage unavailable: {error}",
+    except TimeoutError as error:
+        _finish_probe(attempt, "timeout", _MUSE_PROBE_DETAIL_TIMEOUT)
+        return _muse_without_live_usage(
+            now, error=error, throttle_state=throttle_state, empty=False, probed=attempt.marked,
+        )
+    except (OSError, RuntimeError, json.JSONDecodeError, ValueError) as error:
+        _finish_probe(attempt, "failure", str(error))
+        return _muse_without_live_usage(
+            now, error=error, throttle_state=throttle_state, empty=False, probed=attempt.marked,
         )
 
-    live = _live_muse_usage(result, notification)
+    live = _classify_probe_result(attempt, result, notification)
     if live is not None:
         try:
             write_state_file(_muse_cache_path(), live)
@@ -1316,20 +1642,12 @@ def muse(now: dt.datetime | None = None) -> dict[str, Any]:
 
     # usage/read observed nothing in this process. Another Muse process's
     # calls are not visible here. Reuse agent-meter's own cache when it exists.
-    try:
-        cached_state = _muse_from_cache(now)
-    except (TypeError, ValueError) as error:
-        return unavailable(
-            "muse", "Muse", "generic",
-            f"Muse usage unavailable: {error}",
-        )
-    if cached_state is not None:
-        return cached_state
-    if _muse_read_is_empty(result):
-        return unavailable("muse", "Muse", "generic", _MUSE_NOT_REPORTED)
-    return unavailable(
-        "muse", "Muse", "generic",
-        "Muse usage unavailable: muse serve ended before reporting usage",
+    return _muse_without_live_usage(
+        now,
+        error=None,
+        throttle_state=throttle_state,
+        empty=_muse_read_is_empty(result),
+        probed=attempt.marked,
     )
 
 
