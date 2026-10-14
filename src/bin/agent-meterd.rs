@@ -18,7 +18,8 @@ struct Args {
     /// Write a single refresh and exit.
     #[arg(long, conflicts_with = "watch")]
     once: bool,
-    /// Refresh indefinitely; intended for a systemd --user service.
+    /// Refresh indefinitely. The systemd user unit is agent-meter.service;
+    /// this binary is agent-meterd (`systemctl --user restart agent-meter.service`).
     #[arg(long)]
     watch: bool,
     /// Source configuration. Defaults to $XDG_CONFIG_HOME/agent-meter/sources.json.
@@ -375,6 +376,12 @@ fn unavailable(id_hint: &str, detail: &str) -> ProviderState {
     }
 }
 
+fn write_stable_json(state: &AgentMeterState) {
+    if let Err(e) = agent_meter::write_stable_state(state) {
+        eprintln!("agent-meterd: could not write stable JSON: {e}");
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     let config_path = args.config.unwrap_or_else(config_path);
@@ -395,6 +402,7 @@ fn main() -> Result<()> {
 
         match write_state(&state_path, &state) {
             Ok(()) => {
+                write_stable_json(&state);
                 last_good_state = Some(state);
             }
             Err(err) => {

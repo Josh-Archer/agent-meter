@@ -1,0 +1,2 @@
+{"emittedAtMs":1791939336024,"jsonrpc":"2.0","method":"usage/changed","params":{"observedAtMs":1791939335951,"tier":"REDACTED_TIER","weekly":{"resetsAtMs":1792368000000,"usedPercent":48},"window":{"resetsAtMs":1791957015000,"usedPercent":0,"windowDurationMins":300}}}
+{"id":9,"jsonrpc":"2.0","result":{"usage":{"observedAtMs":1791939335951,"tier":"REDACTED_TIER","weekly":{"resetsAtMs":1792368000000,"usedPercent":48},"window":{"resetsAtMs":1791957015000,"usedPercent":0,"windowDurationMins":300}}}}

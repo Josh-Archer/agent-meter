@@ -56,7 +56,7 @@ function quotaWindows(provider) {
     return (provider.windows ?? []).filter(window =>
         typeof window.remaining_percent === 'number' &&
         Number.isFinite(window.remaining_percent) &&
-        !['availability', 'account', 'session'].includes(window.id));
+        !['availability', 'account'].includes(window.id));
 }
 
 function iconFor(extension, symbol) {
@@ -110,7 +110,7 @@ function limitText(provider) {
         current === null || entry.remaining_percent < current.remaining_percent ? entry : current, null);
     if (!lowest)
         return 'No usage data';
-    if (lowest.id === 'account' || lowest.id === 'session')
+    if (lowest.id === 'account')
         return lowest.reset_label ?? 'Active';
     return `${Math.round(lowest.remaining_percent)}% · ${lowest.reset_label ?? 'reset unknown'}`;
 }

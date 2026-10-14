@@ -7,13 +7,15 @@
       "id": "five_hour",
       "label": "5 hours",
       "remaining_percent": 72.0,
-      "reset_label": "in 1h 12m"
+      "resets_at": "2026-09-16T22:00:00Z",
+      "reset_label": "Mon, Sep 16, 2026 · 6:00 PM EDT"
     },
     {
       "id": "weekly",
       "label": "Weekly",
       "remaining_percent": 51.0,
-      "reset_label": "Tue 10:00"
+      "resets_at": "2026-09-20T14:00:00Z",
+      "reset_label": "Sat, Sep 20, 2026 · 10:00 AM EDT"
     }
   ],
   "status": "fresh",
