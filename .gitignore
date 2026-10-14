@@ -19,3 +19,4 @@ data/provider-state.json
 .vscode/
 *.swp
 .DS_Store
+!tests/fixtures/*.jsonl
