@@ -1,6 +1,8 @@
 use agent_meter::{
-    runtime_state_path, write_state, AgentMeterState, ProviderState, UsageWindow, STATE_VERSION,
+    forecast, runtime_state_path, write_state, AgentMeterState, ProviderState, UsageWindow,
+    STATE_VERSION,
 };
+use agent_meter::forecast::NotifySink;
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 use clap::Parser;
@@ -38,6 +40,52 @@ fn default_command_timeout_seconds() -> u64 {
     30
 }
 
+fn default_max_observations() -> usize {
+    forecast::DEFAULT_MAX_OBSERVATIONS
+}
+
+fn default_stale_after_seconds() -> i64 {
+    forecast::DEFAULT_STALE_AFTER_SECS
+}
+
+/// Opt-in quota-exhaustion forecasting. Disabled by default: set
+/// `enabled = true` to record the bounded local usage history, and list
+/// `notify_thresholds` to also receive threshold notifications.
+#[derive(Debug, Clone, Deserialize)]
+struct ForecastConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_max_observations")]
+    max_observations_per_window: usize,
+    #[serde(default = "default_stale_after_seconds")]
+    stale_after_seconds: i64,
+    /// Remaining-percent thresholds that trigger a notification, for example
+    /// `[25.0, 10.0, 5.0]`. Empty disables notifications.
+    #[serde(default)]
+    notify_thresholds: Vec<f32>,
+    /// Override for the usage-history file. Defaults to
+    /// `$XDG_STATE_HOME/agent-meter/usage-history.json`.
+    #[serde(default)]
+    history_path: Option<PathBuf>,
+    /// Override for the notifications log. Defaults to
+    /// `$XDG_STATE_HOME/agent-meter/notifications.jsonl`.
+    #[serde(default)]
+    notifications_path: Option<PathBuf>,
+}
+
+impl Default for ForecastConfig {
+    fn default() -> Self {
+        ForecastConfig {
+            enabled: false,
+            max_observations_per_window: default_max_observations(),
+            stale_after_seconds: default_stale_after_seconds(),
+            notify_thresholds: Vec::new(),
+            history_path: None,
+            notifications_path: None,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct Config {
     #[serde(default = "default_refresh_seconds")]
@@ -50,6 +98,8 @@ struct Config {
     command_timeout_seconds: u64,
     #[serde(default = "default_sources")]
     sources: Vec<Source>,
+    #[serde(default)]
+    forecast: ForecastConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,6 +178,7 @@ fn load_config(path: &PathBuf) -> Result<Config> {
             refresh_seconds: default_refresh_seconds(),
             command_timeout_seconds: default_command_timeout_seconds(),
             sources: default_sources(),
+            forecast: ForecastConfig::default(),
         });
     }
     let raw =
@@ -420,6 +471,51 @@ fn write_stable_json(state: &AgentMeterState) {
     }
 }
 
+/// Record the refresh in the bounded usage history and emit any configured
+/// threshold notifications. A single call site after `refresh()` so the
+/// refresh loop itself stays untouched.
+fn update_forecast_history(config: &ForecastConfig, state: &AgentMeterState) {
+    let history_path = config
+        .history_path
+        .clone()
+        .unwrap_or_else(forecast::default_history_path);
+    let mut history = forecast::load_history(&history_path).unwrap_or_default();
+    let now = Utc::now();
+    forecast::record_state(
+        &mut history,
+        state,
+        now,
+        config.max_observations_per_window,
+    );
+    if let Err(err) = forecast::save_history(&history_path, &history) {
+        eprintln!("agent-meterd: could not write usage history: {err}");
+    }
+    if config.notify_thresholds.is_empty() {
+        return;
+    }
+    let events = forecast::check_notifications(
+        &mut history,
+        &config.notify_thresholds,
+        now,
+        config.stale_after_seconds,
+    );
+    if events.is_empty() {
+        return;
+    }
+    let sink_path = config
+        .notifications_path
+        .clone()
+        .unwrap_or_else(forecast::default_notifications_path);
+    let mut sink = forecast::FileLogSink::new(sink_path);
+    for event in &events {
+        sink.notify(event);
+    }
+    // Persist duplicate-suppression state: notifications mutate `notified`.
+    if let Err(err) = forecast::save_history(&history_path, &history) {
+        eprintln!("agent-meterd: could not persist notification state: {err}");
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     let config_path = args.config.unwrap_or_else(config_path);
@@ -436,6 +532,9 @@ fn main() -> Result<()> {
                 "agent-meterd: state validation failed: {validation_err}; writing sanitized state"
             );
             sanitize_state(&mut state);
+        }
+        if config.forecast.enabled {
+            update_forecast_history(&config.forecast, &state);
         }
 
         match write_state(&state_path, &state) {
@@ -647,6 +746,7 @@ mod tests {
         let config = Config {
             refresh_seconds: 60,
             command_timeout_seconds: 1,
+            forecast: ForecastConfig::default(),
             sources: vec![Source::Command {
                 program: "sh".into(),
                 args: vec!["-c".into(), script],
@@ -724,6 +824,7 @@ mod tests {
         let config = Config {
             refresh_seconds: 60,
             command_timeout_seconds: 1,
+            forecast: ForecastConfig::default(),
             sources: vec![Source::Command {
                 program: "sleep".into(),
                 args: vec!["5".into()],
@@ -761,6 +862,7 @@ mod tests {
         let config = Config {
             refresh_seconds: 60,
             command_timeout_seconds: 5,
+            forecast: ForecastConfig::default(),
             sources: vec![Source::Command {
                 program: "sh".into(),
                 args: vec!["-c".into(), format!("echo '{valid_json}'")],
@@ -780,6 +882,7 @@ mod tests {
         let config = Config {
             refresh_seconds: 60,
             command_timeout_seconds: 5,
+            forecast: ForecastConfig::default(),
             sources: vec![Source::Command {
                 program: "sh".into(),
                 args: vec!["-c".into(), "echo not-json".into()],
@@ -854,6 +957,7 @@ mod tests {
         let config = Config {
             refresh_seconds: 60,
             command_timeout_seconds: 5,
+            forecast: ForecastConfig::default(),
             sources: vec![
                 Source::Mock {
                     provider: good_provider,
@@ -899,6 +1003,7 @@ mod tests {
         let config = Config {
             refresh_seconds: 60,
             command_timeout_seconds: 5,
+            forecast: ForecastConfig::default(),
             sources: vec![
                 Source::Command {
                     program: "false".into(),
@@ -938,6 +1043,7 @@ mod tests {
         let config = Config {
             refresh_seconds: 60,
             command_timeout_seconds: 5,
+            forecast: ForecastConfig::default(),
             sources: vec![Source::File { path: bad_file }],
         };
 
