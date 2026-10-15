@@ -1,5 +1,7 @@
 {
   "refresh_seconds": 300,
+  "max_concurrent_refreshes": 4,
+  "refresh_deadline_seconds": 45,
   "sources": [
     {
       "kind": "command",
