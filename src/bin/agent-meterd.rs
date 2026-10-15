@@ -141,14 +141,54 @@ enum CommandError {
     Timeout,
 }
 
-fn kill_process_group(child: &mut std::process::Child) {
-    let pid = child.id() as libc::pid_t;
-    if pid > 1 {
+const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+
+fn kill_process_group(pgid: libc::pid_t, child: &mut std::process::Child) {
+    if pgid > 1 {
         unsafe {
-            libc::killpg(pid, libc::SIGKILL);
+            libc::killpg(pgid, libc::SIGKILL);
         }
     }
     let _ = child.kill();
+}
+
+fn read_bounded_pipe<R: std::io::Read>(mut stream: Option<R>) -> Vec<u8> {
+    let mut buf = Vec::new();
+    if let Some(mut stream) = stream.take() {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if buf.len() < MAX_OUTPUT_BYTES {
+                        let to_take = (MAX_OUTPUT_BYTES - buf.len()).min(n);
+                        buf.extend_from_slice(&chunk[..to_take]);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    }
+    buf
+}
+
+fn clean_up_reader_threads(
+    stdout_thread: thread::JoinHandle<Vec<u8>>,
+    stderr_thread: thread::JoinHandle<Vec<u8>>,
+) {
+    let join_deadline = std::time::Instant::now() + StdDuration::from_millis(200);
+    while (!stdout_thread.is_finished() || !stderr_thread.is_finished())
+        && std::time::Instant::now() < join_deadline
+    {
+        thread::sleep(StdDuration::from_millis(5));
+    }
+    if stdout_thread.is_finished() {
+        let _ = stdout_thread.join();
+    }
+    if stderr_thread.is_finished() {
+        let _ = stderr_thread.join();
+    }
 }
 
 fn run_command_with_timeout(
@@ -165,52 +205,50 @@ fn run_command_with_timeout(
         .spawn()
         .map_err(|_| CommandError::Unavailable)?;
 
-    let mut stdout_pipe = child.stdout.take();
-    let mut stderr_pipe = child.stderr.take();
+    let pgid = child.id() as libc::pid_t;
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
 
-    let stdout_thread = thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut stream) = stdout_pipe.take() {
-            use std::io::Read;
-            let _ = stream.read_to_end(&mut buf);
-        }
-        buf
-    });
-
-    let stderr_thread = thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut stream) = stderr_pipe.take() {
-            use std::io::Read;
-            let _ = stream.read_to_end(&mut buf);
-        }
-        buf
-    });
+    let stdout_thread = thread::spawn(move || read_bounded_pipe(stdout_pipe));
+    let stderr_thread = thread::spawn(move || read_bounded_pipe(stderr_pipe));
 
     let start = std::time::Instant::now();
     let mut poll_interval = StdDuration::from_millis(5);
     let max_poll_interval = StdDuration::from_millis(50);
 
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    kill_process_group(&mut child);
+    let mut exit_status: Option<std::process::ExitStatus> = None;
+
+    loop {
+        if exit_status.is_none() {
+            match child.try_wait() {
+                Ok(Some(status)) => exit_status = Some(status),
+                Ok(None) => {}
+                Err(_) => {
+                    kill_process_group(pgid, &mut child);
                     let _ = child.wait();
-                    // Reader threads are detached when dropped without joining
-                    return Err(CommandError::Timeout);
+                    clean_up_reader_threads(stdout_thread, stderr_thread);
+                    return Err(CommandError::Unavailable);
                 }
-                thread::sleep(poll_interval);
-                poll_interval = (poll_interval * 2).min(max_poll_interval);
-            }
-            Err(_) => {
-                kill_process_group(&mut child);
-                let _ = child.wait();
-                return Err(CommandError::Unavailable);
             }
         }
-    };
 
+        if exit_status.is_some() && stdout_thread.is_finished() && stderr_thread.is_finished() {
+            break;
+        }
+
+        if start.elapsed() >= timeout {
+            kill_process_group(pgid, &mut child);
+            let _ = child.wait();
+            clean_up_reader_threads(stdout_thread, stderr_thread);
+            return Err(CommandError::Timeout);
+        }
+
+        let remaining = timeout.saturating_sub(start.elapsed());
+        thread::sleep(poll_interval.min(remaining));
+        poll_interval = (poll_interval * 2).min(max_poll_interval);
+    }
+
+    let status = exit_status.expect("exit status must be set on loop exit");
     let stdout = stdout_thread.join().unwrap_or_default();
     let stderr = stderr_thread.join().unwrap_or_default();
 
@@ -510,6 +548,156 @@ mod tests {
             "Expected timeout within ~2s, took {:?}",
             elapsed
         );
+    }
+
+    #[test]
+    fn command_timeout_kills_descendants_when_adapter_exits_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("descendant.pid");
+        let script = format!("sleep 30 & echo $! > '{}'", pid_file.display());
+
+        let t0 = std::time::Instant::now();
+        let result = run_command_with_timeout(
+            "sh",
+            &["-c".to_string(), script],
+            StdDuration::from_millis(300),
+        );
+        let elapsed = t0.elapsed();
+
+        assert!(matches!(result, Err(CommandError::Timeout)));
+        assert!(
+            elapsed < StdDuration::from_secs(2),
+            "Expected timeout within ~2s, took {:?}",
+            elapsed
+        );
+
+        let pid_str =
+            std::fs::read_to_string(&pid_file).expect("descendant pid file should be written");
+        let descendant_pid: libc::pid_t = pid_str.trim().parse().expect("valid descendant pid");
+        assert!(descendant_pid > 0);
+
+        let check_start = std::time::Instant::now();
+        let mut surviving = true;
+        while check_start.elapsed() < StdDuration::from_millis(1000) {
+            let ret = unsafe { libc::kill(descendant_pid, 0) };
+            if ret != 0 {
+                surviving = false;
+                break;
+            }
+            if let Ok(status) = std::fs::read_to_string(format!("/proc/{descendant_pid}/status")) {
+                if status
+                    .lines()
+                    .any(|l| l.starts_with("State:") && l.contains('Z'))
+                {
+                    surviving = false;
+                    break;
+                }
+            } else {
+                surviving = false;
+                break;
+            }
+            thread::sleep(StdDuration::from_millis(20));
+        }
+
+        if surviving {
+            let _ = unsafe { libc::kill(descendant_pid, libc::SIGKILL) };
+            panic!("Descendant process {descendant_pid} survived after timeout");
+        }
+    }
+
+    #[test]
+    fn command_bounds_captured_output_on_large_stream() {
+        let t0 = std::time::Instant::now();
+        let result = run_command_with_timeout(
+            "sh",
+            &[
+                "-c".to_string(),
+                "head -c 2097152 /dev/zero".to_string(),
+            ],
+            StdDuration::from_secs(5),
+        );
+        let elapsed = t0.elapsed();
+        assert!(elapsed < StdDuration::from_secs(5));
+        let output = result.expect("command should succeed");
+        assert_eq!(output.stdout.len(), MAX_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn command_timeout_bounds_captured_output_on_infinite_stream() {
+        let t0 = std::time::Instant::now();
+        let result = run_command_with_timeout(
+            "yes",
+            &[],
+            StdDuration::from_millis(200),
+        );
+        let elapsed = t0.elapsed();
+        assert!(matches!(result, Err(CommandError::Timeout)));
+        assert!(
+            elapsed < StdDuration::from_secs(2),
+            "Expected timeout within ~2s, took {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn refresh_handles_adapter_exiting_with_inherited_descendant_pipe() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("descendant.pid");
+        let script = format!("sleep 30 & echo $! > '{}'", pid_file.display());
+        let config = Config {
+            refresh_seconds: 60,
+            command_timeout_seconds: 1,
+            sources: vec![Source::Command {
+                program: "sh".into(),
+                args: vec!["-c".into(), script],
+                timeout_seconds: Some(1),
+            }],
+        };
+        let t0 = std::time::Instant::now();
+        let state = refresh(&config);
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < StdDuration::from_secs(3),
+            "Expected refresh timeout within ~3s, took {:?}",
+            elapsed
+        );
+        assert_eq!(state.providers.len(), 1);
+        let provider = &state.providers[0];
+        assert_eq!(provider.status, "unavailable");
+        assert_eq!(provider.detail.as_deref(), Some("Adapter timed out"));
+
+        let pid_str =
+            std::fs::read_to_string(&pid_file).expect("descendant pid file should be written");
+        let descendant_pid: libc::pid_t = pid_str.trim().parse().expect("valid descendant pid");
+        assert!(descendant_pid > 0);
+
+        let check_start = std::time::Instant::now();
+        let mut surviving = true;
+        while check_start.elapsed() < StdDuration::from_millis(1000) {
+            let ret = unsafe { libc::kill(descendant_pid, 0) };
+            if ret != 0 {
+                surviving = false;
+                break;
+            }
+            if let Ok(status) = std::fs::read_to_string(format!("/proc/{descendant_pid}/status")) {
+                if status
+                    .lines()
+                    .any(|l| l.starts_with("State:") && l.contains('Z'))
+                {
+                    surviving = false;
+                    break;
+                }
+            } else {
+                surviving = false;
+                break;
+            }
+            thread::sleep(StdDuration::from_millis(20));
+        }
+
+        if surviving {
+            let _ = unsafe { libc::kill(descendant_pid, libc::SIGKILL) };
+            panic!("Descendant process {descendant_pid} survived after refresh timeout");
+        }
     }
 
     #[test]
