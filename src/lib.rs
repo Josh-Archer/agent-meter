@@ -6,6 +6,8 @@
 //! It only stores normalized availability data; it never persists credentials
 //! or raw provider responses.
 
+pub mod forecast;
+
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -158,6 +160,11 @@ pub struct JsonWindow {
     pub remaining_percent: f32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resets_at: Option<String>,
+    /// Quota-exhaustion forecast from the daemon's local usage history.
+    /// Present only when the daemon has forecasting enabled and has recorded
+    /// observations for this window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forecast: Option<forecast::JsonForecast>,
 }
 
 /// A provider entry in the public JSON schema.
@@ -196,6 +203,7 @@ impl JsonOutput {
                         resets_at: w
                             .resets_at
                             .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, false)),
+                        forecast: None,
                     })
                     .collect();
                 let available = p.status != "unavailable" && p.status != "error";
@@ -213,6 +221,24 @@ impl JsonOutput {
         JsonOutput {
             schema_version: 1,
             providers,
+        }
+    }
+
+    /// Attach per-window quota forecasts, keyed by `(provider id, window id)`.
+    /// Windows without a recorded history keep `forecast: None`, which is
+    /// omitted from the serialized JSON.
+    pub fn attach_forecasts(
+        &mut self,
+        forecasts: &std::collections::HashMap<(String, String), forecast::JsonForecast>,
+    ) {
+        for provider in &mut self.providers {
+            for window in &mut provider.windows {
+                if let Some(found) =
+                    forecasts.get(&(provider.provider.clone(), window.name.clone()))
+                {
+                    window.forecast = Some(found.clone());
+                }
+            }
         }
     }
 }

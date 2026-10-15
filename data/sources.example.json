@@ -2,6 +2,10 @@
   "refresh_seconds": 300,
   "max_concurrent_refreshes": 4,
   "refresh_deadline_seconds": 45,
+  "forecast": {
+    "enabled": false,
+    "notify_thresholds": [25.0, 10.0, 5.0]
+  },
   "sources": [
     {
       "kind": "command",

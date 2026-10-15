@@ -1,6 +1,8 @@
 use agent_meter::{
-    runtime_state_path, write_state, AgentMeterState, ProviderState, UsageWindow, STATE_VERSION,
+    forecast, runtime_state_path, write_state, AgentMeterState, ProviderState, UsageWindow,
+    STATE_VERSION,
 };
+use agent_meter::forecast::NotifySink;
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 use clap::Parser;
@@ -39,6 +41,52 @@ fn default_command_timeout_seconds() -> u64 {
     30
 }
 
+fn default_max_observations() -> usize {
+    forecast::DEFAULT_MAX_OBSERVATIONS
+}
+
+fn default_stale_after_seconds() -> i64 {
+    forecast::DEFAULT_STALE_AFTER_SECS
+}
+
+/// Opt-in quota-exhaustion forecasting. Disabled by default: set
+/// `enabled = true` to record the bounded local usage history, and list
+/// `notify_thresholds` to also receive threshold notifications.
+#[derive(Debug, Clone, Deserialize)]
+struct ForecastConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_max_observations")]
+    max_observations_per_window: usize,
+    #[serde(default = "default_stale_after_seconds")]
+    stale_after_seconds: i64,
+    /// Remaining-percent thresholds that trigger a notification, for example
+    /// `[25.0, 10.0, 5.0]`. Empty disables notifications.
+    #[serde(default)]
+    notify_thresholds: Vec<f32>,
+    /// Override for the usage-history file. Defaults to
+    /// `$XDG_STATE_HOME/agent-meter/usage-history.json`.
+    #[serde(default)]
+    history_path: Option<PathBuf>,
+    /// Override for the notifications log. Defaults to
+    /// `$XDG_STATE_HOME/agent-meter/notifications.jsonl`.
+    #[serde(default)]
+    notifications_path: Option<PathBuf>,
+}
+
+impl Default for ForecastConfig {
+    fn default() -> Self {
+        ForecastConfig {
+            enabled: false,
+            max_observations_per_window: default_max_observations(),
+            stale_after_seconds: default_stale_after_seconds(),
+            notify_thresholds: Vec::new(),
+            history_path: None,
+            notifications_path: None,
+        }
+    }
+}
+
 /// Enough overlap for the usual adapter set without stacking every CLI at once.
 fn default_max_concurrent_refreshes() -> usize {
     4
@@ -68,6 +116,8 @@ struct Config {
     refresh_deadline_seconds: u64,
     #[serde(default = "default_sources")]
     sources: Vec<Source>,
+    #[serde(default)]
+    forecast: ForecastConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -149,6 +199,7 @@ fn load_config(path: &PathBuf) -> Result<Config> {
             max_concurrent_refreshes: default_max_concurrent_refreshes(),
             refresh_deadline_seconds: default_refresh_deadline_seconds(),
             sources: default_sources(),
+            forecast: ForecastConfig::default(),
         });
     }
     let raw =
@@ -677,6 +728,51 @@ fn write_stable_json(state: &AgentMeterState) {
     }
 }
 
+/// Record the refresh in the bounded usage history and emit any configured
+/// threshold notifications. A single call site after `refresh()` so the
+/// refresh loop itself stays untouched.
+fn update_forecast_history(config: &ForecastConfig, state: &AgentMeterState) {
+    let history_path = config
+        .history_path
+        .clone()
+        .unwrap_or_else(forecast::default_history_path);
+    let mut history = forecast::load_history(&history_path).unwrap_or_default();
+    let now = Utc::now();
+    forecast::record_state(
+        &mut history,
+        state,
+        now,
+        config.max_observations_per_window,
+    );
+    if let Err(err) = forecast::save_history(&history_path, &history) {
+        eprintln!("agent-meterd: could not write usage history: {err}");
+    }
+    if config.notify_thresholds.is_empty() {
+        return;
+    }
+    let events = forecast::check_notifications(
+        &mut history,
+        &config.notify_thresholds,
+        now,
+        config.stale_after_seconds,
+    );
+    if events.is_empty() {
+        return;
+    }
+    let sink_path = config
+        .notifications_path
+        .clone()
+        .unwrap_or_else(forecast::default_notifications_path);
+    let mut sink = forecast::FileLogSink::new(sink_path);
+    for event in &events {
+        sink.notify(event);
+    }
+    // Persist duplicate-suppression state: notifications mutate `notified`.
+    if let Err(err) = forecast::save_history(&history_path, &history) {
+        eprintln!("agent-meterd: could not persist notification state: {err}");
+    }
+}
+
 fn emit_state(
     state_path: &std::path::Path,
     state: &AgentMeterState,
@@ -719,11 +815,14 @@ fn main() -> Result<()> {
     let mut last_good_state: Option<AgentMeterState> = None;
     loop {
         let mut write_error: Option<anyhow::Error> = None;
-        refresh_publishing(&config, &mut last_good, |state| {
+        let final_state = refresh_publishing(&config, &mut last_good, |state| {
             if let Err(err) = emit_state(&state_path, state, &mut last_good_state) {
                 write_error = Some(err);
             }
         });
+        if config.forecast.enabled {
+            update_forecast_history(&config.forecast, &final_state);
+        }
         if last_good_state.is_none() {
             if let Some(err) = write_error {
                 if !args.watch {
@@ -918,6 +1017,7 @@ mod tests {
             command_timeout_seconds: 1,
             max_concurrent_refreshes: default_max_concurrent_refreshes(),
             refresh_deadline_seconds: default_refresh_deadline_seconds(),
+            forecast: ForecastConfig::default(),
             sources: vec![Source::Command {
                 program: "sh".into(),
                 args: vec!["-c".into(), script],
@@ -997,6 +1097,7 @@ mod tests {
             command_timeout_seconds: 1,
             max_concurrent_refreshes: default_max_concurrent_refreshes(),
             refresh_deadline_seconds: default_refresh_deadline_seconds(),
+            forecast: ForecastConfig::default(),
             sources: vec![Source::Command {
                 program: "sleep".into(),
                 args: vec!["5".into()],
@@ -1037,6 +1138,7 @@ mod tests {
             command_timeout_seconds: 5,
             max_concurrent_refreshes: default_max_concurrent_refreshes(),
             refresh_deadline_seconds: default_refresh_deadline_seconds(),
+            forecast: ForecastConfig::default(),
             sources: vec![Source::Command {
                 program: "sh".into(),
                 args: vec!["-c".into(), format!("echo '{valid_json}'")],
@@ -1059,6 +1161,7 @@ mod tests {
             command_timeout_seconds: 5,
             max_concurrent_refreshes: default_max_concurrent_refreshes(),
             refresh_deadline_seconds: default_refresh_deadline_seconds(),
+            forecast: ForecastConfig::default(),
             sources: vec![Source::Command {
                 program: "sh".into(),
                 args: vec!["-c".into(), "echo not-json".into()],
@@ -1140,6 +1243,7 @@ mod tests {
             command_timeout_seconds: 5,
             max_concurrent_refreshes: default_max_concurrent_refreshes(),
             refresh_deadline_seconds: default_refresh_deadline_seconds(),
+            forecast: ForecastConfig::default(),
             sources: vec![
                 Source::Mock {
                     provider: good_provider,
@@ -1187,6 +1291,7 @@ mod tests {
             command_timeout_seconds: 5,
             max_concurrent_refreshes: default_max_concurrent_refreshes(),
             refresh_deadline_seconds: default_refresh_deadline_seconds(),
+            forecast: ForecastConfig::default(),
             sources: vec![
                 Source::Command {
                     program: "false".into(),
@@ -1228,6 +1333,7 @@ mod tests {
             command_timeout_seconds: 5,
             max_concurrent_refreshes: default_max_concurrent_refreshes(),
             refresh_deadline_seconds: default_refresh_deadline_seconds(),
+            forecast: ForecastConfig::default(),
             sources: vec![Source::File { path: bad_file }],
         };
 
@@ -1330,6 +1436,7 @@ mod tests {
                 },
                 echo_provider(&fast),
             ],
+            forecast: ForecastConfig::default(),
         };
         let started = Instant::now();
         let mut snapshots = Vec::new();
@@ -1372,6 +1479,7 @@ mod tests {
             max_concurrent_refreshes: 2,
             refresh_deadline_seconds: 5,
             sources: vec![echo_provider(&fast)],
+            forecast: ForecastConfig::default(),
         };
         let mut last_good = HashMap::new();
         let first = refresh_publishing(&success, &mut last_good, |_| {});
@@ -1393,6 +1501,7 @@ mod tests {
                 },
                 echo_provider(&fresh_provider("grok", 40.0)),
             ],
+            forecast: ForecastConfig::default(),
         };
         // The sleeping source replaces index 0. Keep codex's last-good there.
         let started = Instant::now();
@@ -1485,6 +1594,7 @@ mod tests {
             max_concurrent_refreshes: 1,
             refresh_deadline_seconds: 5,
             sources: vec![echo_provider(&fresh_provider("codex", 70.0))],
+            forecast: ForecastConfig::default(),
         };
         let mut last_good = HashMap::new();
         let first = refresh_publishing(&success, &mut last_good, |_| {});
@@ -1500,6 +1610,7 @@ mod tests {
                 args: vec![],
                 timeout_seconds: None,
             }],
+            forecast: ForecastConfig::default(),
         };
         let second = refresh_publishing(&failure, &mut last_good, |_| {});
         assert_eq!(second.providers[0].status, "stale");
@@ -1521,6 +1632,7 @@ mod tests {
             max_concurrent_refreshes: 1,
             refresh_deadline_seconds: 5,
             sources: vec![echo_provider(&fresh_provider("codex", 55.0))],
+            forecast: ForecastConfig::default(),
         };
         refresh_publishing(&success, &mut last_good, |_| {});
 
@@ -1533,6 +1645,7 @@ mod tests {
             max_concurrent_refreshes: 1,
             refresh_deadline_seconds: 5,
             sources: vec![echo_provider(&unavailable_doc)],
+            forecast: ForecastConfig::default(),
         };
         let state = refresh_publishing(&explicit, &mut last_good, |_| {});
         assert_eq!(state.providers[0].status, "unavailable");
@@ -1549,6 +1662,7 @@ mod tests {
                 args: vec![],
                 timeout_seconds: None,
             }],
+            forecast: ForecastConfig::default(),
         };
         let after = refresh_publishing(&failure, &mut last_good, |_| {});
         assert_eq!(after.providers[0].status, "unavailable");
@@ -1581,6 +1695,7 @@ mod tests {
                     timeout_seconds: Some(10),
                 })
                 .collect(),
+            forecast: ForecastConfig::default(),
         };
 
         struct ReleaseFile<'a>(&'a std::path::Path);
@@ -1636,6 +1751,7 @@ mod tests {
                     timeout_seconds: Some(30),
                 },
             ],
+            forecast: ForecastConfig::default(),
         };
         let started = Instant::now();
         let state = refresh(&config);
@@ -1652,5 +1768,30 @@ mod tests {
             assert!(provider.updated_at.is_none());
         }
         assert!(state.validate().is_ok());
+    }
+
+    #[test]
+    fn forecast_history_updates_when_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let history_file = dir.path().join("history.json");
+        let forecast_cfg = ForecastConfig {
+            enabled: true,
+            max_observations_per_window: 10,
+            stale_after_seconds: 600,
+            notify_thresholds: vec![],
+            history_path: Some(history_file.clone()),
+            notifications_path: None,
+        };
+        let state = AgentMeterState {
+            version: STATE_VERSION,
+            generated_at: Utc::now(),
+            providers: vec![fresh_provider("fast-provider", 80.0)],
+        };
+        update_forecast_history(&forecast_cfg, &state);
+        let loaded = forecast::load_history(&history_file).unwrap();
+        assert_eq!(loaded.windows.len(), 1);
+        assert_eq!(loaded.windows[0].provider, "fast-provider");
+        assert_eq!(loaded.windows[0].observations.len(), 1);
+        assert_eq!(loaded.windows[0].observations[0].remaining_percent, 80.0);
     }
 }
