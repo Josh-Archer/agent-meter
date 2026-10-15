@@ -944,6 +944,7 @@ mod tests {
                     status: "fresh".into(),
                     detail: None,
                     usage_url: None,
+                    updated_at: None,
                 },
                 ProviderState {
                     id: "stale-one".into(),
@@ -959,6 +960,7 @@ mod tests {
                     status: "stale".into(),
                     detail: None,
                     usage_url: None,
+                    updated_at: None,
                 },
             ],
         };
