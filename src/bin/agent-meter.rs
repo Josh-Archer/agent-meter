@@ -3,6 +3,31 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 fn load_json_output(custom_state: Option<&Path>) -> Result<JsonOutput, String> {
+    let mut output = load_json_output_inner(custom_state)?;
+    attach_forecasts(&mut output);
+    Ok(output)
+}
+
+/// Best-effort: attach quota forecasts from the daemon's usage history when
+/// forecasting is enabled. A missing or unreadable history leaves the output
+/// unchanged.
+fn attach_forecasts(output: &mut JsonOutput) {
+    let path = agent_meter::forecast::default_history_path();
+    let Ok(history) = agent_meter::forecast::load_history(&path) else {
+        return;
+    };
+    if history.windows.is_empty() {
+        return;
+    }
+    let forecasts = agent_meter::forecast::forecasts_for_json(
+        &history,
+        chrono::Utc::now(),
+        agent_meter::forecast::DEFAULT_STALE_AFTER_SECS,
+    );
+    output.attach_forecasts(&forecasts);
+}
+
+fn load_json_output_inner(custom_state: Option<&Path>) -> Result<JsonOutput, String> {
     load_json_output_at(custom_state, &runtime_state_path(), &stable_state_path())
 }
 

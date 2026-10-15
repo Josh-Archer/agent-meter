@@ -115,6 +115,73 @@ breaking changes are made.
 | `providers[].updated_at` | `string` | ISO 8601 timestamp of the last successful refresh. |
 | `providers[].available` | `bool` | `false` only when the provider status is `unavailable` or `error`. Fresh and stale providers are available. |
 | `providers[].stale` | `bool` | `true` only when the provider status is `stale`. Unavailable providers are not stale. |
+| `providers[].windows[].forecast` | `object?` | Quota-exhaustion forecast (see below). Absent when forecasting is disabled or no history exists yet. |
+
+## Quota forecasting
+
+The daemon can keep a bounded, credential-free local usage history and
+forecast whether a quota will run out before its reset. Forecasting is
+**opt-in** via the `forecast` section of `sources.json`:
+
+```json
+{
+  "refresh_seconds": 300,
+  "forecast": {
+    "enabled": true,
+    "notify_thresholds": [25.0, 10.0, 5.0]
+  },
+  "sources": []
+}
+```
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `enabled` | `false` | Record usage history and compute forecasts. |
+| `max_observations_per_window` | `288` | Cap on stored observations per provider window (~24 h at 5-minute cadence). |
+| `stale_after_seconds` | `600` | Newest observation older than this marks the forecast `stale`. |
+| `notify_thresholds` | `[]` | Remaining-percent thresholds that trigger a notification, e.g. `[25.0, 10.0, 5.0]`. Empty disables notifications. |
+| `history_path` | `$XDG_STATE_HOME/agent-meter/usage-history.json` | Override for the history file. |
+| `notifications_path` | `$XDG_STATE_HOME/agent-meter/notifications.jsonl` | Override for the notifications log. |
+
+Each refresh records one observation per `fresh` provider window: a
+timestamp, the remaining percentage, and the provider-supplied reset time.
+Nothing else is stored — no credentials, no raw provider payloads. An upward
+jump of 25 percentage points is treated as a quota reset and starts a fresh
+cycle, dropping older observations.
+
+Forecasts fit a line through the most recent observations and extrapolate to
+zero remaining, then compare against the provider's reset time:
+
+| `forecast.status` | Meaning |
+| --- | --- |
+| `ok` | Usable forecast; `estimated_exhaustion_at` is set when the quota is depleting, `exhausts_before_reset` compares it with `resets_at`. |
+| `insufficient_data` | Fewer than 3 observations, or they span less than 5 minutes. |
+| `stale` | The newest observation is older than `stale_after_seconds`; no guess is made. |
+| `uncertain` | A trend exists but the linear fit is too noisy (R² < 0.5) to trust. |
+
+`agent-meter --json` attaches the forecast to each window when history is
+available:
+
+```json
+{
+  "name": "five_hour",
+  "remaining_percent": 70.0,
+  "resets_at": "2026-10-14T22:00:00+00:00",
+  "forecast": {
+    "status": "ok",
+    "estimated_exhaustion_at": "2026-10-14T20:00:00+00:00",
+    "exhausts_before_reset": true,
+    "consumption_rate_percent_per_hour": 10.0,
+    "depleting": true,
+    "observation_count": 12
+  }
+}
+```
+
+Notifications fire once per threshold per quota cycle (duplicate suppression):
+when remaining drops at or below a threshold, the daemon appends a JSON line
+to `notifications.jsonl` and logs a one-line summary to stderr. A quota reset
+clears the suppression records so the next cycle notifies again.
 
 To change the shortcut after package installation:
 
