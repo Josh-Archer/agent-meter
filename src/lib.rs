@@ -50,6 +50,11 @@ pub struct ProviderState {
     pub windows: Vec<UsageWindow>,
     /// `fresh`, `stale`, `unavailable`, or `error`.
     pub status: String,
+    /// When this provider's data was last refreshed successfully. Set by the
+    /// daemon on every completed refresh; preserved when a provider is served
+    /// from its last-good snapshot and marked stale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refreshed_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -197,8 +202,9 @@ impl JsonOutput {
                 JsonProvider {
                     provider: p.id.clone(),
                     windows,
-                    updated_at: state
-                        .generated_at
+                    updated_at: p
+                        .refreshed_at
+                        .unwrap_or(state.generated_at)
                         .to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
                     available,
                     stale,
@@ -321,6 +327,7 @@ mod tests {
                     reset_label: Some("in 1h 12m".into()),
                 }],
                 status: "fresh".into(),
+                refreshed_at: None,
                 detail: None,
                 usage_url: None,
             }],
@@ -385,6 +392,7 @@ mod tests {
                     reset_label: Some("in 1h".into()),
                 }],
                 status: "fresh".into(),
+                refreshed_at: None,
                 detail: None,
                 usage_url: None,
             }],
@@ -419,6 +427,7 @@ mod tests {
                     reset_label: None,
                 }],
                 status: "stale".into(),
+                refreshed_at: None,
                 detail: None,
                 usage_url: None,
             }],
@@ -551,5 +560,29 @@ mod tests {
         assert_eq!(parsed.providers.len(), state.providers.len());
         assert!(parsed.providers[0].available);
         assert!(!parsed.providers[0].stale);
+    }
+
+    #[test]
+    fn json_output_uses_per_provider_refreshed_at() {
+        let refreshed = chrono::DateTime::parse_from_rfc3339("2026-10-14T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut state = sample_state();
+        state.providers[0].refreshed_at = Some(refreshed);
+        let output = JsonOutput::from_state(&state);
+        assert_eq!(
+            output.providers[0].updated_at,
+            refreshed.to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
+        );
+
+        // Without a per-provider timestamp the state generation time is used.
+        let state = sample_state();
+        let output = JsonOutput::from_state(&state);
+        assert_eq!(
+            output.providers[0].updated_at,
+            state
+                .generated_at
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
+        );
     }
 }

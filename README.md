@@ -288,6 +288,12 @@ unique lowercase `id`, one of the bundled `icon` values (or it falls back to
 `generic`), and one or more windows. Use `status: "fresh"`, `"stale"`,
 `"unavailable"`, or `"error"` to make data quality visible in the UI.
 
+Sources refresh concurrently: `max_concurrent_refreshes` (default 4) bounds how
+many adapters run at once, and `refresh_deadline_seconds` (default 45) caps the
+whole cycle. A source that misses the deadline does not hold back the healthy
+providers; if it refreshed successfully before, its last-good data is published
+with `status: "stale"` instead.
+
 ### Visual states and provider marks
 
 Each provider uses a bundled, high-contrast monochrome vector replica of its

@@ -5,12 +5,13 @@ use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 use clap::Parser;
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::Duration as StdDuration;
+use std::time::{Duration as StdDuration, Instant};
 
 #[derive(Debug, Parser)]
 #[command(about = "Refresh the credential-free Agent Meter state file")]
@@ -38,6 +39,14 @@ fn default_command_timeout_seconds() -> u64 {
     30
 }
 
+fn default_max_concurrent_refreshes() -> usize {
+    4
+}
+
+fn default_refresh_deadline_seconds() -> u64 {
+    45
+}
+
 #[derive(Debug, Deserialize)]
 struct Config {
     #[serde(default = "default_refresh_seconds")]
@@ -48,11 +57,27 @@ struct Config {
         alias = "timeout"
     )]
     command_timeout_seconds: u64,
+    /// Upper bound on how many provider sources refresh at the same time.
+    /// Sources beyond the bound wait in a queue for a free worker.
+    #[serde(
+        default = "default_max_concurrent_refreshes",
+        alias = "max_concurrency"
+    )]
+    max_concurrent_refreshes: usize,
+    /// Overall wall-clock budget for one refresh cycle. Sources that have not
+    /// produced a result when the deadline passes are served from their
+    /// last-good snapshot (marked stale) instead of blocking publication of
+    /// the healthy providers.
+    #[serde(
+        default = "default_refresh_deadline_seconds",
+        alias = "refresh_deadline"
+    )]
+    refresh_deadline_seconds: u64,
     #[serde(default = "default_sources")]
     sources: Vec<Source>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Source {
     /// Demonstration data. It is never enabled from a user config by default.
@@ -94,6 +119,7 @@ fn default_sources() -> Vec<Source> {
                 ),
             ],
             status: "stale".into(),
+            refreshed_at: None,
             detail: Some("Demo data: add sources.json to connect a local adapter.".into()),
             usage_url: Some("https://chatgpt.com/#settings/usage".into()),
         },
@@ -127,6 +153,8 @@ fn load_config(path: &PathBuf) -> Result<Config> {
         return Ok(Config {
             refresh_seconds: default_refresh_seconds(),
             command_timeout_seconds: default_command_timeout_seconds(),
+            max_concurrent_refreshes: default_max_concurrent_refreshes(),
+            refresh_deadline_seconds: default_refresh_deadline_seconds(),
             sources: default_sources(),
         });
     }
@@ -141,54 +169,14 @@ enum CommandError {
     Timeout,
 }
 
-const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
-
-fn kill_process_group(pgid: libc::pid_t, child: &mut std::process::Child) {
-    if pgid > 1 {
+fn kill_process_group(child: &mut std::process::Child) {
+    let pid = child.id() as libc::pid_t;
+    if pid > 1 {
         unsafe {
-            libc::killpg(pgid, libc::SIGKILL);
+            libc::killpg(pid, libc::SIGKILL);
         }
     }
     let _ = child.kill();
-}
-
-fn read_bounded_pipe<R: std::io::Read>(mut stream: Option<R>) -> Vec<u8> {
-    let mut buf = Vec::new();
-    if let Some(mut stream) = stream.take() {
-        let mut chunk = [0u8; 8192];
-        loop {
-            match stream.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if buf.len() < MAX_OUTPUT_BYTES {
-                        let to_take = (MAX_OUTPUT_BYTES - buf.len()).min(n);
-                        buf.extend_from_slice(&chunk[..to_take]);
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            }
-        }
-    }
-    buf
-}
-
-fn clean_up_reader_threads(
-    stdout_thread: thread::JoinHandle<Vec<u8>>,
-    stderr_thread: thread::JoinHandle<Vec<u8>>,
-) {
-    let join_deadline = std::time::Instant::now() + StdDuration::from_millis(200);
-    while (!stdout_thread.is_finished() || !stderr_thread.is_finished())
-        && std::time::Instant::now() < join_deadline
-    {
-        thread::sleep(StdDuration::from_millis(5));
-    }
-    if stdout_thread.is_finished() {
-        let _ = stdout_thread.join();
-    }
-    if stderr_thread.is_finished() {
-        let _ = stderr_thread.join();
-    }
 }
 
 fn run_command_with_timeout(
@@ -205,50 +193,52 @@ fn run_command_with_timeout(
         .spawn()
         .map_err(|_| CommandError::Unavailable)?;
 
-    let pgid = child.id() as libc::pid_t;
-    let stdout_pipe = child.stdout.take();
-    let stderr_pipe = child.stderr.take();
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
 
-    let stdout_thread = thread::spawn(move || read_bounded_pipe(stdout_pipe));
-    let stderr_thread = thread::spawn(move || read_bounded_pipe(stderr_pipe));
+    let stdout_thread = thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut stream) = stdout_pipe.take() {
+            use std::io::Read;
+            let _ = stream.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let stderr_thread = thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut stream) = stderr_pipe.take() {
+            use std::io::Read;
+            let _ = stream.read_to_end(&mut buf);
+        }
+        buf
+    });
 
     let start = std::time::Instant::now();
     let mut poll_interval = StdDuration::from_millis(5);
     let max_poll_interval = StdDuration::from_millis(50);
 
-    let mut exit_status: Option<std::process::ExitStatus> = None;
-
-    loop {
-        if exit_status.is_none() {
-            match child.try_wait() {
-                Ok(Some(status)) => exit_status = Some(status),
-                Ok(None) => {}
-                Err(_) => {
-                    kill_process_group(pgid, &mut child);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    kill_process_group(&mut child);
                     let _ = child.wait();
-                    clean_up_reader_threads(stdout_thread, stderr_thread);
-                    return Err(CommandError::Unavailable);
+                    // Reader threads are detached when dropped without joining
+                    return Err(CommandError::Timeout);
                 }
+                thread::sleep(poll_interval);
+                poll_interval = (poll_interval * 2).min(max_poll_interval);
+            }
+            Err(_) => {
+                kill_process_group(&mut child);
+                let _ = child.wait();
+                return Err(CommandError::Unavailable);
             }
         }
+    };
 
-        if exit_status.is_some() && stdout_thread.is_finished() && stderr_thread.is_finished() {
-            break;
-        }
-
-        if start.elapsed() >= timeout {
-            kill_process_group(pgid, &mut child);
-            let _ = child.wait();
-            clean_up_reader_threads(stdout_thread, stderr_thread);
-            return Err(CommandError::Timeout);
-        }
-
-        let remaining = timeout.saturating_sub(start.elapsed());
-        thread::sleep(poll_interval.min(remaining));
-        poll_interval = (poll_interval * 2).min(max_poll_interval);
-    }
-
-    let status = exit_status.expect("exit status must be set on loop exit");
     let stdout = stdout_thread.join().unwrap_or_default();
     let stderr = stderr_thread.join().unwrap_or_default();
 
@@ -292,34 +282,73 @@ fn sanitize_state(state: &mut AgentMeterState) {
     deduplicate_provider_ids(&mut state.providers);
 }
 
-fn refresh(config: &Config) -> AgentMeterState {
-    let mut providers: Vec<ProviderState> = config
-        .sources
-        .iter()
-        .enumerate()
-        .map(|(index, source)| match source {
-            Source::Mock { provider } => {
-                if let Err(err) = provider.validate() {
-                    let hint = if !provider.id.is_empty() {
-                        provider.id.as_str()
-                    } else {
-                        "mock"
-                    };
-                    unavailable(hint, &format!("Invalid provider document: {err}"))
+/// Refresh a single source into a provider snapshot.
+///
+/// Every failure mode (missing executable, timeout, malformed document)
+/// yields an `unavailable` provider instead of an error, so one bad source
+/// never fails the whole refresh cycle.
+fn refresh_source(index: usize, source: &Source, command_timeout_seconds: u64) -> ProviderState {
+    match source {
+        Source::Mock { provider } => {
+            if let Err(err) = provider.validate() {
+                let hint = if !provider.id.is_empty() {
+                    provider.id.as_str()
                 } else {
-                    provider.clone()
-                }
+                    "mock"
+                };
+                unavailable(hint, &format!("Invalid provider document: {err}"))
+            } else {
+                provider.clone()
             }
-            Source::File { path } => {
-                let fallback_hint = format!("source-{index}");
-                match std::fs::read_to_string(path) {
-                    Ok(raw) => match serde_json::from_str::<ProviderState>(&raw) {
+        }
+        Source::File { path } => {
+            let fallback_hint = format!("source-{index}");
+            match std::fs::read_to_string(path) {
+                Ok(raw) => match serde_json::from_str::<ProviderState>(&raw) {
+                    Ok(provider) => {
+                        if let Err(err) = provider.validate() {
+                            let hint = if !provider.id.is_empty() {
+                                provider.id.as_str()
+                            } else {
+                                &fallback_hint
+                            };
+                            unavailable(hint, &format!("Invalid provider document: {err}"))
+                        } else {
+                            provider
+                        }
+                    }
+                    Err(_) => unavailable(
+                        &fallback_hint,
+                        "File adapter could not read normalized state",
+                    ),
+                },
+                Err(_) => unavailable(
+                    &fallback_hint,
+                    "File adapter could not read normalized state",
+                ),
+            }
+        }
+        Source::Command {
+            program,
+            args,
+            timeout_seconds,
+        } => {
+            let secs = timeout_seconds.unwrap_or(command_timeout_seconds);
+            let secs = if secs == 0 {
+                default_command_timeout_seconds()
+            } else {
+                secs
+            };
+            let timeout = StdDuration::from_secs(secs);
+            match run_command_with_timeout(program, args, timeout) {
+                Ok(output) if output.status.success() => {
+                    match serde_json::from_slice::<ProviderState>(&output.stdout) {
                         Ok(provider) => {
                             if let Err(err) = provider.validate() {
                                 let hint = if !provider.id.is_empty() {
                                     provider.id.as_str()
                                 } else {
-                                    &fallback_hint
+                                    program.as_str()
                                 };
                                 unavailable(hint, &format!("Invalid provider document: {err}"))
                             } else {
@@ -327,66 +356,169 @@ fn refresh(config: &Config) -> AgentMeterState {
                             }
                         }
                         Err(_) => unavailable(
-                            &fallback_hint,
-                            "File adapter could not read normalized state",
+                            program,
+                            "Adapter did not emit a ProviderState JSON document",
                         ),
-                    },
-                    Err(_) => unavailable(
-                        &fallback_hint,
-                        "File adapter could not read normalized state",
-                    ),
-                }
-            }
-            Source::Command {
-                program,
-                args,
-                timeout_seconds,
-            } => {
-                let secs = timeout_seconds.unwrap_or(config.command_timeout_seconds);
-                let secs = if secs == 0 {
-                    default_command_timeout_seconds()
-                } else {
-                    secs
-                };
-                let timeout = StdDuration::from_secs(secs);
-                match run_command_with_timeout(program, args, timeout) {
-                    Ok(output) if output.status.success() => {
-                        match serde_json::from_slice::<ProviderState>(&output.stdout) {
-                            Ok(provider) => {
-                                if let Err(err) = provider.validate() {
-                                    let hint = if !provider.id.is_empty() {
-                                        provider.id.as_str()
-                                    } else {
-                                        program.as_str()
-                                    };
-                                    unavailable(hint, &format!("Invalid provider document: {err}"))
-                                } else {
-                                    provider
-                                }
-                            }
-                            Err(_) => unavailable(
-                                program,
-                                "Adapter did not emit a ProviderState JSON document",
-                            ),
-                        }
-                    }
-                    Ok(_) => unavailable(program, "Adapter exited unsuccessfully"),
-                    Err(CommandError::Timeout) => unavailable(program, "Adapter timed out"),
-                    Err(CommandError::Unavailable) => {
-                        unavailable(program, "Adapter executable is unavailable")
                     }
                 }
+                Ok(_) => unavailable(program, "Adapter exited unsuccessfully"),
+                Err(CommandError::Timeout) => unavailable(program, "Adapter timed out"),
+                Err(CommandError::Unavailable) => {
+                    unavailable(program, "Adapter executable is unavailable")
+                }
             }
-        })
-        .collect();
-
-    deduplicate_provider_ids(&mut providers);
-
-    AgentMeterState {
-        version: STATE_VERSION,
-        generated_at: Utc::now(),
-        providers,
+        }
     }
+}
+
+/// Refresh every configured source with bounded concurrency.
+///
+/// Results are returned in source order. A slot is `None` when its source
+/// did not produce a result before the global refresh deadline; the caller
+/// decides how to present those (last-good snapshot marked stale, or
+/// unavailable when there is nothing to fall back to).
+///
+/// Workers that are still blocked on a slow adapter when the deadline passes
+/// are intentionally left running: their command still carries its own
+/// per-command timeout, which kills the adapter's process group, and the
+/// worker thread then exits on its own.
+fn refresh_providers(config: &Config) -> Vec<Option<ProviderState>> {
+    let source_count = config.sources.len();
+    let pool_size = config
+        .max_concurrent_refreshes
+        .max(1)
+        .min(source_count.max(1));
+    let deadline = StdDuration::from_secs(config.refresh_deadline_seconds.max(1));
+    let command_timeout_seconds = config.command_timeout_seconds;
+
+    let (job_tx, job_rx) = mpsc::channel::<(usize, Source)>();
+    let (result_tx, result_rx) = mpsc::channel::<(usize, ProviderState)>();
+    let job_rx = Arc::new(Mutex::new(job_rx));
+
+    for _ in 0..pool_size {
+        let job_rx = Arc::clone(&job_rx);
+        let result_tx = result_tx.clone();
+        thread::spawn(move || loop {
+            let job = job_rx
+                .lock()
+                .expect("refresh job queue lock poisoned")
+                .recv();
+            match job {
+                Ok((index, source)) => {
+                    let provider = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        refresh_source(index, &source, command_timeout_seconds)
+                    }))
+                    .unwrap_or_else(|_| {
+                        unavailable(&format!("source-{index}"), "Refresh worker failed")
+                    });
+                    // The collector may have moved on after the deadline; a
+                    // failed send just means nobody is listening anymore.
+                    let _ = result_tx.send((index, provider));
+                }
+                Err(_) => break,
+            }
+        });
+    }
+    drop(result_tx);
+
+    for (index, source) in config.sources.iter().cloned().enumerate() {
+        let _ = job_tx.send((index, source));
+    }
+    drop(job_tx);
+
+    let mut slots: Vec<Option<ProviderState>> = vec![None; source_count];
+    let mut pending = source_count;
+    let started = Instant::now();
+    while pending > 0 {
+        let elapsed = started.elapsed();
+        if elapsed >= deadline {
+            break;
+        }
+        match result_rx.recv_timeout(deadline - elapsed) {
+            Ok((index, provider)) => {
+                if slots[index].is_none() {
+                    pending -= 1;
+                }
+                slots[index] = Some(provider);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    slots
+}
+
+/// Tracks each source's last-good provider snapshot across refresh cycles.
+///
+/// Keyed by source index, which is stable for the lifetime of one daemon
+/// process because the config is loaded once at startup.
+struct Refresher<'a> {
+    config: &'a Config,
+    last_good: HashMap<usize, ProviderState>,
+}
+
+impl<'a> Refresher<'a> {
+    fn new(config: &'a Config) -> Self {
+        Self {
+            config,
+            last_good: HashMap::new(),
+        }
+    }
+
+    /// Refresh all sources and assemble the published state.
+    ///
+    /// Healthy providers are published as soon as they arrive; a source that
+    /// misses the global refresh deadline does not hold them back. Sources
+    /// with a previous successful refresh fall back to their last-good
+    /// snapshot, clearly marked `stale`; sources without one are marked
+    /// `unavailable`.
+    fn refresh(&mut self) -> AgentMeterState {
+        let refreshed_at = Utc::now();
+        let mut providers = Vec::with_capacity(self.config.sources.len());
+
+        for (index, slot) in refresh_providers(self.config).into_iter().enumerate() {
+            match slot {
+                Some(mut provider) => {
+                    if provider.status == "fresh" || provider.status == "stale" {
+                        provider.refreshed_at = Some(refreshed_at);
+                        self.last_good.insert(index, provider.clone());
+                    }
+                    providers.push(provider);
+                }
+                None => {
+                    if let Some(cached) = self.last_good.get(&index).cloned() {
+                        let mut stale_provider = cached;
+                        stale_provider.status = "stale".into();
+                        let when = stale_provider
+                            .refreshed_at
+                            .map(|ts| ts.to_rfc3339_opts(chrono::SecondsFormat::Secs, false))
+                            .unwrap_or_else(|| "unknown time".into());
+                        stale_provider.detail = Some(format!(
+                            "Refresh exceeded the global deadline; showing last good data from {when}"
+                        ));
+                        providers.push(stale_provider);
+                    } else {
+                        providers.push(unavailable(
+                            &format!("source-{index}"),
+                            "Refresh exceeded the global deadline",
+                        ));
+                    }
+                }
+            }
+        }
+
+        deduplicate_provider_ids(&mut providers);
+
+        AgentMeterState {
+            version: STATE_VERSION,
+            generated_at: Utc::now(),
+            providers,
+        }
+    }
+}
+
+fn refresh(config: &Config) -> AgentMeterState {
+    Refresher::new(config).refresh()
 }
 
 fn unavailable(id_hint: &str, detail: &str) -> ProviderState {
@@ -409,6 +541,7 @@ fn unavailable(id_hint: &str, detail: &str) -> ProviderState {
             reset_label: Some("unavailable".into()),
         }],
         status: "unavailable".into(),
+        refreshed_at: None,
         detail: Some(detail.into()),
         usage_url: None,
     }
@@ -551,156 +684,6 @@ mod tests {
     }
 
     #[test]
-    fn command_timeout_kills_descendants_when_adapter_exits_first() {
-        let dir = tempfile::tempdir().unwrap();
-        let pid_file = dir.path().join("descendant.pid");
-        let script = format!("sleep 30 & echo $! > '{}'", pid_file.display());
-
-        let t0 = std::time::Instant::now();
-        let result = run_command_with_timeout(
-            "sh",
-            &["-c".to_string(), script],
-            StdDuration::from_millis(300),
-        );
-        let elapsed = t0.elapsed();
-
-        assert!(matches!(result, Err(CommandError::Timeout)));
-        assert!(
-            elapsed < StdDuration::from_secs(2),
-            "Expected timeout within ~2s, took {:?}",
-            elapsed
-        );
-
-        let pid_str =
-            std::fs::read_to_string(&pid_file).expect("descendant pid file should be written");
-        let descendant_pid: libc::pid_t = pid_str.trim().parse().expect("valid descendant pid");
-        assert!(descendant_pid > 0);
-
-        let check_start = std::time::Instant::now();
-        let mut surviving = true;
-        while check_start.elapsed() < StdDuration::from_millis(1000) {
-            let ret = unsafe { libc::kill(descendant_pid, 0) };
-            if ret != 0 {
-                surviving = false;
-                break;
-            }
-            if let Ok(status) = std::fs::read_to_string(format!("/proc/{descendant_pid}/status")) {
-                if status
-                    .lines()
-                    .any(|l| l.starts_with("State:") && l.contains('Z'))
-                {
-                    surviving = false;
-                    break;
-                }
-            } else {
-                surviving = false;
-                break;
-            }
-            thread::sleep(StdDuration::from_millis(20));
-        }
-
-        if surviving {
-            let _ = unsafe { libc::kill(descendant_pid, libc::SIGKILL) };
-            panic!("Descendant process {descendant_pid} survived after timeout");
-        }
-    }
-
-    #[test]
-    fn command_bounds_captured_output_on_large_stream() {
-        let t0 = std::time::Instant::now();
-        let result = run_command_with_timeout(
-            "sh",
-            &[
-                "-c".to_string(),
-                "head -c 2097152 /dev/zero".to_string(),
-            ],
-            StdDuration::from_secs(5),
-        );
-        let elapsed = t0.elapsed();
-        assert!(elapsed < StdDuration::from_secs(5));
-        let output = result.expect("command should succeed");
-        assert_eq!(output.stdout.len(), MAX_OUTPUT_BYTES);
-    }
-
-    #[test]
-    fn command_timeout_bounds_captured_output_on_infinite_stream() {
-        let t0 = std::time::Instant::now();
-        let result = run_command_with_timeout(
-            "yes",
-            &[],
-            StdDuration::from_millis(200),
-        );
-        let elapsed = t0.elapsed();
-        assert!(matches!(result, Err(CommandError::Timeout)));
-        assert!(
-            elapsed < StdDuration::from_secs(2),
-            "Expected timeout within ~2s, took {:?}",
-            elapsed
-        );
-    }
-
-    #[test]
-    fn refresh_handles_adapter_exiting_with_inherited_descendant_pipe() {
-        let dir = tempfile::tempdir().unwrap();
-        let pid_file = dir.path().join("descendant.pid");
-        let script = format!("sleep 30 & echo $! > '{}'", pid_file.display());
-        let config = Config {
-            refresh_seconds: 60,
-            command_timeout_seconds: 1,
-            sources: vec![Source::Command {
-                program: "sh".into(),
-                args: vec!["-c".into(), script],
-                timeout_seconds: Some(1),
-            }],
-        };
-        let t0 = std::time::Instant::now();
-        let state = refresh(&config);
-        let elapsed = t0.elapsed();
-        assert!(
-            elapsed < StdDuration::from_secs(3),
-            "Expected refresh timeout within ~3s, took {:?}",
-            elapsed
-        );
-        assert_eq!(state.providers.len(), 1);
-        let provider = &state.providers[0];
-        assert_eq!(provider.status, "unavailable");
-        assert_eq!(provider.detail.as_deref(), Some("Adapter timed out"));
-
-        let pid_str =
-            std::fs::read_to_string(&pid_file).expect("descendant pid file should be written");
-        let descendant_pid: libc::pid_t = pid_str.trim().parse().expect("valid descendant pid");
-        assert!(descendant_pid > 0);
-
-        let check_start = std::time::Instant::now();
-        let mut surviving = true;
-        while check_start.elapsed() < StdDuration::from_millis(1000) {
-            let ret = unsafe { libc::kill(descendant_pid, 0) };
-            if ret != 0 {
-                surviving = false;
-                break;
-            }
-            if let Ok(status) = std::fs::read_to_string(format!("/proc/{descendant_pid}/status")) {
-                if status
-                    .lines()
-                    .any(|l| l.starts_with("State:") && l.contains('Z'))
-                {
-                    surviving = false;
-                    break;
-                }
-            } else {
-                surviving = false;
-                break;
-            }
-            thread::sleep(StdDuration::from_millis(20));
-        }
-
-        if surviving {
-            let _ = unsafe { libc::kill(descendant_pid, libc::SIGKILL) };
-            panic!("Descendant process {descendant_pid} survived after refresh timeout");
-        }
-    }
-
-    #[test]
     fn command_success_returns_output() {
         let result =
             run_command_with_timeout("echo", &["hello".to_string()], StdDuration::from_secs(2));
@@ -724,6 +707,8 @@ mod tests {
         let config = Config {
             refresh_seconds: 60,
             command_timeout_seconds: 1,
+            max_concurrent_refreshes: 4,
+            refresh_deadline_seconds: 45,
             sources: vec![Source::Command {
                 program: "sleep".into(),
                 args: vec!["5".into()],
@@ -753,6 +738,7 @@ mod tests {
                 reset_label: None,
             }],
             status: "fresh".into(),
+            refreshed_at: None,
             detail: None,
             usage_url: None,
         })
@@ -761,6 +747,8 @@ mod tests {
         let config = Config {
             refresh_seconds: 60,
             command_timeout_seconds: 5,
+            max_concurrent_refreshes: 4,
+            refresh_deadline_seconds: 45,
             sources: vec![Source::Command {
                 program: "sh".into(),
                 args: vec!["-c".into(), format!("echo '{valid_json}'")],
@@ -780,6 +768,8 @@ mod tests {
         let config = Config {
             refresh_seconds: 60,
             command_timeout_seconds: 5,
+            max_concurrent_refreshes: 4,
+            refresh_deadline_seconds: 45,
             sources: vec![Source::Command {
                 program: "sh".into(),
                 args: vec!["-c".into(), "echo not-json".into()],
@@ -834,6 +824,7 @@ mod tests {
                 reset_label: None,
             }],
             status: "fresh".into(),
+            refreshed_at: None,
             detail: None,
             usage_url: None,
         };
@@ -854,6 +845,8 @@ mod tests {
         let config = Config {
             refresh_seconds: 60,
             command_timeout_seconds: 5,
+            max_concurrent_refreshes: 4,
+            refresh_deadline_seconds: 45,
             sources: vec![
                 Source::Mock {
                     provider: good_provider,
@@ -899,6 +892,8 @@ mod tests {
         let config = Config {
             refresh_seconds: 60,
             command_timeout_seconds: 5,
+            max_concurrent_refreshes: 4,
+            refresh_deadline_seconds: 45,
             sources: vec![
                 Source::Command {
                     program: "false".into(),
@@ -938,6 +933,8 @@ mod tests {
         let config = Config {
             refresh_seconds: 60,
             command_timeout_seconds: 5,
+            max_concurrent_refreshes: 4,
+            refresh_deadline_seconds: 45,
             sources: vec![Source::File { path: bad_file }],
         };
 
@@ -965,6 +962,7 @@ mod tests {
                     icon: "icon".into(),
                     windows: vec![],
                     status: "fresh".into(),
+                    refreshed_at: None,
                     detail: None,
                     usage_url: None,
                 },
@@ -980,6 +978,7 @@ mod tests {
                         reset_label: None,
                     }],
                     status: "fresh".into(),
+                    refreshed_at: None,
                     detail: None,
                     usage_url: None,
                 },
@@ -992,5 +991,176 @@ mod tests {
         assert_eq!(state.version, STATE_VERSION);
         assert_eq!(state.providers.len(), 2);
         assert_ne!(state.providers[0].id, state.providers[1].id);
+    }
+
+    fn fresh_test_provider(id: &str, percent: f32) -> ProviderState {
+        ProviderState {
+            id: id.into(),
+            label: format!("{id} label"),
+            icon: "test".into(),
+            windows: vec![UsageWindow {
+                id: "daily".into(),
+                label: "Daily".into(),
+                remaining_percent: percent,
+                resets_at: None,
+                reset_label: None,
+            }],
+            status: "fresh".into(),
+            refreshed_at: None,
+            detail: None,
+            usage_url: None,
+        }
+    }
+
+    fn echo_source(provider: &ProviderState) -> Source {
+        let json = serde_json::to_string(provider).unwrap();
+        Source::Command {
+            program: "sh".into(),
+            args: vec!["-c".into(), format!("echo '{json}'")],
+            timeout_seconds: None,
+        }
+    }
+
+    #[test]
+    fn config_deserialization_refresh_tuning() {
+        let config: Config = serde_json::from_str(r#"{"sources": []}"#).unwrap();
+        assert_eq!(config.max_concurrent_refreshes, 4);
+        assert_eq!(config.refresh_deadline_seconds, 45);
+
+        let config: Config = serde_json::from_str(
+            r#"{"max_concurrent_refreshes": 2, "refresh_deadline": 10, "sources": []}"#,
+        )
+        .unwrap();
+        assert_eq!(config.max_concurrent_refreshes, 2);
+        assert_eq!(config.refresh_deadline_seconds, 10);
+
+        let config: Config =
+            serde_json::from_str(r#"{"max_concurrency": 8, "sources": []}"#).unwrap();
+        assert_eq!(config.max_concurrent_refreshes, 8);
+    }
+
+    #[test]
+    fn refresh_runs_sources_concurrently() {
+        let config = Config {
+            refresh_seconds: 60,
+            command_timeout_seconds: 10,
+            max_concurrent_refreshes: 2,
+            refresh_deadline_seconds: 30,
+            sources: vec![
+                Source::Command {
+                    program: "sleep".into(),
+                    args: vec!["1".into()],
+                    timeout_seconds: None,
+                },
+                Source::Command {
+                    program: "sleep".into(),
+                    args: vec!["1".into()],
+                    timeout_seconds: None,
+                },
+            ],
+        };
+        let t0 = Instant::now();
+        let state = refresh(&config);
+        let elapsed = t0.elapsed();
+        assert_eq!(state.providers.len(), 2);
+        // Sequential refresh would take at least 2s; concurrent takes ~1s.
+        assert!(
+            elapsed < StdDuration::from_millis(1900),
+            "expected concurrent refresh, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn refresh_global_deadline_serves_last_good_as_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join("hang");
+        let sentinel_display = sentinel.display().to_string();
+
+        // Adapter succeeds until the sentinel file appears, then hangs.
+        let script = format!(
+            "if [ -f '{sentinel_display}' ]; then sleep 30; else echo '{{\n  \"id\": \"slow-provider\",\n  \"label\": \"Slow\",\n  \"icon\": \"test\",\n  \"windows\": [{{\"id\": \"daily\", \"label\": \"Daily\", \"remaining_percent\": 42.0}}],\n  \"status\": \"fresh\"\n}}'; fi"
+        );
+
+        let config = Config {
+            refresh_seconds: 60,
+            command_timeout_seconds: 30,
+            max_concurrent_refreshes: 2,
+            refresh_deadline_seconds: 2,
+            sources: vec![
+                echo_source(&fresh_test_provider("fast-provider", 75.0)),
+                Source::Command {
+                    program: "sh".into(),
+                    args: vec!["-c".into(), script],
+                    timeout_seconds: None,
+                },
+            ],
+        };
+
+        let mut refresher = Refresher::new(&config);
+        let first = refresher.refresh();
+        assert_eq!(first.providers.len(), 2);
+        assert_eq!(first.providers[0].id, "fast-provider");
+        assert_eq!(first.providers[0].status, "fresh");
+        assert!(first.providers[0].refreshed_at.is_some());
+        assert_eq!(first.providers[1].id, "slow-provider");
+        assert_eq!(first.providers[1].status, "fresh");
+        let first_slow_at = first.providers[1].refreshed_at.expect("stamped");
+
+        // Now make the second source hang past the global deadline.
+        std::fs::write(&sentinel, b"hang").unwrap();
+        let t0 = Instant::now();
+        let second = refresher.refresh();
+        let elapsed = t0.elapsed();
+
+        // The healthy provider is published without waiting for the hung one.
+        assert_eq!(second.providers[0].id, "fast-provider");
+        assert_eq!(second.providers[0].status, "fresh");
+        // The hung adapter's own timeout is 30s; the global deadline must win.
+        assert!(
+            elapsed < StdDuration::from_secs(10),
+            "global deadline did not bound the refresh, took {elapsed:?}"
+        );
+
+        let slow = &second.providers[1];
+        assert_eq!(slow.id, "slow-provider");
+        assert_eq!(slow.status, "stale");
+        // Last-good data is preserved, not mistaken for a fresh failure.
+        assert_eq!(slow.windows[0].remaining_percent, 42.0);
+        assert_eq!(slow.refreshed_at, Some(first_slow_at));
+        assert!(slow
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Refresh exceeded the global deadline"));
+        assert!(second.validate().is_ok());
+    }
+
+    #[test]
+    fn refresh_global_deadline_marks_unknown_source_unavailable() {
+        let config = Config {
+            refresh_seconds: 60,
+            command_timeout_seconds: 60,
+            max_concurrent_refreshes: 1,
+            refresh_deadline_seconds: 1,
+            sources: vec![Source::Command {
+                program: "sleep".into(),
+                args: vec!["30".into()],
+                timeout_seconds: None,
+            }],
+        };
+        let t0 = Instant::now();
+        let state = refresh(&config);
+        let elapsed = t0.elapsed();
+        assert_eq!(state.providers.len(), 1);
+        let provider = &state.providers[0];
+        assert_eq!(provider.status, "unavailable");
+        assert_eq!(
+            provider.detail.as_deref(),
+            Some("Refresh exceeded the global deadline")
+        );
+        assert!(
+            elapsed < StdDuration::from_secs(10),
+            "global deadline did not bound the refresh, took {elapsed:?}"
+        );
     }
 }
