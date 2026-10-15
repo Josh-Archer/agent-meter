@@ -54,6 +54,12 @@ pub struct ProviderState {
     pub detail: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_url: Option<String>,
+    /// When this provider last returned usable usage data.
+    ///
+    /// Failed refreshes keep the previous value and set `status` to `stale`,
+    /// so a slow adapter does not look like a brand-new reading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
 }
 
 impl ProviderState {
@@ -194,12 +200,11 @@ impl JsonOutput {
                     .collect();
                 let available = p.status != "unavailable" && p.status != "error";
                 let stale = p.status == "stale";
+                let updated_at = p.updated_at.unwrap_or(state.generated_at);
                 JsonProvider {
                     provider: p.id.clone(),
                     windows,
-                    updated_at: state
-                        .generated_at
-                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
+                    updated_at: updated_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
                     available,
                     stale,
                 }
@@ -323,6 +328,7 @@ mod tests {
                 status: "fresh".into(),
                 detail: None,
                 usage_url: None,
+                updated_at: None,
             }],
         }
     }
@@ -387,6 +393,7 @@ mod tests {
                 status: "fresh".into(),
                 detail: None,
                 usage_url: None,
+                updated_at: None,
             }],
         };
         let output = JsonOutput::from_state(&state);
@@ -395,6 +402,7 @@ mod tests {
         assert_eq!(output.providers[0].provider, "codex");
         assert!(output.providers[0].available);
         assert!(!output.providers[0].stale);
+        assert_eq!(output.providers[0].updated_at, "2026-09-12T10:00:00+00:00");
         assert_eq!(output.providers[0].windows[0].name, "five_hour");
         assert_eq!(output.providers[0].windows[0].remaining_percent, 72.0);
         assert!(output.providers[0].windows[0].resets_at.is_some());
@@ -421,11 +429,51 @@ mod tests {
                 status: "stale".into(),
                 detail: None,
                 usage_url: None,
+                updated_at: None,
             }],
         };
         let output = JsonOutput::from_state(&state);
         assert!(output.providers[0].available);
         assert!(output.providers[0].stale);
+    }
+
+    #[test]
+    fn json_output_keeps_per_provider_last_good_timestamps() {
+        let generated = chrono::DateTime::parse_from_rfc3339("2026-10-15T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let codex_at = chrono::DateTime::parse_from_rfc3339("2026-10-15T11:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let grok_at = chrono::DateTime::parse_from_rfc3339("2026-10-15T09:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut state = sample_state();
+        state.generated_at = generated;
+        state.providers[0].updated_at = Some(codex_at);
+        state.providers.push(ProviderState {
+            id: "grok".into(),
+            label: "Grok".into(),
+            icon: "grok".into(),
+            windows: vec![UsageWindow {
+                id: "weekly".into(),
+                label: "Weekly".into(),
+                remaining_percent: 45.0,
+                resets_at: None,
+                reset_label: None,
+            }],
+            status: "stale".into(),
+            detail: Some("Stale: last good data at 2026-10-15T09:30:00+00:00".into()),
+            usage_url: None,
+            updated_at: Some(grok_at),
+        });
+
+        let output = JsonOutput::from_state(&state);
+        assert_eq!(output.providers[0].updated_at, "2026-10-15T11:00:00+00:00");
+        assert!(!output.providers[0].stale);
+        assert_eq!(output.providers[1].updated_at, "2026-10-15T09:30:00+00:00");
+        assert!(output.providers[1].stale);
+        assert_ne!(output.providers[1].updated_at, "2026-10-15T12:00:00+00:00");
     }
 
     fn provider_with_status(status: &str) -> AgentMeterState {
@@ -506,7 +554,9 @@ mod tests {
         let path = runtime_state_path_from(None);
         assert_eq!(
             path,
-            std::env::temp_dir().join("agent-meter").join(STATE_FILE_NAME)
+            std::env::temp_dir()
+                .join("agent-meter")
+                .join(STATE_FILE_NAME)
         );
     }
 

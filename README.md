@@ -288,6 +288,14 @@ unique lowercase `id`, one of the bundled `icon` values (or it falls back to
 `generic`), and one or more windows. Use `status: "fresh"`, `"stale"`,
 `"unavailable"`, or `"error"` to make data quality visible in the UI.
 
+Sources refresh independently, up to `max_concurrent_refreshes` at once
+(default 4). Each command keeps its own timeout (`command_timeout_seconds`,
+default 30). The wave also stops at `refresh_deadline_seconds` (default 45),
+so several slow adapters do not add their delays together. A provider that
+finishes is written immediately. One that misses the deadline, or fails after
+a previous success, keeps that last good snapshot: `status` becomes `stale`,
+the usage windows stay, and `updated_at` remains the time of the last success.
+
 ### Visual states and provider marks
 
 Each provider uses a bundled, high-contrast monochrome vector replica of its
