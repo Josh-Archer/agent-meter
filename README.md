@@ -53,7 +53,11 @@ off-screen. The top-bar row is always available.
 
 Press **Super+Alt+U** to show or hide the widget, even over an active app.
 Switching focus to another app restores desktop-only visibility. Drag the
-**Agent Meter** header to reposition it.
+**Agent Meter** header to reposition it. The provider menu's **Desktop Widget**
+switch, and this shortcut, are saved in
+`$XDG_CONFIG_HOME/agent-meter/position.json` (usually
+`~/.config/agent-meter/position.json`) and restored when the extension starts.
+The top bar stays available while the card is hidden.
 
 ## JSON output (`--json`) and stable state file
 

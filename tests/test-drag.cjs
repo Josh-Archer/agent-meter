@@ -5,10 +5,12 @@ const source = fs.readFileSync('gnome-extension/agent-meter@local/extension.js',
 const Clutter = {EVENT_STOP: true, EVENT_PROPAGATE: false, BUTTON_PRIMARY: 1,
     EventType: {MOTION: 1, BUTTON_RELEASE: 2}};
 let captured, disconnected, dismissed = false, saved;
+const visibleSaves = [];
 const global = {display: {focus_window: {}}, stage: {
     grab: () => ({dismiss() { dismissed = true; }}),
 }};
 const savePosition = (x, y) => { saved = [x, y]; };
+const saveDesktopVisible = (visible) => { visibleSaves.push(visible); };
 const start = source.indexOf('    _finishDrag(');
 const end = source.indexOf('    _readState()', start);
 const Drag = eval(`(class {${source.slice(start, end)}})`);
@@ -48,6 +50,19 @@ assert.equal(drag._desktop.visible, false, 'Shortcut closes the widget');
 global.display.focus_window = null;
 drag.toggleFromKeyboard();
 assert.equal(drag._desktop.visible, true, 'Shortcut also opens on desktop');
+assert.deepEqual(visibleSaves, [true, false, true], 'Shortcut persists the desktop widget switch');
+// The shortcut can force the card over an app. The menu switch is the saved
+// desktop preference, applied once that temporary overlay is dismissed.
+drag._keyboardShown = false;
+drag._syncDesktopVisibility();
+assert.equal(drag._desktop.visible, true, 'Switch stays on after the shortcut opens the card');
+drag._setDesktopVisible(false);
+assert.equal(drag._desktopVisible, false);
+assert.equal(drag._desktop.visible, false, 'Menu switch hides the card on the desktop');
+assert.equal(visibleSaves.at(-1), false);
+drag._setDesktopVisible(true);
+assert.equal(drag._desktop.visible, true, 'Menu switch shows the card on the desktop');
+assert.equal(visibleSaves.at(-1), true);
 assert.ok(source.includes("Main.wm.removeKeybinding('toggle-widget')"));
 const refreshBody = source.slice(source.indexOf('    _refresh() {'), source.indexOf('        const state = this._readState();'));
 assert.match(refreshBody, /if \(this\._dragState\)\s+return;/);
