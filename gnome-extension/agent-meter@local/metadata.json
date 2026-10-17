@@ -2,7 +2,7 @@
   "uuid": "agent-meter@local",
   "name": "Agent Meter",
   "description": "Shows local coding-agent usage state in the GNOME top bar.",
-  "shell-version": ["46"],
+  "shell-version": ["46", "47", "48", "49", "50"],
   "url": "https://github.com/Josh-Archer/agent-meter",
-  "version": 1
+  "version": 2
 }
