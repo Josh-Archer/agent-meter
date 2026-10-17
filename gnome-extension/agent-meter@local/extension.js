@@ -115,6 +115,32 @@ function limitText(provider) {
     return `${Math.round(lowest.remaining_percent)}% · ${lowest.reset_label ?? 'reset unknown'}`;
 }
 
+// Provider state is local JSON. Only an http(s) page with no embedded
+// userinfo may be handed to the default browser.
+function usagePageUrl(value) {
+    if (typeof value !== 'string')
+        return null;
+    const url = value.trim();
+    if (!/^https?:\/\/[^\s/?#@]+(?::\d+)?(?:[/?#][^\s]*)?$/i.test(url))
+        return null;
+    return url;
+}
+
+function openUsagePage(url) {
+    const target = usagePageUrl(url);
+    if (!target)
+        return false;
+    try {
+        const context = global.create_app_launch_context(0, -1);
+        if (!Gio.AppInfo.launch_default_for_uri(target, context))
+            throw new Error('no default application for the usage page');
+        return true;
+    } catch (error) {
+        console.warn(`Agent Meter could not open usage page: ${error.message}`);
+        return false;
+    }
+}
+
 const AgentMeterIndicator = GObject.registerClass(
 class AgentMeterIndicator extends PanelMenu.Button {
     _init(extension) {
@@ -410,6 +436,13 @@ class AgentMeterIndicator extends PanelMenu.Button {
             labels.add_child(new St.Label({text: limitText(provider), style_class: 'agent-meter-limit'}));
             item.add_child(labels);
             this.menu.addMenuItem(item);
+
+            const usageUrl = usagePageUrl(provider.usage_url);
+            if (usageUrl) {
+                const openUsage = new PopupMenu.PopupMenuItem(`  → Open ${provider.label} usage…`);
+                openUsage.connect('activate', () => openUsagePage(usageUrl));
+                this.menu.addMenuItem(openUsage);
+            }
 
             // A stale snapshot means the provider was previously available but
             // has not emitted a newer usage record. It is not an OAuth failure,
