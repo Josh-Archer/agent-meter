@@ -31,9 +31,13 @@ assert "const shouldShowQuota = isFresh && hasNumericQuota;" in source
 assert "Usage unavailable; cached data expired." in source
 assert "Open Grok Build to refresh" in source
 assert "['connect', 'open'].includes(action)" in source
+assert "function usagePageUrl(" in source
+assert "Gio.AppInfo.launch_default_for_uri" in source
+assert "Open ${provider.label} usage" in source
 
 # Validate progressive quotaColor function in JS
 import subprocess
+subprocess.run(["node", "tests/test-usage-url.cjs"], check=True, cwd=root)
 js_test = """
 const source = require('fs').readFileSync('gnome-extension/agent-meter@local/extension.js', 'utf8');
 // Extract COLOR_STOPS and quotaColor function
