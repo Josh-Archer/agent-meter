@@ -18,38 +18,66 @@ function runtimeStateFile() {
     return Gio.File.new_build_filenamev([GLib.get_user_runtime_dir(), 'agent-meter', 'state.json']);
 }
 
-function loadSavedPosition() {
+function widgetConfigPath() {
+    return GLib.build_filenamev([GLib.get_user_config_dir(), 'agent-meter', 'position.json']);
+}
+
+function readWidgetConfig() {
     try {
-        const file = Gio.File.new_for_path(GLib.build_filenamev([GLib.get_user_config_dir(), 'agent-meter', 'position.json']));
+        const file = Gio.File.new_for_path(widgetConfigPath());
         const [ok, bytes] = file.load_contents(null);
         if (ok) {
-            const pos = JSON.parse(new TextDecoder().decode(bytes));
-            if (typeof pos.x === 'number' && typeof pos.y === 'number') {
-                return [Math.max(0, pos.x), Math.max(28, pos.y)];
-            }
+            const data = JSON.parse(new TextDecoder().decode(bytes));
+            if (data && typeof data === 'object' && !Array.isArray(data))
+                return data;
         }
     } catch (e) {
         // fallback
     }
-    return [36, 60];
+    return {};
 }
 
-function savePosition(x, y) {
+function writeWidgetConfig(data, what) {
     try {
         const configDir = GLib.build_filenamev([GLib.get_user_config_dir(), 'agent-meter']);
         GLib.mkdir_with_parents(configDir, 0o700);
         GLib.chmod(configDir, 0o700);
-        const file = Gio.File.new_for_path(GLib.build_filenamev([configDir, 'position.json']));
+        const file = Gio.File.new_for_path(widgetConfigPath());
         file.replace_contents(
-            JSON.stringify({x: Math.round(x), y: Math.round(y)}),
+            JSON.stringify(data),
             null,
             false,
             Gio.FileCreateFlags.REPLACE_DESTINATION,
             null
         );
     } catch (e) {
-        console.debug(`Could not save widget position: ${e.message}`);
+        console.debug(`Could not save ${what}: ${e.message}`);
     }
+}
+
+function loadSavedPosition() {
+    const pos = readWidgetConfig();
+    if (typeof pos.x === 'number' && typeof pos.y === 'number')
+        return [Math.max(0, pos.x), Math.max(28, pos.y)];
+    return [36, 60];
+}
+
+function loadDesktopVisible() {
+    const {desktopVisible} = readWidgetConfig();
+    return typeof desktopVisible === 'boolean' ? desktopVisible : true;
+}
+
+function savePosition(x, y) {
+    const config = readWidgetConfig();
+    config.x = Math.round(x);
+    config.y = Math.round(y);
+    writeWidgetConfig(config, 'widget position');
+}
+
+function saveDesktopVisible(visible) {
+    const config = readWidgetConfig();
+    config.desktopVisible = Boolean(visible);
+    writeWidgetConfig(config, 'desktop widget switch');
 }
 
 function quotaWindows(provider) {
@@ -120,7 +148,7 @@ class AgentMeterIndicator extends PanelMenu.Button {
     _init(extension) {
         super._init(0.0, 'Agent Meter');
         this._extension = extension;
-        this._desktopVisible = true;
+        this._desktopVisible = loadDesktopVisible();
         this._keyboardShown = false;
         this._dragState = null;
         this._dragGrab = null;
@@ -269,15 +297,20 @@ class AgentMeterIndicator extends PanelMenu.Button {
                 (this._desktopVisible && global.display.focus_window === null);
     }
 
+    _setDesktopVisible(active) {
+        this._desktopVisible = Boolean(active);
+        saveDesktopVisible(this._desktopVisible);
+        this._syncDesktopVisibility();
+    }
+
     toggleFromKeyboard() {
         if (this._desktop.visible) {
             this._keyboardShown = false;
-            this._desktopVisible = false;
+            this._setDesktopVisible(false);
         } else {
-            this._desktopVisible = true;
             this._keyboardShown = true;
+            this._setDesktopVisible(true);
         }
-        this._syncDesktopVisibility();
         this._queueClamp();
     }
 
@@ -430,9 +463,8 @@ class AgentMeterIndicator extends PanelMenu.Button {
 
         // Desktop widget toggle switch
         const desktopToggle = new PopupMenu.PopupSwitchMenuItem('Desktop Widget', this._desktopVisible);
-        desktopToggle.connect('toggled', (item, active) => {
-            this._desktopVisible = active;
-            this._syncDesktopVisibility();
+        desktopToggle.connect('toggled', (_item, active) => {
+            this._setDesktopVisible(active);
         });
         this.menu.addMenuItem(desktopToggle);
 
