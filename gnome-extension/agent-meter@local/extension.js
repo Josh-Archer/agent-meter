@@ -115,14 +115,60 @@ function limitText(provider) {
     return `${Math.round(lowest.remaining_percent)}% · ${lowest.reset_label ?? 'reset unknown'}`;
 }
 
-// Provider state is local JSON. Only an http(s) page with no embedded
-// userinfo may be handed to the default browser.
+// Provider state is local JSON. Only an http(s) page with a valid host,
+// no embedded userinfo, no control characters, no backslashes, and a valid port (1-65535)
+// may be handed to the default browser.
 function usagePageUrl(value) {
     if (typeof value !== 'string')
         return null;
     const url = value.trim();
-    if (!/^https?:\/\/[^\s/?#@]+(?::\d+)?(?:[/?#][^\s]*)?$/i.test(url))
+    if (/[\s\x00-\x1f\x7f\\]/.test(url))
         return null;
+    if (!/^https?:\/\//i.test(url))
+        return null;
+
+    const rest = url.replace(/^https?:\/\//i, '');
+    const authorityEnd = rest.search(/[/?#]/);
+    const authority = authorityEnd === -1 ? rest : rest.slice(0, authorityEnd);
+    if (!authority || authority.includes('@'))
+        return null;
+
+    let host;
+    let portStr;
+    if (authority.startsWith('[')) {
+        const closeBracket = authority.indexOf(']');
+        if (closeBracket <= 1)
+            return null;
+        host = authority.slice(1, closeBracket);
+        const afterHost = authority.slice(closeBracket + 1);
+        if (afterHost.length > 0) {
+            if (!afterHost.startsWith(':'))
+                return null;
+            portStr = afterHost.slice(1);
+        }
+    } else {
+        const colonIndex = authority.lastIndexOf(':');
+        if (colonIndex !== -1) {
+            host = authority.slice(0, colonIndex);
+            portStr = authority.slice(colonIndex + 1);
+            if (host.includes(':'))
+                return null;
+        } else {
+            host = authority;
+        }
+    }
+
+    if (!host || host.includes('[') || host.includes(']'))
+        return null;
+
+    if (portStr !== undefined) {
+        if (!/^\d+$/.test(portStr))
+            return null;
+        const port = Number(portStr);
+        if (port < 1 || port > 65535)
+            return null;
+    }
+
     return url;
 }
 

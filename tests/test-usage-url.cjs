@@ -16,6 +16,10 @@ const accepted = [
     'http://github.com/settings/copilot/features',
     'HTTPS://claude.ai/settings/usage',
     'https://localhost:8443/usage?view=week',
+    'https://[::1]:8080',
+    'https://chatgpt.com/@user',
+    'https://example.com:1/',
+    'https://example.com:65535/',
 ];
 for (const url of accepted)
     assert.equal(usagePageUrl(`  ${url}  `), url);
@@ -27,14 +31,48 @@ const rejected = [
     '',
     '   ',
     'javascript:alert(1)',
+    'JAVASCRIPT:alert(1)',
     'file:///etc/passwd',
     'data:text/html,hi',
+    'vscode://x',
     'ftp://example.com/usage',
     'https:///etc/passwd',
     'https://',
+    'https:///',
     'https://host with space/usage',
+    'https://host\u2028name/usage',
     'not a url',
+    '/relative',
+    '//host/x',
     'https://user:secret@chatgpt.com/usage',
+    'https://user@host',
+    'https://a.com\\@b.com',
+    // Blocker: control characters [\x00-\x1f\x7f] anywhere in the URL (host, path, query, fragment)
+    'https://a\x01b.com/',
+    'https://a.com/\x00x',
+    'https://a.com/\x7f',
+    'https://a.com/\x1f',
+    'https://a.com/?q=\x05',
+    'https://a.com/#\x02',
+    // Nits: empty host
+    'https://:80/',
+    'https://:80',
+    'https://:',
+    'https://?query',
+    'https://#fragment',
+    // Nits: ports outside 1-65535
+    'https://example.com:99999/',
+    'https://example.com:99999',
+    'https://example.com:0/',
+    'https://example.com:0',
+    'https://example.com:65536/',
+    'https://[::1]:99999',
+    'https://[::1]:0',
+    // Nits: backslashes in host
+    'https://good.com\\evil.com',
+    'https://good.com\\evil.com/',
+    'https://a\\b.com/',
+    'https://\\evil.com',
 ];
 for (const value of rejected)
     assert.equal(usagePageUrl(value), null, `rejected ${JSON.stringify(value)}`);
