@@ -616,6 +616,16 @@ class AgentMeterIndicator extends PanelMenu.Button {
                     }));
                     card.add_child(row);
                 }
+                // Plan names and "N of M used" live in provider.detail. Bars do not replace that line.
+                if (typeof provider.detail === 'string' && provider.detail.length > 0) {
+                    const detailRow = new St.BoxLayout({style_class: 'agent-meter-desktop-window'});
+                    detailRow.add_child(new St.Label({
+                        text: provider.detail,
+                        style_class: 'agent-meter-limit',
+                        x_expand: true,
+                    }));
+                    card.add_child(detailRow);
+                }
             } else {
                 const detailRow = new St.BoxLayout({style_class: 'agent-meter-desktop-window'});
                 const detailText = isStale ? 'Usage unavailable; cached data expired.' :
