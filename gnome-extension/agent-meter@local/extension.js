@@ -143,6 +143,78 @@ function limitText(provider) {
     return `${Math.round(lowest.remaining_percent)}% · ${lowest.reset_label ?? 'reset unknown'}`;
 }
 
+// Provider state is local JSON. Only an http(s) page with a valid host,
+// no embedded userinfo, no control characters, no backslashes, and a valid port (1-65535)
+// may be handed to the default browser.
+function usagePageUrl(value) {
+    if (typeof value !== 'string')
+        return null;
+    const url = value.trim();
+    if (/[\s\x00-\x1f\x7f\\]/.test(url))
+        return null;
+    if (!/^https?:\/\//i.test(url))
+        return null;
+
+    const rest = url.replace(/^https?:\/\//i, '');
+    const authorityEnd = rest.search(/[/?#]/);
+    const authority = authorityEnd === -1 ? rest : rest.slice(0, authorityEnd);
+    if (!authority || authority.includes('@'))
+        return null;
+
+    let host;
+    let portStr;
+    if (authority.startsWith('[')) {
+        const closeBracket = authority.indexOf(']');
+        if (closeBracket <= 1)
+            return null;
+        host = authority.slice(1, closeBracket);
+        const afterHost = authority.slice(closeBracket + 1);
+        if (afterHost.length > 0) {
+            if (!afterHost.startsWith(':'))
+                return null;
+            portStr = afterHost.slice(1);
+        }
+    } else {
+        const colonIndex = authority.lastIndexOf(':');
+        if (colonIndex !== -1) {
+            host = authority.slice(0, colonIndex);
+            portStr = authority.slice(colonIndex + 1);
+            if (host.includes(':'))
+                return null;
+        } else {
+            host = authority;
+        }
+    }
+
+    if (!host || host.includes('[') || host.includes(']'))
+        return null;
+
+    if (portStr !== undefined) {
+        if (!/^\d+$/.test(portStr))
+            return null;
+        const port = Number(portStr);
+        if (port < 1 || port > 65535)
+            return null;
+    }
+
+    return url;
+}
+
+function openUsagePage(url) {
+    const target = usagePageUrl(url);
+    if (!target)
+        return false;
+    try {
+        const context = global.create_app_launch_context(0, -1);
+        if (!Gio.AppInfo.launch_default_for_uri(target, context))
+            throw new Error('no default application for the usage page');
+        return true;
+    } catch (error) {
+        console.warn(`Agent Meter could not open usage page: ${error.message}`);
+        return false;
+    }
+}
+
 const AgentMeterIndicator = GObject.registerClass(
 class AgentMeterIndicator extends PanelMenu.Button {
     _init(extension) {
@@ -443,6 +515,13 @@ class AgentMeterIndicator extends PanelMenu.Button {
             labels.add_child(new St.Label({text: limitText(provider), style_class: 'agent-meter-limit'}));
             item.add_child(labels);
             this.menu.addMenuItem(item);
+
+            const usageUrl = usagePageUrl(provider.usage_url);
+            if (usageUrl) {
+                const openUsage = new PopupMenu.PopupMenuItem(`  → Open ${provider.label} usage…`);
+                openUsage.connect('activate', () => openUsagePage(usageUrl));
+                this.menu.addMenuItem(openUsage);
+            }
 
             // A stale snapshot means the provider was previously available but
             // has not emitted a newer usage record. It is not an OAuth failure,

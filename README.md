@@ -19,9 +19,10 @@ turns orange or red; unavailable usage appears as an em dash.
 
 ![Agent Meter top bar showing five provider icons and remaining quota](docs/screenshots/top-bar.png)
 
-Open the provider menu for reset dates, refresh controls, and desktop-widget
-settings. These screenshots show version 0.1.6; percentages are illustrative
-snapshots, not live usage.
+Open the provider menu for reset dates, refresh controls, each provider's
+usage page, and desktop-widget settings. A usage item opens that provider's
+`usage_url` in the default browser. These screenshots show version 0.1.6;
+percentages are illustrative snapshots, not live usage.
 
 ![Agent Meter provider menu with quota reset dates and widget controls](docs/screenshots/provider-menu.png)
 
