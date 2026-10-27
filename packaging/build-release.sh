@@ -48,6 +48,7 @@ install -Dm644 README.md "$debroot/usr/share/doc/agent-meter/README.md"
 install -Dm644 LICENSE "$debroot/usr/share/doc/agent-meter/LICENSE"
 
 mkdir -p "$debroot/DEBIAN"
+chmod 755 "$debroot/DEBIAN"
 cat > "$debroot/DEBIAN/control" <<EOF
 Package: agent-meter
 Version: $version
