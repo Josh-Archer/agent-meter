@@ -247,7 +247,7 @@ class AgentMeterIndicator extends PanelMenu.Button {
         const [posX, posY] = loadSavedPosition();
         this._desktop.set_position(posX, posY);
 
-        Main.layoutManager.addChrome(this._desktop, {affectsInputRegion: true, trackFullscreen: false});
+        Main.layoutManager.addChrome(this._desktop, {trackFullscreen: false});
         this._focusChangedId = global.display.connect('notify::focus-window', () => {
             this._keyboardShown = false;
             this._syncDesktopVisibility();
