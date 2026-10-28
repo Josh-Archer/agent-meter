@@ -2,6 +2,7 @@ import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
+import Pango from 'gi://Pango';
 import St from 'gi://St';
 import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
@@ -499,6 +500,9 @@ class AgentMeterIndicator extends PanelMenu.Button {
                 style: `color: ${color};`,
                 y_align: Clutter.ActorAlign.CENTER,
             });
+            const clutterText = pctLabel.get_clutter_text?.();
+            if (clutterText)
+                clutterText.ellipsize = 0;
             pill.add_child(pctLabel);
 
             this._icons.add_child(pill);
