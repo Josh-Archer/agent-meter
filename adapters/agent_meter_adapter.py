@@ -222,6 +222,53 @@ def agy_window(group: str, bucket: dict[str, Any]) -> dict[str, Any] | None:
     return result
 
 
+def _agy_target_group(groups: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """When Antigravity reports multiple distinct model families (e.g. Gemini Models
+    vs Claude and GPT models), select the group that matches the user's active
+    model so an exhausted secondary pool does not force the provider
+    percentage to 0%.
+    """
+    if len(groups) <= 1:
+        return groups[0] if groups else None
+
+    # Explicit environment variable override
+    override = os.environ.get("AGENT_METER_AGY_GROUP")
+    if override:
+        for group in groups:
+            name = str(group.get("name") or group.get("display_name") or "")
+            if override.lower() in name.lower():
+                return group
+
+    # Read Antigravity CLI settings for configured model
+    settings_path = os.environ.get(
+        "AGENT_METER_AGY_SETTINGS",
+        os.path.expanduser("~/.gemini/antigravity-cli/settings.json"),
+    )
+    configured_model = ""
+    try:
+        with open(settings_path, encoding="utf-8") as f:
+            data = json.load(f)
+            configured_model = str(data.get("model", "")).lower()
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    if configured_model:
+        for group in groups:
+            name = str(group.get("name") or group.get("display_name") or "").lower()
+            desc = str(group.get("description", "")).lower()
+            tokens = [t for t in configured_model.replace("-", " ").split() if len(t) > 2]
+            if any(t in name or t in desc for t in tokens):
+                return group
+
+    # Default to Gemini Models if present, otherwise first group
+    for group in groups:
+        name = str(group.get("name") or group.get("display_name") or "")
+        if "gemini" in name.lower():
+            return group
+
+    return groups[0]
+
+
 def normalize_agy(result: dict[str, Any]) -> dict[str, Any]:
     command = result.get("command")
     if isinstance(command, dict) and command.get("name") == "usage":
@@ -230,8 +277,11 @@ def normalize_agy(result: dict[str, Any]) -> dict[str, Any]:
         summary = result.get("quota_summary")
     if not isinstance(summary, dict):
         raise ValueError(result.get("quota_summary_error") or "agy-usage returned no quota summary")
+    raw_groups = [g for g in summary.get("groups", []) if isinstance(g, dict)]
+    target = _agy_target_group(raw_groups)
+    groups = [target] if target else raw_groups
     windows: list[dict[str, Any]] = []
-    for group in summary.get("groups", []):
+    for group in groups:
         if not isinstance(group, dict):
             continue
         group_name = str(group.get("name") or group.get("display_name") or "Antigravity")
