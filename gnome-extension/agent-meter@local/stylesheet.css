@@ -1,13 +1,13 @@
 /* Panel Icons and Pills */
 .agent-meter-icons {
-  spacing: 8px;
-  margin-left: 4px;
-  margin-right: 4px;
+  spacing: 4px;
+  margin-left: 2px;
+  margin-right: 2px;
 }
 
 .agent-meter-pill {
-  spacing: 3px;
-  padding: 2px 5px;
+  spacing: 2px;
+  padding: 1px 4px;
   border-radius: 6px;
   background-color: rgba(255, 255, 255, 0.13);
   border: 1px solid rgba(255, 255, 255, 0.20);
