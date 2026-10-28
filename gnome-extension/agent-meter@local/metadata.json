@@ -4,6 +4,6 @@
   "description": "Shows local coding-agent usage state in the GNOME top bar.",
   "shell-version": ["46", "47", "48", "49", "50"],
   "url": "https://github.com/Josh-Archer/agent-meter",
-  "version": 10,
+  "version": 11,
   "settings-schema": "org.gnome.shell.extensions.agent-meter"
 }
