@@ -490,6 +490,110 @@ def test_agy_provider_usage_command() -> None:
     assert state["detail"] == "Antigravity CLI /usage quota"
 
 
+def test_agy_multi_group_defaults_to_gemini() -> None:
+    payload = {
+        "command": {
+            "name": "usage",
+            "data": {
+                "groups": [
+                    {
+                        "name": "Gemini Models",
+                        "description": "Models within this group: Gemini Flash, Gemini Pro",
+                        "buckets": [
+                            {"name": "Five Hour Limit Remaining", "window": "5h", "remaining_fraction": 0.90,
+                             "reset_time": "2026-08-30T20:00:00Z"},
+                            {"name": "Weekly Limit Remaining", "window": "weekly", "remaining_fraction": 0.60,
+                             "reset_time": "2026-09-04T00:50:56Z"},
+                        ],
+                    },
+                    {
+                        "name": "Claude and GPT models",
+                        "description": "Models within this group: Claude Opus, Claude Sonnet, GPT-OSS",
+                        "buckets": [
+                            {"name": "Weekly Limit Remaining", "window": "weekly", "remaining_fraction": 0.0,
+                             "reset_time": "2026-09-04T00:50:56Z"},
+                        ],
+                    },
+                ]
+            }
+        }
+    }
+    with patched_env({"AGENT_METER_AGY_SETTINGS": "/nonexistent/settings.json"}):
+        state = adapter.normalize_agy(payload)
+    assert len(state["windows"]) == 2
+    assert [w["remaining_percent"] for w in state["windows"]] == [90.0, 60.0]
+    assert all("Gemini" in w["label"] for w in state["windows"])
+
+
+def test_agy_multi_group_settings_model_selection() -> None:
+    payload = {
+        "command": {
+            "name": "usage",
+            "data": {
+                "groups": [
+                    {
+                        "name": "Gemini Models",
+                        "description": "Models within this group: Gemini Flash, Gemini Pro",
+                        "buckets": [
+                            {"name": "Weekly Limit Remaining", "window": "weekly", "remaining_fraction": 0.60,
+                             "reset_time": "2026-09-04T00:50:56Z"},
+                        ],
+                    },
+                    {
+                        "name": "Claude and GPT models",
+                        "description": "Models within this group: Claude Opus, Claude Sonnet, GPT-OSS",
+                        "buckets": [
+                            {"name": "Weekly Limit Remaining", "window": "weekly", "remaining_fraction": 0.25,
+                             "reset_time": "2026-09-04T00:50:56Z"},
+                        ],
+                    },
+                ]
+            }
+        }
+    }
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        json.dump({"model": "claude-opus-4-6-thinking"}, f)
+        settings_path = f.name
+    try:
+        with patched_env({"AGENT_METER_AGY_SETTINGS": settings_path}):
+            state = adapter.normalize_agy(payload)
+        assert len(state["windows"]) == 1
+        assert state["windows"][0]["remaining_percent"] == 25.0
+        assert "Claude" in state["windows"][0]["label"]
+    finally:
+        os.unlink(settings_path)
+
+
+def test_agy_multi_group_env_override() -> None:
+    payload = {
+        "command": {
+            "name": "usage",
+            "data": {
+                "groups": [
+                    {
+                        "name": "Gemini Models",
+                        "buckets": [
+                            {"name": "Weekly Limit Remaining", "window": "weekly", "remaining_fraction": 0.60,
+                             "reset_time": "2026-09-04T00:50:56Z"},
+                        ],
+                    },
+                    {
+                        "name": "Claude and GPT models",
+                        "buckets": [
+                            {"name": "Weekly Limit Remaining", "window": "weekly", "remaining_fraction": 0.25,
+                             "reset_time": "2026-09-04T00:50:56Z"},
+                        ],
+                    },
+                ]
+            }
+        }
+    }
+    with patched_env({"AGENT_METER_AGY_GROUP": "claude"}):
+        state = adapter.normalize_agy(payload)
+    assert len(state["windows"]) == 1
+    assert state["windows"][0]["remaining_percent"] == 25.0
+
+
 # ---------------------------------------------------------------------------
 # normalize_claude
 # ---------------------------------------------------------------------------
@@ -1816,6 +1920,9 @@ if __name__ == "__main__":
     test_agy()
     test_agy_disabled_bucket_skipped()
     test_agy_provider_usage_command()
+    test_agy_multi_group_defaults_to_gemini()
+    test_agy_multi_group_settings_model_selection()
+    test_agy_multi_group_env_override()
     test_claude_normalize()
     test_claude_normalize_only_one_window()
     test_claude_normalize_missing_rate_limits()

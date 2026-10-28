@@ -88,6 +88,8 @@ function quotaWindows(provider) {
 }
 
 function iconFor(extension, symbol) {
+    if (symbol === 'agy')
+        symbol = 'antigravity';
     const allowed = new Set(['codex', 'antigravity', 'grok', 'copilot', 'claude', 'generic']);
     const name = allowed.has(symbol) ? symbol : 'generic';
     const iconsDir = extension.dir.get_child('icons');
