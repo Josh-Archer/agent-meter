@@ -11,6 +11,19 @@ jobs:
   test:
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'uecb-shared' }}
     steps:
+      - name: Ensure base toolchain (uecb-shared image lacks it)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          # Stopgap until ghcr.io/josh-archer/shared-runner (home gitops/images/shared-runner) is published and pinned.
+          missing=""
+          for t in make gcc g++ ruby wget pkg-config; do command -v "$t" >/dev/null 2>&1 || missing="$missing $t"; done
+          if [ -n "$missing" ] && command -v apt-get >/dev/null 2>&1; then
+            echo "Installing missing tools:$missing"
+            SUDO=""; [ "$(id -u)" = 0 ] || SUDO=sudo
+            $SUDO apt-get update -qq
+            $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends build-essential pkg-config ruby wget ca-certificates
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
