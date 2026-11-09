@@ -590,3 +590,14 @@ illustrated in `data/provider-state.example.json`.
 Contributions should run both Python checks and `cargo test --all-features`
 before opening a pull request. Never add a real token, private log, or personal
 home-directory path to fixtures or documentation.
+
+## Releases
+
+Every merge to `main` whose CI passes is released automatically by
+`.github/workflows/auto-release.yml`. It sets the version in `Cargo.toml` and
+`Cargo.lock` to the next patch version (or the next minor for a `type!:` /
+`BREAKING CHANGE` commit), tags it and starts `release.yml`, which builds the
+`.deb`, publishes the GitHub release and updates the APT repository. Merges that
+only touch docs, Markdown, `.github/` or `tests/` are not released. See
+`scripts/next-release-version.sh`.
+
