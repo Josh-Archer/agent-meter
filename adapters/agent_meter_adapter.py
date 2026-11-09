@@ -9,13 +9,20 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import fcntl
 import json
 import os
+import pty
 import selectors
+import shutil
+import signal
+import struct
 import subprocess
 import sys
 import tempfile
+import termios
 import time
+import urllib.parse
 from typing import Any
 
 
@@ -365,17 +372,32 @@ def _grok_max_age_seconds() -> float:
         return 1800.0
 
 
-def normalize_grok(records: list[Any], now: dt.datetime | None = None) -> dict[str, Any]:
-    """Read only Grok's structured billing snapshots, never its auth state.
+def _grok_refresh_timeout_seconds() -> float:
+    """Stay inside agent-meterd's default 30s command timeout."""
+    try:
+        return float(os.environ.get("AGENT_METER_GROK_REFRESH_TIMEOUT_SECONDS", "20"))
+    except ValueError:
+        return 20.0
 
-    Staleness comes from the billing record's own ``ts``. The newest snapshot
-    is kept even after its billing period ends; an ended period is stale and
-    does not keep a reset instant that is already in the past. This path does
-    not consult OMP.
+
+def _parse_utc(value: Any) -> dt.datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.UTC)
+    return parsed
+
+
+def _billing_candidates(records: list[Any]) -> list[tuple[dt.datetime, dt.datetime, dict[str, Any]]]:
+    """Usable ``billing: fetched credits config`` rows, oldest selection later.
+
+    Rows without a usable usage percent or period end are ignored. This never
+    reads auth state.
     """
-    current = now or dt.datetime.now(dt.UTC)
-    if current.tzinfo is None:
-        current = current.replace(tzinfo=dt.UTC)
     candidates: list[tuple[dt.datetime, dt.datetime, dict[str, Any]]] = []
     for record in records:
         if not isinstance(record, dict) or record.get("msg") != "billing: fetched credits config":
@@ -387,16 +409,26 @@ def normalize_grok(records: list[Any], now: dt.datetime | None = None) -> dict[s
         used_percent = _number(config.get("creditUsagePercent")) if isinstance(config, dict) else None
         if used_percent is None or not 0 <= used_percent <= 100:
             continue
-        try:
-            observed = dt.datetime.fromisoformat(str(record.get("ts")).replace("Z", "+00:00"))
-            period_end = dt.datetime.fromisoformat(str(config.get("billingPeriodEnd")).replace("Z", "+00:00"))
-            if observed.tzinfo is None:
-                observed = observed.replace(tzinfo=dt.UTC)
-            if period_end.tzinfo is None:
-                period_end = period_end.replace(tzinfo=dt.UTC)
-        except (TypeError, ValueError):
+        observed = _parse_utc(record.get("ts"))
+        period_end = _parse_utc(config.get("billingPeriodEnd")) if isinstance(config, dict) else None
+        if observed is None or period_end is None or not isinstance(config, dict):
             continue
         candidates.append((observed, period_end, config))
+    return candidates
+
+
+def normalize_grok(records: list[Any], now: dt.datetime | None = None) -> dict[str, Any]:
+    """Read only Grok's structured billing snapshots, never its auth state.
+
+    Staleness comes from the billing record's own ``ts``. The newest snapshot
+    is kept even after its billing period ends; an ended period is stale and
+    does not keep a reset instant that is already in the past. This path does
+    not consult OMP.
+    """
+    current = now or dt.datetime.now(dt.UTC)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=dt.UTC)
+    candidates = _billing_candidates(records)
     if not candidates:
         raise ValueError("no Grok billing snapshot; start Grok Build once to refresh it")
     observed, period_end, config = max(candidates, key=lambda item: item[0])
@@ -525,17 +557,259 @@ def _grok_from_omp(now: dt.datetime | None = None) -> dict[str, Any] | None:
         return None
 
 
-def _grok_from_log(now: dt.datetime | None = None) -> dict[str, Any]:
-    """Normalize the Grok Build log. This path does not invoke OMP."""
-    log_path = os.environ.get("AGENT_METER_GROK_LOG", os.path.expanduser("~/.grok/logs/unified.jsonl"))
+def _grok_log_path() -> str:
+    return os.environ.get("AGENT_METER_GROK_LOG", os.path.expanduser("~/.grok/logs/unified.jsonl"))
+
+
+def _read_grok_log(log_path: str) -> list[Any]:
+    records: list[Any] = []
+    with open(log_path, encoding="utf-8") as stream:
+        for line in stream:
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return records
+
+
+def _newest_billing_time(records: list[Any]) -> dt.datetime | None:
+    candidates = _billing_candidates(records)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[0])[0]
+
+
+def _grok_log_needs_refresh(records: list[Any], now: dt.datetime | None) -> bool:
+    """True when the log has no usable snapshot or the one it has is stale."""
     try:
-        records: list[Any] = []
-        with open(log_path, encoding="utf-8") as stream:
-            for line in stream:
-                try:
-                    records.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
+        state = normalize_grok(records, now=now)
+    except (ValueError, TypeError):
+        return True
+    return state.get("status") != "fresh"
+
+
+def _grok_bin() -> str | None:
+    """Grok CLI that owns billing refresh. An explicit override is not replaced."""
+    override = os.environ.get("AGENT_METER_GROK_BIN")
+    if override:
+        return override
+    found = shutil.which("grok")
+    if found:
+        return found
+    bundled = os.path.expanduser("~/.grok/bin/grok")
+    if os.path.isfile(bundled) and os.access(bundled, os.X_OK):
+        return bundled
+    return None
+
+
+def _grok_refresh_cwd() -> str:
+    """Private directory so a refresh session is not a user project session."""
+    override = os.environ.get("AGENT_METER_GROK_REFRESH_CWD")
+    if override:
+        os.makedirs(override, exist_ok=True)
+        return override
+    state_home = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    path = os.path.join(state_home, "agent-meter", "grok-billing-refresh")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _remove_refresh_session(cwd: str) -> None:
+    """Delete only the session directory Grok creates for the refresh cwd."""
+    grok_home = os.environ.get("GROK_HOME") or os.path.expanduser("~/.grok")
+    root = os.path.realpath(os.path.join(grok_home, "sessions"))
+    encoded = urllib.parse.quote(os.path.abspath(cwd), safe="")
+    target = os.path.realpath(os.path.join(root, encoded))
+    if os.path.dirname(target) != root or not os.path.isdir(target):
+        return
+    shutil.rmtree(target, ignore_errors=True)
+
+
+def _terminate_process_group(proc: subprocess.Popen[bytes]) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except (OSError, ProcessLookupError):
+        proc.kill()
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            proc.kill()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def _set_pty_size(fd: int) -> None:
+    try:
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+    except OSError:
+        pass
+
+
+def _newest_billing_time_from_text(text: str) -> dt.datetime | None:
+    records: list[Any] = []
+    for line in text.splitlines():
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return _newest_billing_time(records)
+
+
+def _read_appended_billing(log_path: str, offset: int) -> tuple[dt.datetime | None, int]:
+    """Parse complete log lines appended after ``offset``.
+
+    A trailing partial line stays unread so the next poll can finish it.
+    """
+    try:
+        with open(log_path, "rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            if size < offset:
+                offset = 0
+            stream.seek(offset)
+            data = stream.read()
+    except OSError:
+        return None, offset
+    if not data:
+        return None, offset
+    if not data.endswith(b"\n"):
+        last_nl = data.rfind(b"\n")
+        if last_nl == -1:
+            return None, offset
+        data = data[: last_nl + 1]
+    text = data.decode("utf-8", errors="replace")
+    return _newest_billing_time_from_text(text), offset + len(data)
+
+
+def _refresh_grok_billing_snapshot(log_path: str, previous: dt.datetime | None) -> bool:
+    """Start Grok long enough for it to append a newer billing snapshot.
+
+    Grok writes ``billing: fetched credits config`` during session startup.
+    ``grok usage`` on the shell route does not. The CLI is started on a
+    private PTY, watched until a newer usable snapshot is appended or the
+    deadline passes, then its process group is stopped. Stdout and stderr
+    stay on that PTY and are discarded. Auth files are not read.
+    """
+    binary = _grok_bin()
+    if not binary:
+        return False
+    timeout = _grok_refresh_timeout_seconds()
+    cwd = ""
+    master: int | None = None
+    slave: int | None = None
+    proc: subprocess.Popen[bytes] | None = None
+    try:
+        cwd = _grok_refresh_cwd()
+        try:
+            offset = os.path.getsize(log_path)
+        except OSError:
+            offset = 0
+        master, slave = pty.openpty()
+        _set_pty_size(slave)
+        flags = fcntl.fcntl(master, fcntl.F_GETFL)
+        fcntl.fcntl(master, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        environment = os.environ.copy()
+        bin_dir = os.path.dirname(os.path.abspath(binary))
+        if bin_dir:
+            environment["PATH"] = f"{bin_dir}:{environment.get('PATH', '')}"
+        proc = subprocess.Popen(
+            [binary, "--no-alt-screen"],
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            cwd=cwd,
+            start_new_session=True,
+            close_fds=True,
+            env=environment,
+        )
+        os.close(slave)
+        slave = None
+        deadline = time.monotonic() + timeout
+        selector = selectors.DefaultSelector()
+        selector.register(master, selectors.EVENT_READ)
+        try:
+            while time.monotonic() < deadline:
+                observed, offset = _read_appended_billing(log_path, offset)
+                if observed is not None and (previous is None or observed > previous):
+                    return True
+                if proc.poll() is not None:
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                events = selector.select(timeout=min(0.2, remaining))
+                pty_closed = False
+                for key, _ in events:
+                    try:
+                        chunk = os.read(key.fd, 65536)
+                    except OSError:
+                        continue
+                    if chunk == b"":
+                        pty_closed = True
+                # A closed PTY stays readable. Sleep so the log poll does not spin.
+                if pty_closed:
+                    time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        finally:
+            selector.close()
+        observed, _offset = _read_appended_billing(log_path, offset)
+        return observed is not None and (previous is None or observed > previous)
+    except (OSError, subprocess.SubprocessError):
+        try:
+            observed, _offset = _read_appended_billing(log_path, 0)
+        except OSError:
+            return False
+        return observed is not None and (previous is None or observed > previous)
+    finally:
+        if slave is not None:
+            try:
+                os.close(slave)
+            except OSError:
+                pass
+        if proc is not None:
+            _terminate_process_group(proc)
+        if master is not None:
+            try:
+                os.close(master)
+            except OSError:
+                pass
+        if cwd:
+            try:
+                _remove_refresh_session(cwd)
+            except OSError:
+                pass
+
+
+def _grok_from_log(now: dt.datetime | None = None) -> dict[str, Any]:
+    """Normalize the Grok Build log, refreshing a stale snapshot first.
+
+    This path does not invoke OMP and does not read Grok's auth store. When
+    the newest billing snapshot is missing, older than the max age, or from a
+    billing period that has ended, Grok is started so it can append a new
+    snapshot. The TUI is not left running.
+    """
+    log_path = _grok_log_path()
+    records: list[Any] | None
+    try:
+        records = _read_grok_log(log_path)
+    except OSError:
+        records = None
+    if records is None or _grok_log_needs_refresh(records, now):
+        previous = _newest_billing_time(records or [])
+        if _refresh_grok_billing_snapshot(log_path, previous):
+            try:
+                records = _read_grok_log(log_path)
+            except OSError:
+                records = None
+    try:
+        if records is None:
+            raise OSError(log_path)
         return normalize_grok(records, now=now)
     except (OSError, ValueError, TypeError) as error:
         return unavailable(

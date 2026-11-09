@@ -6,6 +6,7 @@ import stat
 import sys
 import tempfile
 import time
+import urllib.parse
 from contextlib import contextmanager, redirect_stderr
 from pathlib import Path
 
@@ -868,15 +869,12 @@ def test_grok_never_infers_quota_from_auth_file() -> None:
         os.makedirs(grok_dir)
         with open(os.path.join(grok_dir, "auth.json"), "w") as stream:
             json.dump({"session": {"email": "private@example.invalid", "refresh_token": "secret"}}, stream)
-        old_home = os.environ.get("HOME")
-        os.environ["HOME"] = tmp
-        try:
+        with patched_env({
+            "HOME": tmp,
+            "AGENT_METER_OMP_BIN": "/nonexistent/omp-for-test",
+            "AGENT_METER_GROK_BIN": "/nonexistent/grok-for-test",
+        }):
             state = adapter.grok()
-        finally:
-            if old_home is None:
-                del os.environ["HOME"]
-            else:
-                os.environ["HOME"] = old_home
     assert state["status"] == "unavailable"
     assert "private@example.invalid" not in state["detail"]
     assert "secret" not in state["detail"]
@@ -1704,12 +1702,163 @@ def test_grok_sample_without_billing_records_is_unavailable() -> None:
         log_path.write_text("".join(json.dumps(row) + "\n" for row in records), encoding="utf-8")
         with patched_env({
             "AGENT_METER_OMP_BIN": "/nonexistent/omp-for-test",
+            "AGENT_METER_GROK_BIN": "/nonexistent/grok-for-test",
             "AGENT_METER_GROK_LOG": str(log_path),
         }):
             state = adapter.grok()
     assert state["status"] == "unavailable"
     assert state["id"] == "grok"
     assert "Grok usage unavailable" in state["detail"]
+
+
+def _grok_billing_record(ts: str, used_percent: float, period_end: str) -> dict:
+    return {
+        "ts": ts,
+        "msg": "billing: fetched credits config",
+        "ctx": {"config": {
+            "creditUsagePercent": used_percent,
+            "billingPeriodEnd": period_end,
+        }},
+    }
+
+
+def _write_grok_refresh_stub(path: Path, body: str) -> None:
+    path.write_text("#!/usr/bin/env python3\n" + body, encoding="utf-8")
+    path.chmod(path.stat().st_mode | stat.S_IEXEC)
+
+
+def test_grok_refreshes_stale_snapshot_without_tui() -> None:
+    """A snapshot older than 30 minutes is refreshed by the grok CLI itself.
+
+    The replacement record is what the provider returns, so this fails when
+    the adapter only reads the log the TUI wrote.
+    """
+    now = adapter.dt.datetime(2026, 8, 30, tzinfo=adapter.dt.UTC)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        log_path = root / "unified.jsonl"
+        log_path.write_text(json.dumps(_grok_billing_record(
+            "2026-08-29T20:00:00Z", 80.0, "2026-09-05T00:00:00Z",
+        )) + "\n", encoding="utf-8")
+        marker = root / "invoked"
+        refresh_cwd = root / "refresh-cwd"
+        grok_home = root / "grok-home"
+        encoded = urllib.parse.quote(os.path.abspath(refresh_cwd), safe="")
+        session_dir = grok_home / "sessions" / encoded / "stale-session"
+        session_dir.mkdir(parents=True)
+        (session_dir / "summary.json").write_text("{}\n", encoding="utf-8")
+        stub = root / "grok"
+        _write_grok_refresh_stub(stub, f"""
+import json, os, sys
+from pathlib import Path
+Path({str(marker)!r}).write_text(" ".join(sys.argv[1:]), encoding="utf-8")
+row = {json.dumps(_grok_billing_record("2026-08-30T00:00:00Z", 10.0, "2026-09-05T00:00:00Z"))}
+with open(os.environ["AGENT_METER_GROK_LOG"], "a", encoding="utf-8") as handle:
+    handle.write(json.dumps(row) + "\\n")
+""")
+        with patched_env({
+            "AGENT_METER_OMP_BIN": "/nonexistent/omp-for-test",
+            "AGENT_METER_GROK_BIN": str(stub),
+            "AGENT_METER_GROK_LOG": str(log_path),
+            "AGENT_METER_GROK_REFRESH_CWD": str(refresh_cwd),
+            "GROK_HOME": str(grok_home),
+        }):
+            state = adapter.grok(now=now)
+        assert marker.is_file(), "stale snapshot must invoke the grok CLI"
+        assert "--no-alt-screen" in marker.read_text(encoding="utf-8")
+        assert not (grok_home / "sessions" / encoded).exists()
+    assert state["status"] == "fresh"
+    assert state["windows"][0]["remaining_percent"] == 90.0
+    assert "minutes old" not in state["detail"]
+    assert state["windows"][0]["resets_at"] == "2026-09-05T00:00:00Z"
+
+
+def test_grok_refreshes_ended_period_snapshot() -> None:
+    """An ended billing period is refreshed instead of staying stale."""
+    now = adapter.dt.datetime(2026, 8, 30, tzinfo=adapter.dt.UTC)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        log_path = root / "unified.jsonl"
+        log_path.write_text(json.dumps(_grok_billing_record(
+            "2026-08-29T23:50:00Z", 40.0, "2026-08-29T00:00:00Z",
+        )) + "\n", encoding="utf-8")
+        stub = root / "grok"
+        _write_grok_refresh_stub(stub, f"""
+import json, os
+row = {json.dumps(_grok_billing_record("2026-08-30T00:00:00Z", 15.0, "2026-09-06T00:00:00Z"))}
+with open(os.environ["AGENT_METER_GROK_LOG"], "a", encoding="utf-8") as handle:
+    handle.write(json.dumps(row) + "\\n")
+""")
+        with patched_env({
+            "AGENT_METER_OMP_BIN": "/nonexistent/omp-for-test",
+            "AGENT_METER_GROK_BIN": str(stub),
+            "AGENT_METER_GROK_LOG": str(log_path),
+            "AGENT_METER_GROK_REFRESH_CWD": str(root / "refresh-cwd"),
+            "GROK_HOME": str(root / "grok-home"),
+        }):
+            state = adapter.grok(now=now)
+    assert state["status"] == "fresh"
+    assert state["windows"][0]["remaining_percent"] == 85.0
+    assert "billing period that ended" not in state["detail"]
+
+
+def test_grok_does_not_start_cli_when_snapshot_is_fresh() -> None:
+    now = adapter.dt.datetime(2026, 8, 30, 0, 10, tzinfo=adapter.dt.UTC)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        log_path = root / "unified.jsonl"
+        log_path.write_text(json.dumps(_grok_billing_record(
+            "2026-08-30T00:00:00Z", 25.0, "2026-09-05T00:00:00Z",
+        )) + "\n", encoding="utf-8")
+        marker = root / "invoked"
+        stub = root / "grok"
+        _write_grok_refresh_stub(stub, f"""
+import sys
+from pathlib import Path
+Path({str(marker)!r}).write_text("ran", encoding="utf-8")
+sys.exit(1)
+""")
+        with patched_env({
+            "AGENT_METER_OMP_BIN": "/nonexistent/omp-for-test",
+            "AGENT_METER_GROK_BIN": str(stub),
+            "AGENT_METER_GROK_LOG": str(log_path),
+            "AGENT_METER_GROK_REFRESH_CWD": str(root / "refresh-cwd"),
+            "GROK_HOME": str(root / "grok-home"),
+        }):
+            state = adapter.grok(now=now)
+        assert not marker.exists()
+    assert state["status"] == "fresh"
+    assert state["windows"][0]["remaining_percent"] == 75.0
+
+
+def test_grok_stays_stale_when_refresh_appends_nothing() -> None:
+    """A CLI that exits without a new snapshot must not hide the age."""
+    now = adapter.dt.datetime(2026, 8, 30, tzinfo=adapter.dt.UTC)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        log_path = root / "unified.jsonl"
+        log_path.write_text(json.dumps(_grok_billing_record(
+            "2026-08-29T20:00:00Z", 55.0, "2026-09-05T00:00:00Z",
+        )) + "\n", encoding="utf-8")
+        marker = root / "invoked"
+        stub = root / "grok"
+        _write_grok_refresh_stub(stub, f"""
+from pathlib import Path
+Path({str(marker)!r}).write_text("ran", encoding="utf-8")
+""")
+        with patched_env({
+            "AGENT_METER_OMP_BIN": "/nonexistent/omp-for-test",
+            "AGENT_METER_GROK_BIN": str(stub),
+            "AGENT_METER_GROK_LOG": str(log_path),
+            "AGENT_METER_GROK_REFRESH_CWD": str(root / "refresh-cwd"),
+            "GROK_HOME": str(root / "grok-home"),
+            "AGENT_METER_GROK_REFRESH_TIMEOUT_SECONDS": "5",
+        }):
+            state = adapter.grok(now=now)
+        assert marker.is_file()
+    assert state["status"] == "stale"
+    assert state["windows"][0]["remaining_percent"] == 45.0
+    assert "minutes old" in state["detail"]
 
 
 def test_grok_log_used_when_omp_missing() -> None:
@@ -1953,6 +2102,10 @@ if __name__ == "__main__":
     test_grok_sample_stale_within_period()
     test_grok_sample_after_period_end()
     test_grok_sample_without_billing_records_is_unavailable()
+    test_grok_refreshes_stale_snapshot_without_tui()
+    test_grok_refreshes_ended_period_snapshot()
+    test_grok_does_not_start_cli_when_snapshot_is_fresh()
+    test_grok_stays_stale_when_refresh_appends_nothing()
     test_grok_log_used_when_omp_missing()
     test_copilot_quota_sample_has_no_trustworthy_reset()
     test_muse_empty_raises()

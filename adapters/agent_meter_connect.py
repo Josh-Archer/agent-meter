@@ -26,9 +26,9 @@ COMMANDS = {
 }
 
 OPEN_COMMANDS = {
-    # Grok Build refreshes its billing snapshot during normal startup. Its CLI
-    # does not expose a non-interactive quota command, so opening its own TUI
-    # is the only supported refresh path that does not read credentials.
+    # Manual open still starts Grok Build. The grok adapter also starts the CLI
+    # itself when the billing snapshot is stale, so unattended polls do not
+    # depend on this button. Neither path reads credentials.
     "grok": ["grok"],
 }
 

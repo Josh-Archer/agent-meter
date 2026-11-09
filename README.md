@@ -435,19 +435,29 @@ stamps it with the fetch time and does not judge its age from a payload clock.
 
 Without a usable OMP report, the Grok Build log path runs on its own and does
 not depend on OMP. Grok Build writes a structured weekly billing snapshot to
-`~/.grok/logs/unified.jsonl` after the CLI starts. The adapter reads only
-records named `billing: fetched credits config` and keeps the newest snapshot,
-including one whose billing period has already ended. It never opens
-`~/.grok/auth.json` or reads tokens, identity, prompts, or model output.
+`~/.grok/logs/unified.jsonl` when its CLI starts a session. On the shell
+route, `grok usage` does not fetch that snapshot; only session startup does,
+which is why leaving the TUI closed used to leave the reading stale after 30
+minutes. The adapter reads only records named `billing: fetched credits config`
+and keeps the newest snapshot, including one whose billing period has already
+ended. It never opens `~/.grok/auth.json` or reads tokens, identity, prompts,
+or model output.
 The provider's `creditUsagePercent` field is usage consumed, so Agent Meter
 converts it to the remaining percentage shown in the widget.
-Staleness uses that record's own `ts`. Snapshots older than 30 minutes are
-marked `stale` while their last known percentage remains visible. A snapshot
-from a billing period that has ended is also `stale`: the percentage from the
-snapshot is kept, and a reset instant already in the past is omitted. Start
-Grok Build to refresh it. You can tune the age boundary with
-`AGENT_METER_GROK_MAX_AGE_SECONDS` (default 1800). A log with no billing
-records is `unavailable`.
+Staleness uses that record's own `ts`. When the newest snapshot is missing,
+older than 30 minutes, or from a billing period that has ended, the adapter
+starts `grok --no-alt-screen` on a private PTY (working directory
+`$XDG_STATE_HOME/agent-meter/grok-billing-refresh`), waits until a newer
+billing record is appended, then stops that process. It does not leave the
+TUI running. If startup does not append a newer snapshot, the last known
+percentage stays visible with status `stale` and a detail that includes the
+age or the ended period. A reset instant already in the past is omitted.
+You can tune the age boundary with `AGENT_METER_GROK_MAX_AGE_SECONDS`
+(default 1800) and the startup deadline with
+`AGENT_METER_GROK_REFRESH_TIMEOUT_SECONDS` (default 20, so it finishes inside
+the daemon's default command timeout). Override the CLI with
+`AGENT_METER_GROK_BIN` (otherwise `grok` on `PATH`, then `~/.grok/bin/grok`).
+A log that still has no billing records after that attempt is `unavailable`.
 Stale means usage data needs refreshing, not that the saved Grok sign-in has
 expired; Agent Meter only offers **Connect** when a provider is actually
 unavailable.
