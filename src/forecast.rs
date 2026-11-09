@@ -219,13 +219,16 @@ pub fn record_state(
             continue;
         }
         for window in &provider.windows {
+            let Some(remaining_percent) = window.remaining_percent else {
+                continue;
+            };
             record_observation(
                 history,
                 &provider.id,
                 &window.id,
                 UsageObservation {
                     observed_at: now,
-                    remaining_percent: window.remaining_percent,
+                    remaining_percent,
                     resets_at: window.resets_at,
                 },
                 max_observations,
@@ -937,13 +940,14 @@ mod tests {
                     windows: vec![UsageWindow {
                         id: "daily".into(),
                         label: "Daily".into(),
-                        remaining_percent: 50.0,
+                        remaining_percent: Some(50.0),
                         resets_at: None,
                         reset_label: None,
                     }],
                     status: "fresh".into(),
                     detail: None,
                     usage_url: None,
+                    reason: None,
                     updated_at: None,
                 },
                 ProviderState {
@@ -953,13 +957,14 @@ mod tests {
                     windows: vec![UsageWindow {
                         id: "daily".into(),
                         label: "Daily".into(),
-                        remaining_percent: 50.0,
+                        remaining_percent: Some(50.0),
                         resets_at: None,
                         reset_label: None,
                     }],
                     status: "stale".into(),
                     detail: None,
                     usage_url: None,
+                    reason: None,
                     updated_at: None,
                 },
             ],

@@ -1213,13 +1213,103 @@ def test_muse_empty_read_falls_back_to_cache() -> None:
     assert "minutes old" in state["detail"]
 
 
-def test_muse_unavailable_when_missing() -> None:
-    """muse() returns unavailable when the binary is not installed."""
-    with patched_env({"AGENT_METER_MUSE_BIN": "/nonexistent/muse-for-test"}):
-        state = adapter.muse()
-    assert state["status"] == "unavailable"
+def _assert_muse_cli_missing(state: dict) -> None:
+    """A missing CLI is unknown usage, not an exhausted quota."""
     assert state["id"] == "muse"
+    assert state["status"] == "stale"
+    assert state["reason"] == adapter._MUSE_REASON_CLI_NOT_INSTALLED
+    assert state["reason"] == "cli_not_installed"
     assert "not installed" in state["detail"]
+    assert len(state["windows"]) == 1
+    window = state["windows"][0]
+    assert window["id"] == "availability"
+    assert window["remaining_percent"] is None
+    # The exhausted shape is 0% with a current, non-stale unavailable reading.
+    assert state["status"] != "unavailable"
+    encoded = json.dumps(state, separators=(",", ":"))
+    assert '"remaining_percent":0' not in encoded
+    assert '"remaining_percent":0.0' not in encoded
+
+
+def test_muse_unavailable_when_missing() -> None:
+    """A missing muse binary is stale and unknown, not 0% remaining."""
+    with tempfile.TemporaryDirectory() as tmp:
+        with patched_env({
+            "AGENT_METER_MUSE_BIN": "/nonexistent/muse-for-test",
+            "AGENT_METER_MUSE_PROBE": "1",
+            "XDG_STATE_HOME": str(Path(tmp) / "state"),
+            "XDG_CONFIG_HOME": str(Path(tmp) / "config"),
+        }):
+            state = adapter.muse()
+        probe_written = (Path(tmp) / "state" / "agent-meter" / "muse-probe.json").exists()
+        cache_written = _muse_cache_path(tmp).exists()
+    _assert_muse_cli_missing(state)
+    assert not probe_written
+    assert not cache_written
+
+
+def test_muse_missing_from_path_is_not_exhausted() -> None:
+    """PATH without muse, and probe enabled, still does not publish 0%."""
+    with tempfile.TemporaryDirectory() as tmp:
+        with patched_env({
+            "AGENT_METER_MUSE_BIN": None,
+            "PATH": tmp,
+            "AGENT_METER_MUSE_PROBE": "1",
+            "XDG_STATE_HOME": str(Path(tmp) / "state"),
+            "XDG_CONFIG_HOME": str(Path(tmp) / "config"),
+        }):
+            state = adapter.muse()
+        probe_written = (Path(tmp) / "state" / "agent-meter" / "muse-probe.json").exists()
+    _assert_muse_cli_missing(state)
+    assert not probe_written
+
+
+def test_muse_non_executable_cli_is_not_exhausted() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        fake = Path(tmp) / "muse"
+        fake.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        fake.chmod(0o644)
+        with patched_env({
+            "AGENT_METER_MUSE_BIN": str(fake),
+            "AGENT_METER_MUSE_PROBE": "1",
+            "XDG_STATE_HOME": str(Path(tmp) / "state"),
+            "XDG_CONFIG_HOME": str(Path(tmp) / "config"),
+        }):
+            state = adapter.muse()
+    _assert_muse_cli_missing(state)
+
+
+def test_muse_real_zero_remaining_is_quota() -> None:
+    """usedPercent 100 is an empty quota, not a missing CLI."""
+    usage = json.loads(json.dumps(_observed_muse_usage()))
+    usage["window"]["usedPercent"] = 100
+    usage["weekly"]["usedPercent"] = 100
+    now = _ms(usage["observedAtMs"]) + adapter.dt.timedelta(seconds=10)
+    state = adapter.normalize_muse(usage, now=now)
+    assert state["status"] == "fresh"
+    assert "reason" not in state
+    assert [window["remaining_percent"] for window in state["windows"]] == [0.0, 0.0]
+    assert "resets_at" in state["windows"][0]
+    assert "resets_at" in state["windows"][1]
+    assert state["detail"] == "Muse subscription usage"
+
+
+def test_muse_zero_percent_payload_stays_quota() -> None:
+    """A live usage/read of 0% remaining is published as quota, not cli_not_installed."""
+    usage = json.loads(json.dumps(_observed_muse_usage()))
+    usage["window"]["usedPercent"] = 100
+    usage["weekly"]["usedPercent"] = 100
+    now = _ms(usage["observedAtMs"]) + adapter.dt.timedelta(minutes=1)
+    line = json.dumps({"jsonrpc": "2.0", "id": 2, "result": {"usage": usage}})
+    with tempfile.TemporaryDirectory() as tmp:
+        fixture = Path(tmp) / "zero.jsonl"
+        fixture.write_text(line + "\n", encoding="utf-8")
+        with patched_env(_muse_env(tmp, fixture)):
+            state = adapter.muse(now=now)
+    assert state["status"] == "fresh"
+    assert "reason" not in state
+    assert [window["id"] for window in state["windows"]] == ["session", "weekly"]
+    assert [window["remaining_percent"] for window in state["windows"]] == [0.0, 0.0]
 
 
 def test_muse_serve_failure_is_unavailable() -> None:
@@ -2118,6 +2208,10 @@ if __name__ == "__main__":
     test_muse_empty_read_is_unavailable_without_cache()
     test_muse_empty_read_falls_back_to_cache()
     test_muse_unavailable_when_missing()
+    test_muse_missing_from_path_is_not_exhausted()
+    test_muse_non_executable_cli_is_not_exhausted()
+    test_muse_real_zero_remaining_is_quota()
+    test_muse_zero_percent_payload_stays_quota()
     test_muse_serve_failure_is_unavailable()
     test_uuid7_helper()
     test_muse_probe_off_memory_host_is_unavailable()
