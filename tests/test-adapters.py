@@ -15,13 +15,31 @@ import agent_meter_adapter as adapter
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
+MUSE_USAGE_FAKE = """#!/usr/bin/env python3
+import json
+import os
+import sys
+import time
+
+with open(os.environ["MUSE_COMMAND_LOG"], "a", encoding="utf-8") as stream:
+    stream.write(json.dumps(sys.argv[1:]) + "\\n")
+if sys.argv[1:] != ["usage", "--json"]:
+    raise SystemExit(3)  # No serve/probe is allowed on a supported CLI.
+time.sleep(float(os.environ.get("MUSE_COMMAND_DELAY", "0")))
+if os.environ.get("MUSE_COMMAND_ERROR"):
+    sys.stderr.write(os.environ["MUSE_COMMAND_ERROR"])
+    raise SystemExit(1)
+with open(os.environ["MUSE_COMMAND_FIXTURE"], encoding="utf-8") as stream:
+    sys.stdout.write(stream.read())
+"""
+
 MUSE_FAKE = """#!/usr/bin/env python3
 import json
 import os
 import sys
 
 if sys.argv[1:3] != ["serve", "--no-session-log"]:
-    sys.stderr.write("expected: serve --no-session-log\\n")
+    sys.stderr.write("error: unrecognized subcommand 'usage'\\n")
     raise SystemExit(2)
 received = []
 for line in sys.stdin:
@@ -55,7 +73,7 @@ import os
 import sys
 
 if sys.argv[1:3] != ["serve", "--no-session-log"]:
-    sys.stderr.write("expected: serve --no-session-log\\n")
+    sys.stderr.write("error: unrecognized subcommand 'usage'\\n")
     raise SystemExit(2)
 
 with open(os.environ["MUSE_USAGE_FIXTURE"], encoding="utf-8") as handle:
@@ -172,7 +190,7 @@ def snapshot_probe_state():
         handle.write(data)
 
 if sys.argv[1:3] != ["serve", "--no-session-log"]:
-    sys.stderr.write("expected: serve --no-session-log\\n")
+    sys.stderr.write("error: unrecognized subcommand 'usage'\\n")
     raise SystemExit(2)
 
 mode = os.environ.get("MUSE_PROBE_MODE", "ok")
@@ -893,6 +911,160 @@ def test_copilot_env_allowance() -> None:
 # normalize_muse — real MSP SubscriptionUsage samples
 # ---------------------------------------------------------------------------
 
+def _muse_usage_env(tmp: str, fixture: str = "muse-usage-command.json") -> dict:
+    fake = Path(tmp) / "muse"
+    _write_executable(fake, MUSE_USAGE_FAKE)
+    return {
+        "AGENT_METER_MUSE_BIN": str(fake),
+        "AGENT_METER_MUSE_TIMEOUT": "5",
+        "AGENT_METER_MUSE_PROBE": "1",  # Supported usage must never probe.
+        "MUSE_COMMAND_FIXTURE": str(FIXTURES / fixture),
+        "MUSE_COMMAND_LOG": str(Path(tmp) / "commands.jsonl"),
+        "MUSE_COMMAND_ERROR": None,
+        "MUSE_COMMAND_DELAY": None,
+        "XDG_STATE_HOME": str(Path(tmp) / "state"),
+        "XDG_CONFIG_HOME": str(Path(tmp) / "config"),
+    }
+
+
+def _muse_command_now():
+    payload = json.loads((FIXTURES / "muse-usage-command.json").read_text())
+    return _ms(payload["allowance"]["asOfMs"]) + adapter.dt.timedelta(seconds=10)
+
+
+def test_muse_usage_command_success() -> None:
+    """Captured 1.4.15 shape: asOfMs, no duration, and private tier metadata."""
+    with tempfile.TemporaryDirectory() as tmp:
+        with patched_env(_muse_usage_env(tmp)):
+            state, stderr = _call_muse(now=_muse_command_now())
+        assert state["status"] == "fresh"
+        assert state["icon"] == "muse"
+        session, weekly = state["windows"]
+        assert session["id"] == "session" and session["label"] == "Session"
+        assert session["remaining_percent"] == 96.0
+        assert session["resets_at"] == "2026-11-11T02:43:13Z"
+        assert weekly["id"] == "weekly" and weekly["remaining_percent"] == 79.0
+        assert weekly["resets_at"] == "2026-11-16T00:00:00Z"
+        cached = _muse_cache_path(tmp).read_text()
+        assert json.loads(cached)["observedAtMs"] == 1794347096479
+        assert "tier" not in cached and "source" not in cached
+        assert "REDACTED_TIER" not in cached + json.dumps(state) + stderr
+        assert not _probe_state_path(tmp).exists()
+        assert (Path(tmp) / "commands.jsonl").read_text().splitlines() == ['["usage", "--json"]']
+        _assert_private_file(_muse_cache_path(tmp))
+
+
+def test_muse_usage_command_no_data() -> None:
+    for payload in (
+        json.loads((FIXTURES / "muse-usage-command-empty.json").read_text()),
+        {"schemaVersion": 1, "allowance": None, "reason": None},
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Path(tmp) / "empty.json"
+            fixture.write_text(json.dumps(payload))
+            env = _muse_usage_env(tmp)
+            env["MUSE_COMMAND_FIXTURE"] = str(fixture)
+            with patched_env(env):
+                state, stderr = _call_muse()
+            assert state["status"] == "unavailable"
+            assert state["reason"] == "server_sent_no_usage"
+            assert "before first use" in state["detail"]
+            assert all("remaining_percent" not in window for window in state["windows"])
+            assert not _probe_state_path(tmp).exists()
+            assert not _muse_cache_path(tmp).exists()
+            assert not stderr
+
+
+def test_muse_usage_command_no_data_cache_validity() -> None:
+    for scenario in ("valid", "aged", "reset", "missing_timestamp", "corrupt"):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = _muse_usage_env(tmp)
+            now = _muse_command_now()
+            with patched_env(env):
+                adapter.muse(now=now)
+            path = _muse_cache_path(tmp)
+            cache = json.loads(path.read_text())
+            if scenario == "aged":
+                now += adapter.dt.timedelta(minutes=31)
+            elif scenario == "reset":
+                cache["window"]["resetsAtMs"] = int(now.timestamp() * 1000) - 1
+            elif scenario == "missing_timestamp":
+                cache.pop("observedAtMs")
+            path.write_text("{broken" if scenario == "corrupt" else json.dumps(cache))
+            before = path.read_bytes()
+            env["MUSE_COMMAND_FIXTURE"] = str(FIXTURES / "muse-usage-command-empty.json")
+            with patched_env(env):
+                state = adapter.muse(now=now)
+            assert state["reason"] == "server_sent_no_usage"
+            if scenario == "valid":
+                assert state["status"] == "stale"
+                assert "using cached" in state["detail"]
+                assert [w["remaining_percent"] for w in state["windows"]] == [96.0, 79.0]
+            else:
+                assert state["status"] == "unavailable", scenario
+                assert all("remaining_percent" not in w for w in state["windows"])
+            assert path.read_bytes() == before
+            assert not _probe_state_path(tmp).exists()
+
+
+def test_muse_usage_command_errors_do_not_probe() -> None:
+    for scenario in ("failure", "timeout", "invalid_json", "invalid_shape", "missing_allowance", "no_percent"):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = _muse_usage_env(tmp)
+            if scenario == "failure":
+                env["MUSE_COMMAND_ERROR"] = "private-diagnostic-test-marker"
+            elif scenario == "timeout":
+                env["MUSE_COMMAND_DELAY"] = "5"
+                env["AGENT_METER_MUSE_TIMEOUT"] = "0.1"
+            else:
+                fixture = Path(tmp) / "bad.json"
+                fixture.write_text({
+                    "invalid_json": "private-diagnostic-test-marker",
+                    "invalid_shape": "[]",
+                    "missing_allowance": "{}",
+                    "no_percent": '{"allowance":{"window":{"usedPercent":null}}}',
+                }[scenario])
+                env["MUSE_COMMAND_FIXTURE"] = str(fixture)
+            with patched_env(env):
+                state, stderr = _call_muse()
+            assert state["status"] == "unavailable", scenario
+            assert state["reason"] == "usage_command_failed", scenario
+            assert "private-diagnostic-test-marker" not in json.dumps(state) + stderr
+            assert all("remaining_percent" not in w for w in state["windows"])
+            assert not _probe_state_path(tmp).exists()
+            assert not _muse_cache_path(tmp).exists()
+
+
+def test_muse_usage_command_partial_and_zero_windows() -> None:
+    for bucket in ({"usedPercent": 100}, {"usedPercent": 25}, {"usedPercent": False}, {"usedPercent": float("nan")}):
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = json.loads((FIXTURES / "muse-usage-command.json").read_text())
+            payload["allowance"]["window"] = bucket
+            fixture = Path(tmp) / "partial.json"
+            fixture.write_text(json.dumps(payload))
+            env = _muse_usage_env(tmp)
+            env["MUSE_COMMAND_FIXTURE"] = str(fixture)
+            with patched_env(env):
+                state = adapter.muse(now=_muse_command_now())
+            assert state["status"] == "fresh"
+            if bucket["usedPercent"] is False or str(bucket["usedPercent"]) == "nan":
+                assert [w["id"] for w in state["windows"]] == ["weekly"]
+            else:
+                assert state["windows"][0]["remaining_percent"] == 100 - bucket["usedPercent"]
+            assert state["windows"][-1]["remaining_percent"] == 79.0
+
+
+def test_muse_usage_command_expired_keeps_measurement() -> None:
+    payload = json.loads((FIXTURES / "muse-usage-command.json").read_text())
+    now = _ms(payload["allowance"]["window"]["resetsAtMs"]) + adapter.dt.timedelta(seconds=1)
+    with tempfile.TemporaryDirectory() as tmp:
+        with patched_env(_muse_usage_env(tmp)):
+            state = adapter.muse(now=now)
+    assert state["status"] == "stale"
+    assert state["windows"][0]["remaining_percent"] == 96.0
+    assert "resets_at" not in state["windows"][0]
+
+
 def _muse_env(tmp: str, fixture: Path, requests_log: Path | None = None) -> dict[str, str | None]:
     fake = Path(tmp) / "muse"
     _write_executable(fake, MUSE_FAKE)
@@ -1187,6 +1359,7 @@ def test_muse_empty_read_is_unavailable_without_cache() -> None:
     assert state["id"] == "muse"
     assert state["detail"] == MUSE_UNAVAILABLE_REASON
     assert state["detail"] == adapter._MUSE_NOT_REPORTED
+    assert all("remaining_percent" not in w for w in state["windows"])
     assert not cache_exists
 
 
@@ -2108,11 +2281,12 @@ def test_json_schema_output() -> None:
                 {
                     "id": "muse",
                     "label": "Muse",
-                    "icon": "generic",
+                    "icon": "muse",
                     "windows": [
-                        {"id": "availability", "label": "Availability", "remaining_percent": 0.0},
+                        {"id": "availability", "label": "Availability"},
                     ],
                     "status": "unavailable",
+                    "reason": "server_sent_no_usage",
                 },
             ],
         }
@@ -2146,6 +2320,8 @@ def test_json_schema_output() -> None:
         assert muse["provider"] == "muse"
         assert muse["available"] is False
         assert muse["stale"] is False
+        assert muse["reason"] == "server_sent_no_usage"
+        assert "remaining_percent" not in muse["windows"][0]
 
 
 if __name__ == "__main__":
@@ -2198,6 +2374,12 @@ if __name__ == "__main__":
     test_grok_stays_stale_when_refresh_appends_nothing()
     test_grok_log_used_when_omp_missing()
     test_copilot_quota_sample_has_no_trustworthy_reset()
+    test_muse_usage_command_success()
+    test_muse_usage_command_no_data()
+    test_muse_usage_command_no_data_cache_validity()
+    test_muse_usage_command_errors_do_not_probe()
+    test_muse_usage_command_partial_and_zero_windows()
+    test_muse_usage_command_expired_keeps_measurement()
     test_muse_empty_raises()
     test_muse_observed_sample_windows()
     test_muse_observed_sample_stale_by_age()

@@ -473,42 +473,41 @@ or usage-dashboard information if you need an alternative source.
 
 ### Muse
 
-Muse 1.4.7 has no `usage` subcommand and no passive place to read subscription
-usage. Checked against Muse 1.4.7:
+Agent Meter prefers the read-only `muse usage --json` command, available in
+Muse 1.4.15. Set `AGENT_METER_MUSE_BIN` to override the executable and
+`AGENT_METER_MUSE_TIMEOUT` to override its timeout (default 20 seconds).
 
-- Subscription usage lives only in the memory of the host process that made a
-  model call. It arrives as a frame on the model stream
-  (`/v1/chat/completions`). After `muse exec "Reply with just: ok"`, a fresh
-  `muse serve` `usage/read` returns `{}`.
-- The files Muse writes (`session.jsonl`, `cli-*.log`,
-  `local-tracing/bootstrap/*.log`, `.msp-view-v1` journal and snapshots,
-  `session-index.db`, `session-names.db`, `cron.db`, and `model-catalog/*.json`)
-  contain no `usedPercent`, reset, or rate-limit data.
-- The binary has no account or usage HTTP endpoint. The only `api.meta.ai`
-  paths are `/v1/chat/completions`, `/v1/models`, `/v1/asr/duplex`, `/v1/logs`,
-  `/v1/traces`, and `/v1/metrics`. Adapters never read `~/.config/muse/auth.json`.
-- `~/.local/share/muse/runtime/muse/ms-*.sock` is a stale peer-messaging
-  socket, not a shared host. The TUI and `muse exec` each spawn their own
-  in-process host, so a long-lived Agent Meter `muse serve` never sees the
-  user's real calls.
+The command's JSON has `schemaVersion: 1` and an `allowance` object with
+`window`, `weekly`, and `asOfMs`. Each window supplies `usedPercent` and
+`resetsAtMs`. Agent Meter maps `window` to `session` and `asOfMs` to its cache's
+`observedAtMs`; it does not assume a session duration when none is supplied.
+Only numeric quota fields are cached. Account `tier`, source metadata, and
+other response fields are omitted. The adapter never reads Muse credentials.
 
-There is no passive persistent source. The only way to observe usage is for
-Agent Meter's own `muse serve` process to make a model call.
+The server can return `reason: "server_sent_no_usage"` with `allowance: null`,
+for example before first use in a new window. This is unknown usage. Agent Meter
+reuses its own cache only if the observation is within
+`AGENT_METER_MUSE_MAX_AGE_SECONDS` and no reported reset time has passed. That
+result is marked `stale`, with `reason: "server_sent_no_usage"` and a detail
+identifying the cached reading. Without a valid cache it is `unavailable`,
+with the same reason and no `remaining_percent`. An omitted percentage is not
+0% or exhausted quota. A failed or malformed usage command similarly uses a
+valid cache or reports unknown usage with `reason: "usage_command_failed"`.
+These cases do not launch `muse serve` or spend quota on a probe, even if the
+legacy probe is enabled.
 
-Agent Meter still tries a read-only MSP exchange first. It runs
-`muse serve --no-session-log` in a temporary directory, sends `initialize`,
-`initialized`, and `usage/read`, and reads stdout until the `usage/read`
-response. A `usage/changed` notification that arrives before that response is
-the same SubscriptionUsage object. The account `tier` is omitted.
+For older CLIs such as Muse 1.4.7, an explicit unknown-command error falls back
+to the existing MSP path. Agent Meter runs `muse serve --no-session-log` in a
+temporary directory, sends `initialize`, `initialized`, and `usage/read`, and
+reads stdout until the response. A preceding `usage/changed` notification is
+also accepted. In 1.4.7, usage lives in the host process that made a model call;
+a fresh `serve` returns `{}` and cannot see another Muse process's calls.
 
-`usage/read` returns `{"usage": ...}` only after a model call in that same
-process, and `{}` otherwise. An empty result uses
+An empty legacy result reuses an earlier observation from
 `$XDG_STATE_HOME/agent-meter/muse-usage.json` (default
-`~/.local/state/agent-meter/muse-usage.json`) when Agent Meter has cached an
-earlier observation. With neither an observation nor a cache, the provider is
-`unavailable`. The detail says that Muse keeps subscription usage only in the
-memory of the process that made a model call and writes none to disk. A
-missing `muse` binary or a failed `serve` is also `unavailable`.
+`~/.local/state/agent-meter/muse-usage.json`), marked stale when aged or reset.
+With no observation or cache, the provider is `unavailable` and omits the
+percentage. The detail explains the older CLI's in-memory usage limitation.
 
 An opt-in probe can fill that cache. It is off by default. Turn it on with
 `AGENT_METER_MUSE_PROBE=1` or with `~/.config/agent-meter/muse.json`:
@@ -517,8 +516,8 @@ An opt-in probe can fill that cache. It is off by default. Turn it on with
 {"probe": true, "probe_interval_seconds": 3600}
 ```
 
-When the probe is on, Agent Meter sends one minimal turn on that same
-`muse serve` host only when the last probe attempt is older than
+When the legacy fallback is active and the probe is on, Agent Meter sends
+one minimal turn on that same `muse serve` host only when the last probe attempt is older than
 `probe_interval_seconds` (default 3600, minimum 900). The gate is
 `$XDG_STATE_HOME/agent-meter/muse-probe.json` (default
 `~/.local/state/agent-meter/muse-probe.json`): `last_attempt_at` plus the
@@ -567,9 +566,10 @@ The rolling window is exposed as id `session` (labeled from
 Remaining percentage is `100 - usedPercent`, clamped to 0 through 100
 (`usedPercent` may exceed 100). Reset times are ISO 8601 UTC instants from
 `resetsAtMs`. An observation older than `AGENT_METER_MUSE_MAX_AGE_SECONDS`
-(default 1800), counted from `observedAtMs`, is `stale`. A window whose reset
-time has already passed reports 100% remaining, omits `resets_at`, and marks
-the provider `stale`. Override the binary with `AGENT_METER_MUSE_BIN`.
+(default 1800), counted from `observedAtMs` (`allowance.asOfMs` for the usage
+command), is `stale`. A window whose reset time has passed retains the last
+measured percentage, omits `resets_at`, and marks the provider `stale`; Agent
+Meter does not assume a new allowance of 100%.
 
 When that binary is missing or not executable, the probe cannot run. The
 adapter does not report `remaining_percent: 0` with `available: false` and
@@ -584,7 +584,7 @@ python3 tests/check-extension-layout.py
 python3 tests/test-adapters.py
 ```
 
-`check-extension-layout.py` verifies that all six local symbols exist, the panel
+`check-extension-layout.py` verifies that all seven local symbols exist, the panel
 loops over all configured providers, and the desktop card uses the desktop-only
 focus rule. `test-adapters.py` validates all normalization paths: `normalize_codex`,
 `normalize_agy`, `normalize_grok`, `normalize_claude`, `normalize_muse`, Copilot SDK

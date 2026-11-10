@@ -8,7 +8,7 @@ extension = root / "gnome-extension" / "agent-meter@local"
 metadata = json.loads((extension / "metadata.json").read_text())
 assert metadata["uuid"] == "agent-meter@local"
 source = (extension / "extension.js").read_text()
-for name in ("codex", "antigravity", "grok", "copilot", "claude", "generic"):
+for name in ("codex", "antigravity", "grok", "copilot", "claude", "muse", "generic"):
     assert (extension / "icons" / f"{name}.svg").is_file(), name
     assert (extension / "icons" / f"{name}-symbolic.svg").is_file(), name
     assert f"'{name}'" in source, name

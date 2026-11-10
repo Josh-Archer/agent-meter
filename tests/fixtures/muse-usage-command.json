@@ -1,0 +1,12 @@
+{
+  "allowance": {
+    "asOfMs": 1794347096479,
+    "source": "subscription",
+    "tier": "REDACTED_TIER",
+    "weekly": {"resetsAtMs": 1794787200000, "usedPercent": 21},
+    "window": {"resetsAtMs": 1794364993000, "usedPercent": 4}
+  },
+  "hint": null,
+  "reason": null,
+  "schemaVersion": 1
+}

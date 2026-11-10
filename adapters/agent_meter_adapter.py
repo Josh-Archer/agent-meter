@@ -11,6 +11,7 @@ import argparse
 import datetime as dt
 import fcntl
 import json
+import math
 import os
 import pty
 import selectors
@@ -1530,7 +1531,7 @@ def _muse_window(
     if not isinstance(bucket, dict):
         return None, False
     used = _number(bucket.get("usedPercent"))
-    if used is None:
+    if used is None or not math.isfinite(used):
         return None, False
     # usedPercent may exceed 100. Remaining is clamped to 0..100.
     remaining = max(0.0, min(100.0, 100.0 - float(used)))
@@ -1547,7 +1548,6 @@ def _muse_window(
     except (OverflowError, OSError, ValueError):
         return window, False
     if reset_dt <= now:
-        window["remaining_percent"] = 100.0
         return window, True
     reset_at, reset_text = reset_label(reset_ms)
     if reset_at:
@@ -1562,9 +1562,9 @@ def normalize_muse(payload: dict[str, Any], now: dt.datetime | None = None) -> d
 
     ``window`` becomes the ``session`` window (its label comes from
     ``windowDurationMins``, for example ``5h``). ``weekly`` stays ``weekly``.
-    ``tier`` is omitted. A reset instant that has already passed reports 100%
-    remaining, drops ``resets_at``, and marks the provider stale. Age is taken
-    from ``observedAtMs``.
+    ``tier`` is omitted. A reset instant that has already passed keeps the last
+    measured percentage, drops ``resets_at``, and marks the provider stale. Age
+    is taken from ``observedAtMs``.
     """
     current = now or dt.datetime.now(dt.UTC)
     if current.tzinfo is None:
@@ -1609,7 +1609,7 @@ def normalize_muse(payload: dict[str, Any], now: dt.datetime | None = None) -> d
     state = {
         "id": "muse",
         "label": "Muse",
-        "icon": "generic",
+        "icon": "muse",
         "windows": windows,
         "status": "stale" if stale else "fresh",
         "detail": detail,
@@ -1863,6 +1863,89 @@ def _muse_from_cache(now: dt.datetime | None) -> dict[str, Any] | None:
     return normalize_muse(cached, now=now)
 
 
+def _muse_unavailable(detail: str, reason: str = "usage_not_reported") -> dict[str, Any]:
+    return {
+        "id": "muse",
+        "label": "Muse",
+        "icon": "muse",
+        "windows": [{"id": "availability", "label": "Availability"}],
+        "status": "unavailable",
+        "detail": detail,
+        "reason": reason,
+    }
+
+
+def _query_muse_usage(command: str, timeout: float) -> dict[str, Any] | None:
+    """Read Muse 1.4.15 JSON; None means the CLI has no usage subcommand.
+
+    Never include command output in exceptions: even errors may contain account
+    identifiers. Only an explicit unsupported-command error enables MSP/probing.
+    """
+    completed = subprocess.run(
+        [command, "usage", "--json"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout,
+    )
+    if completed.returncode != 0:
+        diagnostic = (completed.stderr + "\n" + completed.stdout).lower()
+        if any(
+            f"{prefix} {quoted}" in diagnostic
+            for prefix in (
+                "unknown command", "unknown subcommand",
+                "unrecognized subcommand", "unexpected argument",
+            )
+            for quoted in ("'usage'", '"usage"', "`usage`")
+        ):
+            return None
+        raise RuntimeError("muse usage --json failed")
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        raise ValueError("muse usage --json returned invalid JSON") from None
+    if not isinstance(payload, dict):
+        raise ValueError("muse usage --json returned an invalid document")
+    return payload
+
+
+def _muse_usage_observation(payload: dict[str, Any]) -> dict[str, Any]:
+    """Map allowance.asOfMs to MSP's observedAtMs; keep quota fields only."""
+    allowance = payload.get("allowance")
+    if not isinstance(allowance, dict):
+        raise ValueError("muse usage --json returned no allowance")
+    usage: dict[str, Any] = {}
+    observed = _number(allowance.get("asOfMs"))
+    if observed is not None and math.isfinite(observed):
+        usage["observedAtMs"] = observed
+    for name in ("window", "weekly"):
+        bucket = allowance.get(name)
+        if isinstance(bucket, dict):
+            usage[name] = {
+                key: value
+                for key in ("usedPercent", "resetsAtMs", "windowDurationMins")
+                if (value := _number(bucket.get(key))) is not None and math.isfinite(value)
+            }
+    return usage
+
+
+def _muse_command_without_usage(
+    now: dt.datetime | None, detail: str, reason: str,
+) -> dict[str, Any]:
+    """Reuse only a current, unreset observation and label it as cached."""
+    try:
+        cached = _muse_from_cache(now)
+    except (TypeError, ValueError, OverflowError, OSError):
+        cached = None
+    if cached is not None and cached["status"] == "fresh":
+        cached["status"] = "stale"
+        cached["reason"] = reason
+        cached["detail"] = f"{detail}; using cached Muse usage"
+        return cached
+    return _muse_unavailable(detail, reason)
+
+
 def _muse_without_live_usage(
     now: dt.datetime | None,
     *,
@@ -1875,25 +1958,20 @@ def _muse_without_live_usage(
     try:
         cached_state = _muse_from_cache(now)
     except (TypeError, ValueError) as cache_error:
-        return unavailable(
-            "muse", "Muse", "generic",
-            f"Muse usage unavailable: {cache_error}",
-        )
+        return _muse_unavailable(f"Muse usage unavailable: {cache_error}")
     if cached_state is not None:
         return cached_state
     # A probe that just ran reports its own error. A later refresh, with no
     # usable cache, reports when the last attempt was and when the next is allowed.
     if throttle_state is not None and not probed:
-        return unavailable("muse", "Muse", "generic", _probe_throttle_detail(throttle_state))
+        return _muse_unavailable(_probe_throttle_detail(throttle_state))
     if empty:
-        return unavailable("muse", "Muse", "generic", _MUSE_NOT_REPORTED)
+        return _muse_unavailable(_MUSE_NOT_REPORTED)
     if error is None:
-        return unavailable(
-            "muse", "Muse", "generic",
+        return _muse_unavailable(
             "Muse usage unavailable: muse serve ended before reporting usage",
         )
-    return unavailable(
-        "muse", "Muse", "generic",
+    return _muse_unavailable(
         f"Muse usage unavailable: {error}",
     )
 
@@ -1941,7 +2019,7 @@ def _muse_cli_not_installed() -> dict[str, Any]:
     return {
         "id": "muse",
         "label": "Muse",
-        "icon": "generic",
+        "icon": "muse",
         "windows": [
             {
                 "id": "availability",
@@ -1956,9 +2034,9 @@ def _muse_cli_not_installed() -> dict[str, Any]:
 
 
 def muse(now: dt.datetime | None = None) -> dict[str, Any]:
-    """Read Muse subscription usage over the MSP stdio protocol.
+    """Prefer read-only ``muse usage --json``, falling back for older CLIs.
 
-    A fresh ``muse serve`` has no subscription usage: Muse keeps that only in
+    On older CLIs a fresh ``muse serve`` has no usage: Muse keeps that only in
     the memory of the process that made a model call. The read-only
     ``usage/read`` still runs. The opt-in probe, off by default, makes one
     minimal turn in this same host only when the last probe attempt is older
@@ -1972,6 +2050,31 @@ def muse(now: dt.datetime | None = None) -> dict[str, Any]:
     command = os.environ.get("AGENT_METER_MUSE_BIN", "muse")
     if not _muse_cli_installed(command):
         return _muse_cli_not_installed()
+    try:
+        payload = _query_muse_usage(command, _muse_timeout_seconds())
+        if payload is not None:
+            if payload.get("reason") == "server_sent_no_usage" or (
+                "allowance" in payload and payload["allowance"] is None
+            ):
+                return _muse_command_without_usage(
+                    now,
+                    "Muse server sent no usage data; this can happen before first use in a new window",
+                    "server_sent_no_usage",
+                )
+            live = _muse_usage_observation(payload)
+            state = normalize_muse(live, now=now)
+            try:
+                write_state_file(_muse_cache_path(), live)
+            except OSError:
+                pass
+            return state
+    except FileNotFoundError:
+        return _muse_cli_not_installed()
+    except (OSError, RuntimeError, ValueError, OverflowError, subprocess.TimeoutExpired):
+        return _muse_command_without_usage(
+            now, "Muse usage command unavailable or returned invalid data", "usage_command_failed",
+        )
+
     should_probe, throttle_state = _muse_probe_gate()
     timeout = _muse_probe_timeout_seconds() if should_probe else _muse_timeout_seconds()
     attempt = _ProbeAttempt()
@@ -2001,10 +2104,7 @@ def muse(now: dt.datetime | None = None) -> dict[str, Any]:
         try:
             return normalize_muse(live, now=now)
         except (TypeError, ValueError) as error:
-            return unavailable(
-                "muse", "Muse", "generic",
-                f"Muse usage unavailable: {error}",
-            )
+            return _muse_unavailable(f"Muse usage unavailable: {error}")
 
     # usage/read observed nothing in this process. Another Muse process's
     # calls are not visible here. Reuse agent-meter's own cache when it exists.
