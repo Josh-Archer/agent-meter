@@ -91,7 +91,7 @@ function quotaWindows(provider) {
 function iconFor(extension, symbol) {
     if (symbol === 'agy')
         symbol = 'antigravity';
-    const allowed = new Set(['codex', 'antigravity', 'grok', 'copilot', 'claude', 'generic']);
+    const allowed = new Set(['codex', 'antigravity', 'grok', 'copilot', 'claude', 'muse', 'generic']);
     const name = allowed.has(symbol) ? symbol : 'generic';
     const iconsDir = extension.dir.get_child('icons');
     const symbolicFile = iconsDir.get_child(`${name}-symbolic.svg`);
