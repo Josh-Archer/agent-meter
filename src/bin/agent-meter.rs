@@ -172,16 +172,27 @@ mod gui {
                     .xalign(0.0)
                     .build(),
             );
+            let Some(percent) = window.remaining_percent else {
+                row.append(
+                    &gtk::Label::builder()
+                        .label("—")
+                        .hexpand(true)
+                        .xalign(0.0)
+                        .build(),
+                );
+                card.append(&row);
+                continue;
+            };
             let bar = gtk::ProgressBar::builder()
-                .fraction((window.remaining_percent / 100.0).into())
+                .fraction((percent / 100.0).into())
                 .hexpand(true)
-                .css_classes([style_for(window.remaining_percent, &provider.status)])
+                .css_classes([style_for(percent, &provider.status)])
                 .build();
             row.append(&bar);
             let reset = window.reset_label.as_deref().unwrap_or("no reset time");
             row.append(
                 &gtk::Label::builder()
-                    .label(format!("{:>3.0}%  {reset}", window.remaining_percent))
+                    .label(format!("{:>3.0}%  {reset}", percent))
                     .xalign(1.0)
                     .build(),
             );
@@ -300,13 +311,14 @@ mod tests {
                 windows: vec![UsageWindow {
                     id: "five_hour".into(),
                     label: "5 hours".into(),
-                    remaining_percent: 80.0,
+                    remaining_percent: Some(80.0),
                     resets_at: None,
                     reset_label: None,
                 }],
                 status: "fresh".into(),
                 detail: None,
                 usage_url: None,
+                reason: None,
                 updated_at: None,
             }],
         };
@@ -314,7 +326,7 @@ mod tests {
         let loaded = load_json_output(Some(&path)).unwrap();
         assert_eq!(loaded.schema_version, 1);
         assert_eq!(loaded.providers[0].provider, "codex");
-        assert_eq!(loaded.providers[0].windows[0].remaining_percent, 80.0);
+        assert_eq!(loaded.providers[0].windows[0].remaining_percent, Some(80.0));
     }
 
     #[test]
@@ -337,13 +349,14 @@ mod tests {
                 windows: vec![UsageWindow {
                     id: "weekly".into(),
                     label: "Weekly".into(),
-                    remaining_percent: 92.0,
+                    remaining_percent: Some(92.0),
                     resets_at: None,
                     reset_label: None,
                 }],
                 status: "fresh".into(),
                 detail: None,
                 usage_url: None,
+                reason: None,
                 updated_at: None,
             }],
         };
@@ -352,7 +365,7 @@ mod tests {
 
         let loaded = load_json_output_at(None, &runtime, &stable).unwrap();
         assert_eq!(loaded.providers[0].provider, "muse");
-        assert_eq!(loaded.providers[0].windows[0].remaining_percent, 92.0);
+        assert_eq!(loaded.providers[0].windows[0].remaining_percent, Some(92.0));
         assert!(loaded.providers[0].available);
         assert!(!loaded.providers[0].stale);
     }

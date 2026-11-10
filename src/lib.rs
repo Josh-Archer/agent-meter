@@ -25,7 +25,11 @@ pub struct UsageWindow {
     pub id: String,
     pub label: String,
     /// Remaining allowance as a percentage from 0 through 100.
-    pub remaining_percent: f32,
+    ///
+    /// `None` means the probe produced no quota sample. That is not 0%
+    /// remaining. Public JSON omits the field in that case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_percent: Option<f32>,
     /// Provider-supplied reset time, if it has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resets_at: Option<DateTime<Utc>>,
@@ -35,8 +39,10 @@ pub struct UsageWindow {
 
 impl UsageWindow {
     pub fn validate(&self) -> Result<()> {
-        if !(0.0..=100.0).contains(&self.remaining_percent) {
-            bail!("{} remaining_percent must be between 0 and 100", self.id);
+        if let Some(percent) = self.remaining_percent {
+            if !(0.0..=100.0).contains(&percent) {
+                bail!("{} remaining_percent must be between 0 and 100", self.id);
+            }
         }
         Ok(())
     }
@@ -54,6 +60,10 @@ pub struct ProviderState {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Why no quota sample exists, for example `cli_not_installed`.
+    /// Absent when the windows hold a real remaining percent, including 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_url: Option<String>,
     /// When this provider last returned usable usage data.
@@ -86,7 +96,7 @@ impl ProviderState {
     pub fn most_constrained_percent(&self) -> f32 {
         self.windows
             .iter()
-            .map(|window| window.remaining_percent)
+            .filter_map(|window| window.remaining_percent)
             .fold(100.0_f32, f32::min)
     }
 }
@@ -157,7 +167,10 @@ pub fn stable_state_path() -> PathBuf {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct JsonWindow {
     pub name: String,
-    pub remaining_percent: f32,
+    /// Remaining quota from 0.0 to 100.0. Omitted when the probe could not
+    /// run. Omission is not the same as 0% remaining.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_percent: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resets_at: Option<String>,
     /// Quota-exhaustion forecast from the daemon's local usage history.
@@ -177,6 +190,10 @@ pub struct JsonProvider {
     pub available: bool,
     /// True only when the provider status is `stale`.
     pub stale: bool,
+    /// Machine-readable cause when no quota sample exists, for example
+    /// `cli_not_installed`. Absent for a normal reading, including a real 0%.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Top-level public JSON output written by `agent-meter --json` and to the
@@ -215,6 +232,7 @@ impl JsonOutput {
                     updated_at: updated_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
                     available,
                     stale,
+                    reason: p.reason.clone(),
                 }
             })
             .collect();
@@ -347,13 +365,14 @@ mod tests {
                 windows: vec![UsageWindow {
                     id: "five_hour".into(),
                     label: "5 hours".into(),
-                    remaining_percent: 72.0,
+                    remaining_percent: Some(72.0),
                     resets_at: None,
                     reset_label: Some("in 1h 12m".into()),
                 }],
                 status: "fresh".into(),
                 detail: None,
                 usage_url: None,
+                reason: None,
                 updated_at: None,
             }],
         }
@@ -371,7 +390,7 @@ mod tests {
     #[test]
     fn invalid_percent_is_rejected() {
         let mut state = sample_state();
-        state.providers[0].windows[0].remaining_percent = 101.0;
+        state.providers[0].windows[0].remaining_percent = Some(101.0);
         assert!(state.validate().is_err());
     }
 
@@ -412,13 +431,14 @@ mod tests {
                 windows: vec![UsageWindow {
                     id: "five_hour".into(),
                     label: "5 hours".into(),
-                    remaining_percent: 72.0,
+                    remaining_percent: Some(72.0),
                     resets_at: Some(reset_ts),
                     reset_label: Some("in 1h".into()),
                 }],
                 status: "fresh".into(),
                 detail: None,
                 usage_url: None,
+                reason: None,
                 updated_at: None,
             }],
         };
@@ -430,7 +450,7 @@ mod tests {
         assert!(!output.providers[0].stale);
         assert_eq!(output.providers[0].updated_at, "2026-09-12T10:00:00+00:00");
         assert_eq!(output.providers[0].windows[0].name, "five_hour");
-        assert_eq!(output.providers[0].windows[0].remaining_percent, 72.0);
+        assert_eq!(output.providers[0].windows[0].remaining_percent, Some(72.0));
         assert!(output.providers[0].windows[0].resets_at.is_some());
         let resets_at = output.providers[0].windows[0].resets_at.as_ref().unwrap();
         assert!(resets_at.contains("2026-09-12"));
@@ -448,13 +468,14 @@ mod tests {
                 windows: vec![UsageWindow {
                     id: "weekly".into(),
                     label: "Weekly".into(),
-                    remaining_percent: 45.0,
+                    remaining_percent: Some(45.0),
                     resets_at: None,
                     reset_label: None,
                 }],
                 status: "stale".into(),
                 detail: None,
                 usage_url: None,
+                reason: None,
                 updated_at: None,
             }],
         };
@@ -484,13 +505,14 @@ mod tests {
             windows: vec![UsageWindow {
                 id: "weekly".into(),
                 label: "Weekly".into(),
-                remaining_percent: 45.0,
+                remaining_percent: Some(45.0),
                 resets_at: None,
                 reset_label: None,
             }],
             status: "stale".into(),
             detail: Some("Stale: last good data at 2026-10-15T09:30:00+00:00".into()),
             usage_url: None,
+            reason: None,
             updated_at: Some(grok_at),
         });
 
@@ -525,6 +547,82 @@ mod tests {
         let error = JsonOutput::from_state(&provider_with_status("error"));
         assert!(!error.providers[0].available);
         assert!(!error.providers[0].stale);
+    }
+
+    #[test]
+    fn missing_cli_document_omits_percent_and_marks_stale() {
+        let raw = r#"{
+            "id": "muse",
+            "label": "Muse",
+            "icon": "generic",
+            "windows": [{
+                "id": "availability",
+                "label": "Availability",
+                "remaining_percent": null
+            }],
+            "status": "stale",
+            "detail": "muse is not installed; install Muse and sign in to see usage.",
+            "reason": "cli_not_installed"
+        }"#;
+        let provider: ProviderState = serde_json::from_str(raw).unwrap();
+        assert!(provider.validate().is_ok());
+        assert_eq!(provider.reason.as_deref(), Some("cli_not_installed"));
+        assert_eq!(provider.windows[0].remaining_percent, None);
+        let state = AgentMeterState {
+            version: STATE_VERSION,
+            generated_at: Utc::now(),
+            providers: vec![provider],
+        };
+        let output = JsonOutput::from_state(&state);
+        assert!(output.providers[0].stale);
+        assert!(output.providers[0].available);
+        assert_eq!(
+            output.providers[0].reason.as_deref(),
+            Some("cli_not_installed")
+        );
+        assert_eq!(output.providers[0].windows[0].remaining_percent, None);
+        let value = serde_json::to_value(&output).unwrap();
+        let muse = &value["providers"][0];
+        assert!(muse["windows"][0].get("remaining_percent").is_none());
+        assert_eq!(muse["reason"], "cli_not_installed");
+        assert_eq!(muse["stale"], true);
+        assert_eq!(muse["available"], true);
+    }
+
+    #[test]
+    fn real_zero_percent_stays_a_quota_reading() {
+        let raw = r#"{
+            "id": "muse",
+            "label": "Muse",
+            "icon": "generic",
+            "windows": [
+                {"id": "session", "label": "5h", "remaining_percent": 0.0},
+                {"id": "weekly", "label": "Weekly", "remaining_percent": 0.0}
+            ],
+            "status": "fresh",
+            "detail": "Muse subscription usage"
+        }"#;
+        let provider: ProviderState = serde_json::from_str(raw).unwrap();
+        assert!(provider.validate().is_ok());
+        assert!(provider.reason.is_none());
+        assert_eq!(provider.windows[0].remaining_percent, Some(0.0));
+        let state = AgentMeterState {
+            version: STATE_VERSION,
+            generated_at: Utc::now(),
+            providers: vec![provider],
+        };
+        let output = JsonOutput::from_state(&state);
+        assert!(!output.providers[0].stale);
+        assert!(output.providers[0].available);
+        assert!(output.providers[0].reason.is_none());
+        assert_eq!(output.providers[0].windows[0].remaining_percent, Some(0.0));
+        assert_eq!(output.providers[0].windows[1].remaining_percent, Some(0.0));
+        let value = serde_json::to_value(&output).unwrap();
+        let muse = &value["providers"][0];
+        assert!(muse.get("reason").is_none());
+        assert_eq!(muse["windows"][0]["remaining_percent"], 0.0);
+        assert_eq!(muse["windows"][1]["remaining_percent"], 0.0);
+        assert_eq!(muse["stale"], false);
     }
 
     #[test]

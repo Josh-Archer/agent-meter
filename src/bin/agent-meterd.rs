@@ -164,6 +164,7 @@ fn default_sources() -> Vec<Source> {
             status: "stale".into(),
             detail: Some("Demo data: add sources.json to connect a local adapter.".into()),
             usage_url: Some("https://chatgpt.com/#settings/usage".into()),
+            reason: None,
             updated_at: None,
         },
     }]
@@ -179,7 +180,7 @@ fn window(
     UsageWindow {
         id: id.into(),
         label: label.into(),
-        remaining_percent: remaining,
+        remaining_percent: Some(remaining),
         resets_at: Some(reset),
         reset_label: Some(reset_label.into()),
     }
@@ -711,13 +712,14 @@ fn unavailable(id_hint: &str, detail: &str) -> ProviderState {
         windows: vec![UsageWindow {
             id: "availability".into(),
             label: "Availability".into(),
-            remaining_percent: 0.0,
+            remaining_percent: Some(0.0),
             resets_at: None,
             reset_label: Some("unavailable".into()),
         }],
         status: "unavailable".into(),
         detail: Some(detail.into()),
         usage_url: None,
+        reason: None,
         updated_at: None,
     }
 }
@@ -1122,13 +1124,14 @@ mod tests {
             windows: vec![UsageWindow {
                 id: "daily".into(),
                 label: "Daily".into(),
-                remaining_percent: 50.0,
+                remaining_percent: Some(50.0),
                 resets_at: None,
                 reset_label: None,
             }],
             status: "fresh".into(),
             detail: None,
             usage_url: None,
+            reason: None,
             updated_at: None,
         })
         .unwrap();
@@ -1215,13 +1218,14 @@ mod tests {
             windows: vec![UsageWindow {
                 id: "daily".into(),
                 label: "Daily".into(),
-                remaining_percent: 75.0,
+                remaining_percent: Some(75.0),
                 resets_at: None,
                 reset_label: None,
             }],
             status: "fresh".into(),
             detail: None,
             usage_url: None,
+            reason: None,
             updated_at: None,
         };
 
@@ -1266,7 +1270,7 @@ mod tests {
             .find(|p| p.id == "good-provider")
             .expect("good provider should be present");
         assert_eq!(good.status, "fresh");
-        assert_eq!(good.windows[0].remaining_percent, 75.0);
+        assert_eq!(good.windows[0].remaining_percent, Some(75.0));
 
         let bad = state
             .providers
@@ -1363,6 +1367,7 @@ mod tests {
                     status: "fresh".into(),
                     detail: None,
                     usage_url: None,
+                    reason: None,
                     updated_at: None,
                 },
                 ProviderState {
@@ -1372,13 +1377,14 @@ mod tests {
                     windows: vec![UsageWindow {
                         id: "win".into(),
                         label: "Win".into(),
-                        remaining_percent: 50.0,
+                        remaining_percent: Some(50.0),
                         resets_at: None,
                         reset_label: None,
                     }],
                     status: "fresh".into(),
                     detail: None,
                     usage_url: None,
+                    reason: None,
                     updated_at: None,
                 },
             ],
@@ -1400,13 +1406,14 @@ mod tests {
             windows: vec![UsageWindow {
                 id: "daily".into(),
                 label: "Daily".into(),
-                remaining_percent: percent,
+                remaining_percent: Some(percent),
                 resets_at: None,
                 reset_label: None,
             }],
             status: "fresh".into(),
             detail: None,
             usage_url: None,
+            reason: None,
             updated_at: None,
         }
     }
@@ -1540,7 +1547,7 @@ mod tests {
             .expect("last good codex snapshot");
         assert_eq!(codex.status, "stale");
         assert_eq!(codex.updated_at, Some(stamp));
-        assert_eq!(codex.windows[0].remaining_percent, 64.0);
+        assert_eq!(codex.windows[0].remaining_percent, Some(64.0));
         let detail = codex.detail.as_deref().unwrap_or_default();
         let stamp_text = stamp.to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
         assert!(
@@ -1615,12 +1622,12 @@ mod tests {
         let second = refresh_publishing(&failure, &mut last_good, |_| {});
         assert_eq!(second.providers[0].status, "stale");
         assert_eq!(second.providers[0].updated_at, Some(stamp));
-        assert_eq!(second.providers[0].windows[0].remaining_percent, 70.0);
+        assert_eq!(second.providers[0].windows[0].remaining_percent, Some(70.0));
 
         let third = refresh_publishing(&failure, &mut last_good, |_| {});
         assert_eq!(third.providers[0].status, "stale");
         assert_eq!(third.providers[0].updated_at, Some(stamp));
-        assert_eq!(third.providers[0].windows[0].remaining_percent, 70.0);
+        assert_eq!(third.providers[0].windows[0].remaining_percent, Some(70.0));
     }
 
     #[test]

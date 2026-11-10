@@ -115,11 +115,12 @@ breaking changes are made.
 | `schema_version` | `int` | Always `1` for this schema revision. |
 | `providers[].provider` | `string` | Lowercase provider identifier (e.g. `codex`, `grok`, `muse`). |
 | `providers[].windows[].name` | `string` | Stable window name: `five_hour`, `weekly`, `session`, `monthly`, etc. |
-| `providers[].windows[].remaining_percent` | `float` | Remaining quota from 0.0 to 100.0. |
+| `providers[].windows[].remaining_percent` | `float?` | Remaining quota from 0.0 to 100.0. Omitted when the probe could not run. Omission is not 0% remaining. |
 | `providers[].windows[].resets_at` | `string?` | ISO 8601 datetime with timezone offset. Absent when the provider does not report a trustworthy reset time. Copilot is excluded from the expectation that every window has this field: the Copilot SDK `account.getQuota` returns `resetDate` equal to the fetch time, so no trustworthy reset instant exists. |
 | `providers[].updated_at` | `string` | ISO 8601 timestamp of the last successful refresh. |
 | `providers[].available` | `bool` | `false` only when the provider status is `unavailable` or `error`. Fresh and stale providers are available. |
 | `providers[].stale` | `bool` | `true` only when the provider status is `stale`. Unavailable providers are not stale. |
+| `providers[].reason` | `string?` | Machine-readable cause when no quota sample exists, for example `cli_not_installed`. Absent for a normal reading, including a real 0% remaining. |
 | `providers[].windows[].forecast` | `object?` | Quota-exhaustion forecast (see below). Absent when forecasting is disabled or no history exists yet. |
 
 ## Quota forecasting
@@ -569,6 +570,12 @@ Remaining percentage is `100 - usedPercent`, clamped to 0 through 100
 (default 1800), counted from `observedAtMs`, is `stale`. A window whose reset
 time has already passed reports 100% remaining, omits `resets_at`, and marks
 the provider `stale`. Override the binary with `AGENT_METER_MUSE_BIN`.
+
+When that binary is missing or not executable, the probe cannot run. The
+adapter does not report `remaining_percent: 0` with `available: false` and
+`stale: false`. It reports a stale provider, omits `remaining_percent`, and
+sets `reason` to `cli_not_installed`. A real Muse payload with `usedPercent`
+of 100 still reports `remaining_percent` 0 and is not `cli_not_installed`.
 
 ## Validation included here
 

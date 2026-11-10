@@ -1916,6 +1916,45 @@ def _classify_probe_result(
     return live
 
 
+_MUSE_REASON_CLI_NOT_INSTALLED = "cli_not_installed"
+
+
+def _muse_cli_installed(command: str) -> bool:
+    """True when ``command`` is an executable the probe can start.
+
+    A missing or non-executable binary is not a quota reading. Callers must
+    not report that case as 0% remaining.
+    """
+    if os.path.sep in command:
+        return os.path.isfile(command) and os.access(command, os.X_OK)
+    return shutil.which(command) is not None
+
+
+def _muse_cli_not_installed() -> dict[str, Any]:
+    """Unknown usage because the probe cannot run.
+
+    ``remaining_percent`` is null, not 0. Status is ``stale`` so published
+    JSON sets ``stale: true`` and omits the percent. ``reason`` tells a
+    consumer this host has no Muse CLI, which is distinct from an exhausted
+    quota (``usedPercent`` of 100).
+    """
+    return {
+        "id": "muse",
+        "label": "Muse",
+        "icon": "generic",
+        "windows": [
+            {
+                "id": "availability",
+                "label": "Availability",
+                "remaining_percent": None,
+            }
+        ],
+        "status": "stale",
+        "detail": "muse is not installed; install Muse and sign in to see usage.",
+        "reason": _MUSE_REASON_CLI_NOT_INSTALLED,
+    }
+
+
 def muse(now: dt.datetime | None = None) -> dict[str, Any]:
     """Read Muse subscription usage over the MSP stdio protocol.
 
@@ -1925,8 +1964,14 @@ def muse(now: dt.datetime | None = None) -> dict[str, Any]:
     minimal turn in this same host only when the last probe attempt is older
     than the probe interval. The gate is that attempt time, including when
     ``muse-usage.json`` is missing, stale, or unusable.
+
+    When the ``muse`` binary is not installed, this returns a stale document
+    with no remaining percent and ``reason`` ``cli_not_installed``. It does
+    not start a probe and does not report 0% remaining.
     """
     command = os.environ.get("AGENT_METER_MUSE_BIN", "muse")
+    if not _muse_cli_installed(command):
+        return _muse_cli_not_installed()
     should_probe, throttle_state = _muse_probe_gate()
     timeout = _muse_probe_timeout_seconds() if should_probe else _muse_timeout_seconds()
     attempt = _ProbeAttempt()
@@ -1935,10 +1980,7 @@ def muse(now: dt.datetime | None = None) -> dict[str, Any]:
             command, timeout, probe=should_probe, attempt=attempt,
         )
     except FileNotFoundError:
-        return unavailable(
-            "muse", "Muse", "generic",
-            "muse is not installed; install Muse and sign in to see usage.",
-        )
+        return _muse_cli_not_installed()
     except TimeoutError as error:
         _finish_probe(attempt, "timeout", _MUSE_PROBE_DETAIL_TIMEOUT)
         return _muse_without_live_usage(
