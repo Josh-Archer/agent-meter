@@ -420,9 +420,26 @@ that every provider window carries an ISO 8601 `resets_at`.
 ### Antigravity
 
 Antigravity quota is read directly from the provider-owned command
-`agy -p /usage --output-format json`. It returns the real five-hour and weekly
-remaining fractions and reset times without reading OAuth storage. The
-**Connect** button launches `agy` so its browser sign-in can complete.
+`agy -p /usage --output-format json`. It queries the internal language server's
+`PredictionService.RetrieveUserQuotaSummary` RPC cache and returns the real
+five-hour and weekly remaining fractions and reset times without reading OAuth storage.
+The **Connect** button launches `agy` so its browser sign-in can complete.
+
+Antigravity exposes separate quota pools for distinct model families, reported
+as stable window identifiers:
+
+* **General Gemini models** (`gemini-models-weekly`, `gemini-models-5h`):
+  Covers Gemini Flash models (including **Gemini 3.8 Flash** High, Medium, and Low)
+  and Gemini Pro models.
+* **Claude and 3P models** (`claude-models-weekly`, `claude-models-5h`):
+  Covers Claude Opus 5.5, Claude Sonnet 5.5, and GPT-OSS via agy.
+* **Gemini 4 Argon** (`gemini-argon-weekly`, and `gemini-argon-5h` if present):
+  A separate dedicated quota pool available on Google AI Pro and Ultra plans.
+
+If a pool cannot be read, is disabled, or is not provisioned for the current
+account tier, it is omitted rather than fabricated. Windows preserve provider-reported
+`remaining_percent` and `resets_at` timestamps. Optional filtering to a single
+group is available by setting `AGENT_METER_AGY_GROUP`.
 
 ### Grok
 

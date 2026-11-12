@@ -1,0 +1,67 @@
+{
+  "command": {
+    "name": "usage",
+    "data": {
+      "description": "Within each group, models share a weekly limit and a 5-hour limit. Quota is consumed proportionally to the cost of the tokens. Thus, limits will last longer with shorter tasks or using more cost-effective models. The 5-hour limit smooths out aggregate demand to fairly distribute global capacity across all users, while your weekly limit is tied directly to your individual tier.",
+      "groups": [
+        {
+          "name": "Gemini Models",
+          "description": "Models within this group: Gemini Flash, Gemini Pro",
+          "buckets": [
+            {
+              "id": "gemini-weekly",
+              "name": "Weekly Limit Remaining",
+              "description": "You have used some of your weekly limit, it will fully refresh in 1 day, 21 hours.",
+              "window": "weekly",
+              "remaining_fraction": 0.6204319596290588,
+              "reset_time": "2026-11-14T00:31:56Z"
+            },
+            {
+              "id": "gemini-5h",
+              "name": "Five Hour Limit Remaining",
+              "description": "You have used some of your 5-hour limit, it will fully refresh in 4 hours, 59 minutes.",
+              "window": "5h",
+              "remaining_fraction": 0.9956050515174866,
+              "reset_time": "2026-11-12T07:43:40Z"
+            }
+          ]
+        },
+        {
+          "name": "Claude and GPT models",
+          "description": "Models within this group: Claude Opus, Claude Sonnet, GPT-OSS",
+          "buckets": [
+            {
+              "id": "3p-weekly",
+              "name": "Weekly Limit Remaining",
+              "description": "You have used some of your weekly limit, it will fully refresh in 6 days, 10 hours.",
+              "window": "weekly",
+              "remaining_fraction": 0.4977903962135315,
+              "reset_time": "2026-11-18T13:34:54Z"
+            },
+            {
+              "id": "3p-5h",
+              "name": "Five Hour Limit Remaining",
+              "window": "5h",
+              "remaining_fraction": 1.0,
+              "reset_time": "2026-11-12T07:44:39Z"
+            }
+          ]
+        },
+        {
+          "name": "Gemini 4 Argon",
+          "description": "For paid Pro plans, Argon quota is separate. Higher Argon quota (included as part of the larger Gemini quota bucket) is available on Ultra plans.",
+          "buckets": [
+            {
+              "id": "gemini-argon-wtu-weekly",
+              "name": "Gemini 4 Argon Weekly Limit",
+              "description": "You have used some of your weekly limit, it will fully refresh in 2 days, 12 hours.",
+              "window": "weekly",
+              "remaining_fraction": 0.3027222752571106,
+              "reset_time": "2026-11-14T15:06:32Z"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}
