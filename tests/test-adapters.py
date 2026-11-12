@@ -509,7 +509,7 @@ def test_agy_provider_usage_command() -> None:
     assert state["detail"] == "Antigravity CLI /usage quota"
 
 
-def test_agy_multi_group_defaults_to_gemini() -> None:
+def test_agy_multi_group_reports_all_pools() -> None:
     payload = {
         "command": {
             "name": "usage",
@@ -537,14 +537,56 @@ def test_agy_multi_group_defaults_to_gemini() -> None:
             }
         }
     }
-    with patched_env({"AGENT_METER_AGY_SETTINGS": "/nonexistent/settings.json"}):
-        state = adapter.normalize_agy(payload)
-    assert len(state["windows"]) == 2
-    assert [w["remaining_percent"] for w in state["windows"]] == [90.0, 60.0]
-    assert all("Gemini" in w["label"] for w in state["windows"])
+    state = adapter.normalize_agy(payload)
+    assert len(state["windows"]) == 3
+    assert state["windows"][0]["id"] == "gemini-models-5h"
+    assert state["windows"][0]["remaining_percent"] == 90.0
+    assert state["windows"][1]["id"] == "gemini-models-weekly"
+    assert state["windows"][1]["remaining_percent"] == 60.0
+    assert state["windows"][2]["id"] == "claude-models-weekly"
+    assert state["windows"][2]["remaining_percent"] == 0.0
 
 
-def test_agy_multi_group_settings_model_selection() -> None:
+def test_agy_fixture_all_pools() -> None:
+    fixture_path = os.path.join(os.path.dirname(__file__), "fixtures", "agy-usage-pools.json")
+    with open(fixture_path, encoding="utf-8") as f:
+        payload = json.load(f)
+    state = adapter.normalize_agy(payload)
+    assert state["id"] == "antigravity"
+    assert state["status"] == "fresh"
+    assert len(state["windows"]) == 5
+
+    window_by_id = {w["id"]: w for w in state["windows"]}
+    assert set(window_by_id.keys()) == {
+        "gemini-models-weekly",
+        "gemini-models-5h",
+        "claude-models-weekly",
+        "claude-models-5h",
+        "gemini-argon-weekly",
+    }
+
+    gemini_weekly = window_by_id["gemini-models-weekly"]
+    assert round(gemini_weekly["remaining_percent"], 1) == 62.0
+    assert gemini_weekly["resets_at"] == "2026-11-14T00:31:56Z"
+
+    gemini_5h = window_by_id["gemini-models-5h"]
+    assert round(gemini_5h["remaining_percent"], 1) == 99.6
+    assert gemini_5h["resets_at"] == "2026-11-12T07:43:40Z"
+
+    claude_weekly = window_by_id["claude-models-weekly"]
+    assert round(claude_weekly["remaining_percent"], 1) == 49.8
+    assert claude_weekly["resets_at"] == "2026-11-18T13:34:54Z"
+
+    claude_5h = window_by_id["claude-models-5h"]
+    assert claude_5h["remaining_percent"] == 100.0
+    assert claude_5h["resets_at"] == "2026-11-12T07:44:39Z"
+
+    argon_weekly = window_by_id["gemini-argon-weekly"]
+    assert round(argon_weekly["remaining_percent"], 1) == 30.3
+    assert argon_weekly["resets_at"] == "2026-11-14T15:06:32Z"
+
+
+def test_agy_unreadable_pool_omitted_never_fabricated() -> None:
     payload = {
         "command": {
             "name": "usage",
@@ -552,35 +594,30 @@ def test_agy_multi_group_settings_model_selection() -> None:
                 "groups": [
                     {
                         "name": "Gemini Models",
-                        "description": "Models within this group: Gemini Flash, Gemini Pro",
                         "buckets": [
-                            {"name": "Weekly Limit Remaining", "window": "weekly", "remaining_fraction": 0.60,
-                             "reset_time": "2026-09-04T00:50:56Z"},
+                            {"window": "weekly", "remaining_fraction": 0.50, "reset_time": "2026-09-04T00:50:56Z"},
                         ],
                     },
                     {
                         "name": "Claude and GPT models",
-                        "description": "Models within this group: Claude Opus, Claude Sonnet, GPT-OSS",
                         "buckets": [
-                            {"name": "Weekly Limit Remaining", "window": "weekly", "remaining_fraction": 0.25,
-                             "reset_time": "2026-09-04T00:50:56Z"},
+                            {"window": "weekly", "remaining_fraction": None},  # unreadable
+                            {"window": "5h", "remaining_fraction": 0.80, "disabled": True},  # disabled
                         ],
+                    },
+                    {
+                        "name": "Gemini 4 Argon",
+                        "buckets": [],  # no buckets
                     },
                 ]
             }
         }
     }
-    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-        json.dump({"model": "claude-opus-4-6-thinking"}, f)
-        settings_path = f.name
-    try:
-        with patched_env({"AGENT_METER_AGY_SETTINGS": settings_path}):
-            state = adapter.normalize_agy(payload)
-        assert len(state["windows"]) == 1
-        assert state["windows"][0]["remaining_percent"] == 25.0
-        assert "Claude" in state["windows"][0]["label"]
-    finally:
-        os.unlink(settings_path)
+    state = adapter.normalize_agy(payload)
+    # Only Gemini weekly should be present; unreadable/disabled/empty pools must be omitted and never 100%.
+    assert len(state["windows"]) == 1
+    assert state["windows"][0]["id"] == "gemini-models-weekly"
+    assert state["windows"][0]["remaining_percent"] == 50.0
 
 
 def test_agy_multi_group_env_override() -> None:
@@ -611,6 +648,7 @@ def test_agy_multi_group_env_override() -> None:
         state = adapter.normalize_agy(payload)
     assert len(state["windows"]) == 1
     assert state["windows"][0]["remaining_percent"] == 25.0
+    assert state["windows"][0]["id"] == "claude-models-weekly"
 
 
 # ---------------------------------------------------------------------------
@@ -2335,8 +2373,9 @@ if __name__ == "__main__":
     test_agy()
     test_agy_disabled_bucket_skipped()
     test_agy_provider_usage_command()
-    test_agy_multi_group_defaults_to_gemini()
-    test_agy_multi_group_settings_model_selection()
+    test_agy_multi_group_reports_all_pools()
+    test_agy_fixture_all_pools()
+    test_agy_unreadable_pool_omitted_never_fabricated()
     test_agy_multi_group_env_override()
     test_claude_normalize()
     test_claude_normalize_only_one_window()

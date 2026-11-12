@@ -210,17 +210,70 @@ def codex(timeout: float | None = None) -> dict[str, Any]:
             child.wait()
 
 
+# ---------------------------------------------------------------------------
+# Antigravity (agy) Quota Source Architecture:
+#
+# Antigravity retrieves quota from Google's Cloud Code Prediction Service RPC:
+#   PredictionService.RetrieveUserQuotaSummary
+#   (https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary)
+#
+# Key source findings:
+# 1. ~/.gemini/antigravity* storage: Holds SQLite conversation metadata, keyring
+#    tokens, and settings; it does not persist offline per-pool quota balances.
+# 2. Agent Client Protocol (ACP): ACP handles interactive agent sessions and
+#    tool execution (google3/third_party/jetski/cli/acp), but delegates quota
+#    inspection to the language server.
+# 3. CLI collector: Because the agy CLI does not expose an offline `usage`
+#    subcommand, the adapter executes `agy -p /usage --output-format json`,
+#    which triggers the /usage slash command that queries the language server's
+#    cached RetrieveUserQuotaSummary response.
+#
+# Quota pools returned by agy:
+# - "Gemini Models": General Gemini pool covering Gemini Flash (e.g. Gemini 3.8
+#   Flash High/Medium/Low) and Gemini Pro. Windows: `gemini-models-weekly`,
+#   `gemini-models-5h`.
+# - "Claude and GPT models": 3P pool covering Claude Opus 5.5, Claude Sonnet 5.5,
+#   and GPT-OSS. Windows: `claude-models-weekly`, `claude-models-5h`.
+# - "Gemini 4 Argon": Dedicated Argon quota pool on Google AI Pro / Ultra plans.
+#   Windows: `gemini-argon-weekly` (plus a 5-hour window if present).
+# ---------------------------------------------------------------------------
+
+
+def _agy_pool_prefix(group: str) -> str:
+    lower = group.lower()
+    if "argon" in lower:
+        return "gemini-argon"
+    if "claude" in lower:
+        return "claude-models"
+    if "gemini" in lower:
+        return "gemini-models"
+    return lower.replace(" ", "-")
+
+
+def _agy_window_suffix(bucket: dict[str, Any]) -> str:
+    raw = bucket.get("window") or bucket.get("display_name") or bucket.get("name") or "quota"
+    s = str(raw).strip().lower()
+    if "5h" in s or "five-hour" in s or "five hour" in s or "5-hour" in s or "5 hour" in s:
+        return "5h"
+    if "weekly" in s or "week" in s:
+        return "weekly"
+    return s.replace(" ", "-")
+
+
 def agy_window(group: str, bucket: dict[str, Any]) -> dict[str, Any] | None:
     remaining = bucket.get("remaining_pct")
     if remaining is None and isinstance(bucket.get("remaining_fraction"), (int, float)):
         remaining = float(bucket["remaining_fraction"]) * 100.0
     if not isinstance(remaining, (int, float)):
         return None
-    window_name = str(bucket.get("window") or bucket.get("display_name") or "Quota")
+    raw_window = bucket.get("window") or bucket.get("display_name") or bucket.get("name") or "Quota"
+    window_suffix = _agy_window_suffix(bucket)
+    window_display = bucket.get("window") or ("5h" if window_suffix == "5h" else "weekly" if window_suffix == "weekly" else str(raw_window))
+    prefix = _agy_pool_prefix(group)
     reset_at, label = reset_label(bucket.get("reset_time"))
     result: dict[str, Any] = {
-        "id": f"{group.lower().replace(' ', '-')}-{window_name.lower().replace(' ', '-')}",
-        "label": f"{window_name} · {group}",
+        "id": f"{prefix}-{window_suffix}",
+        "label": f"{window_display} · {group}",
         "remaining_percent": max(0.0, min(100.0, float(remaining))),
     }
     if reset_at:
@@ -231,48 +284,16 @@ def agy_window(group: str, bucket: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _agy_target_group(groups: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """When Antigravity reports multiple distinct model families (e.g. Gemini Models
-    vs Claude and GPT models), select the group that matches the user's active
-    model so an exhausted secondary pool does not force the provider
-    percentage to 0%.
-    """
+    """Retained for backward compatibility when AGENT_METER_AGY_GROUP is used."""
     if len(groups) <= 1:
         return groups[0] if groups else None
 
-    # Explicit environment variable override
     override = os.environ.get("AGENT_METER_AGY_GROUP")
     if override:
         for group in groups:
             name = str(group.get("name") or group.get("display_name") or "")
             if override.lower() in name.lower():
                 return group
-
-    # Read Antigravity CLI settings for configured model
-    settings_path = os.environ.get(
-        "AGENT_METER_AGY_SETTINGS",
-        os.path.expanduser("~/.gemini/antigravity-cli/settings.json"),
-    )
-    configured_model = ""
-    try:
-        with open(settings_path, encoding="utf-8") as f:
-            data = json.load(f)
-            configured_model = str(data.get("model", "")).lower()
-    except (OSError, json.JSONDecodeError):
-        pass
-
-    if configured_model:
-        for group in groups:
-            name = str(group.get("name") or group.get("display_name") or "").lower()
-            desc = str(group.get("description", "")).lower()
-            tokens = [t for t in configured_model.replace("-", " ").split() if len(t) > 2]
-            if any(t in name or t in desc for t in tokens):
-                return group
-
-    # Default to Gemini Models if present, otherwise first group
-    for group in groups:
-        name = str(group.get("name") or group.get("display_name") or "")
-        if "gemini" in name.lower():
-            return group
 
     return groups[0]
 
@@ -286,8 +307,18 @@ def normalize_agy(result: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(summary, dict):
         raise ValueError(result.get("quota_summary_error") or "agy-usage returned no quota summary")
     raw_groups = [g for g in summary.get("groups", []) if isinstance(g, dict)]
-    target = _agy_target_group(raw_groups)
-    groups = [target] if target else raw_groups
+
+    override = os.environ.get("AGENT_METER_AGY_GROUP")
+    if override:
+        matched = [
+            g for g in raw_groups
+            if override.lower() in str(g.get("name") or g.get("display_name") or "").lower()
+        ]
+        groups = matched if matched else raw_groups
+    else:
+        # Report all pools by default: Gemini Models, Claude models, and Gemini 4 Argon.
+        groups = raw_groups
+
     windows: list[dict[str, Any]] = []
     for group in groups:
         if not isinstance(group, dict):
