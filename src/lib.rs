@@ -7,6 +7,7 @@
 //! or raw provider responses.
 
 pub mod forecast;
+pub mod usage;
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
