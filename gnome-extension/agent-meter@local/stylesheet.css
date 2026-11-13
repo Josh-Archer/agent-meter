@@ -112,6 +112,12 @@
   text-align: right;
 }
 
+.agent-meter-usage-today {
+  font-size: 13px;
+  color: #c5cad3;
+  margin-bottom: 2px;
+}
+
 .agent-meter-desktop-card {
   spacing: 8px;
   padding: 12px 14px;

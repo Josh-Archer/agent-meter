@@ -1,0 +1,206 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Josh-Archer/agent-meter/blob/main/data/usage-event.v1.json",
+  "title": "agent-meter usage event v1",
+  "description": "One cumulative session snapshot pushed by a coding-harness reporter. Counts are running totals for the session, not deltas. An unknown count is null, never 0. input_tokens excludes cache read and cache write; each harness normalizes that before sending. The document must not carry prompts, messages, tool input or output, diffs, or file paths inside a repo. agent-meterd rejects unknown keys. This file is the contract for agent-setup#140 and #141-#143.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "idempotency_key",
+    "kind",
+    "host",
+    "harness",
+    "harness_version",
+    "session_id",
+    "seq",
+    "observed_at",
+    "started_at",
+    "ended_at",
+    "duration_ms",
+    "models",
+    "source",
+    "dispatch_run_id",
+    "repo"
+  ],
+  "properties": {
+    "schema": {
+      "const": "agent-meter.usage-event/v1"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Lowercase hex SHA-256 of the UTF-8 string host|harness|session_id|seq. seq is decimal with no leading zeros (seq 0 is \"0\"). host, harness, and session_id contain no '|' character."
+    },
+    "kind": {
+      "const": "session_snapshot"
+    },
+    "host": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._-]+$",
+      "description": "Reporter host id. For HTTP ingest this must equal the host id of the bearer token."
+    },
+    "harness": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9._-]*$",
+      "description": "Stable lowercase harness id: claude, codex, agy, grok, muse, omp, copilot, cursor, gemini."
+    },
+    "harness_version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9._+-]+$",
+      "description": "CLI version that produced the snapshot. Send \"unknown\" when the reporter cannot read it. Do not omit the field."
+    },
+    "session_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "pattern": "^[A-Za-z0-9._:@+-]+$",
+      "description": "Stable session id from the harness. Not a filesystem path."
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Monotonic snapshot counter for this session. The store keeps the highest seq. Bump seq whenever the cumulative totals change. Repeated Stop hooks with the same seq are duplicates."
+    },
+    "observed_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC3339 timestamp with a numeric offset when the reporter observed the snapshot."
+    },
+    "started_at": {
+      "type": ["string", "null"],
+      "format": "date-time"
+    },
+    "ended_at": {
+      "type": ["string", "null"],
+      "format": "date-time"
+    },
+    "duration_ms": {
+      "type": ["integer", "null"],
+      "minimum": 0
+    },
+    "models": {
+      "type": "array",
+      "maxItems": 64,
+      "description": "Full set of models for this session so far. Replaces the previous snapshot; it is not a delta.",
+      "items": { "$ref": "#/$defs/model" }
+    },
+    "source": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Short origin tag such as hook:Stop+transcript. Not a transcript, prompt, or path."
+    },
+    "dispatch_run_id": {
+      "type": ["string", "null"],
+      "maxLength": 128,
+      "description": "Optional dispatch-launch run id for a later join. Null when the session was not launched by dispatch."
+    },
+    "repo": {
+      "type": ["string", "null"],
+      "description": "Repository slug owner/name, or null. Not a filesystem path and not a file inside the repo."
+    }
+  },
+  "$defs": {
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "model",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "reasoning_tokens",
+        "requests",
+        "cost_usd",
+        "cost_source"
+      ],
+      "properties": {
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Model id as reported by the harness, for example claude-opus-5-5."
+        },
+        "input_tokens": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Input tokens excluding cache read and cache write. Null when the harness did not report this count. Never coerce unknown to 0."
+        },
+        "output_tokens": { "type": ["integer", "null"], "minimum": 0 },
+        "cache_read_tokens": { "type": ["integer", "null"], "minimum": 0 },
+        "cache_write_tokens": { "type": ["integer", "null"], "minimum": 0 },
+        "reasoning_tokens": { "type": ["integer", "null"], "minimum": 0 },
+        "requests": { "type": ["integer", "null"], "minimum": 0 },
+        "cost_usd": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "description": "USD cost for this model in the session so far. Null when the harness has no cost figure."
+        },
+        "cost_source": {
+          "enum": ["harness", "estimated", "none"],
+          "description": "harness: the CLI reported the cost. estimated: the reporter priced tokens. none: cost_usd is null."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "cost_usd": { "type": "null" } },
+            "required": ["cost_usd"]
+          },
+          "then": {
+            "properties": { "cost_source": { "const": "none" } }
+          }
+        },
+        {
+          "if": {
+            "properties": { "cost_usd": { "type": "number" } },
+            "required": ["cost_usd"]
+          },
+          "then": {
+            "properties": { "cost_source": { "enum": ["harness", "estimated"] } }
+          }
+        }
+      ]
+    }
+  },
+  "examples": [
+    {
+      "schema": "agent-meter.usage-event/v1",
+      "idempotency_key": "613f7836ad7edd362b9853998dfda601c875355a2cfb180fcbc1ca2258634204",
+      "kind": "session_snapshot",
+      "host": "homelabdesktop",
+      "harness": "claude",
+      "harness_version": "2.1.321",
+      "session_id": "uuid-or-native-id",
+      "seq": 7,
+      "observed_at": "2026-11-11T21:41:00-05:00",
+      "started_at": "2026-11-11T21:40:15-05:00",
+      "ended_at": null,
+      "duration_ms": 45000,
+      "models": [
+        {
+          "model": "claude-opus-5-5",
+          "input_tokens": 1200,
+          "output_tokens": 340,
+          "cache_read_tokens": 80,
+          "cache_write_tokens": 0,
+          "reasoning_tokens": null,
+          "requests": 2,
+          "cost_usd": null,
+          "cost_source": "none"
+        }
+      ],
+      "source": "hook:Stop+transcript",
+      "dispatch_run_id": null,
+      "repo": null
+    }
+  ]
+}

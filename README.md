@@ -41,8 +41,10 @@ The daemon binary is `agent-meterd`. The systemd user unit that runs it is
 `agent-meterd` only accepts a normalized, credential-free `ProviderState`
 document from a fixed executable or local file. It never invokes a shell,
 persists provider tokens, stores raw provider responses, or sends data off the
-machine. The state file is atomically replaced, so the widget never reads a
-partial result.
+machine. Usage events are a separate local document and do not change
+`state.json`. The optional ingest listener is off unless `--listen` is set,
+and it does not dial out. The state file is atomically replaced, so the widget
+never reads a partial result.
 
 On GNOME Wayland there is no supported third-party window role that stays
 behind every app window. The extension therefore owns the actual desktop card:
@@ -188,6 +190,226 @@ Notifications fire once per threshold per quota cycle (duplicate suppression):
 when remaining drops at or below a threshold, the daemon appends a JSON line
 to `notifications.jsonl` and logs a one-line summary to stderr. A quota reset
 clears the suppression records so the next cycle notifies again.
+
+## Usage events
+
+Quota percentages and token usage are different documents. `state.json` stays
+schema version 1. Session tokens, cache, cost, and duration live in the usage
+store under `$XDG_STATE_HOME/agent-meter/` (usually
+`~/.local/state/agent-meter/`).
+
+This is the contract for the shared reporter and the per-harness hooks
+(Josh-Archer/agent-setup#140 and #141–#143). Those reporters are not part of
+this repository. They should send only the fields below.
+
+### Privacy
+
+The validator rejects unknown keys, including nested ones. Do not send a
+prompt, message, tool input or output, diff, transcript, or a file path
+inside a repo. `repo` is an `owner/name` slug or null. `source` is a short
+tag such as `hook:Stop+transcript`, not the transcript itself. The store
+keeps the normalized event and nothing else: no raw provider payloads and no
+bearer tokens.
+
+### Event schema v1
+
+The normative JSON Schema is
+[data/usage-event.v1.json](data/usage-event.v1.json). `schema` is
+`agent-meter.usage-event/v1`. Every field is required. Use `null` when a
+count or timestamp is unknown. Unknown is not `0`. `0` means the harness
+reported zero.
+
+`input_tokens` excludes cache read and cache write. Codex, Cursor, and
+Copilot count cache inside input; Claude does not. Normalize on the reporter
+side before sending.
+
+Counts are cumulative totals for the session, not deltas. Each new snapshot
+uses the next `seq`. The store keeps the highest `seq` for
+`(host, harness, session_id)`, so a repeated Stop hook does not double count.
+
+`idempotency_key` is the lowercase hex SHA-256 of the UTF-8 string
+
+```text
+host|harness|session_id|seq
+```
+
+`seq` is decimal with no leading zeros (`0` stays `0`). `host`, `harness`,
+and `session_id` do not contain `|`.
+
+```json
+{
+  "schema": "agent-meter.usage-event/v1",
+  "idempotency_key": "613f7836ad7edd362b9853998dfda601c875355a2cfb180fcbc1ca2258634204",
+  "kind": "session_snapshot",
+  "host": "homelabdesktop",
+  "harness": "claude",
+  "harness_version": "2.1.321",
+  "session_id": "uuid-or-native-id",
+  "seq": 7,
+  "observed_at": "2026-11-11T21:41:00-05:00",
+  "started_at": "2026-11-11T21:40:15-05:00",
+  "ended_at": null,
+  "duration_ms": 45000,
+  "models": [
+    {
+      "model": "claude-opus-5-5",
+      "input_tokens": 1200,
+      "output_tokens": 340,
+      "cache_read_tokens": 80,
+      "cache_write_tokens": 0,
+      "reasoning_tokens": null,
+      "requests": 2,
+      "cost_usd": null,
+      "cost_source": "none"
+    }
+  ],
+  "source": "hook:Stop+transcript",
+  "dispatch_run_id": null,
+  "repo": null
+}
+```
+
+| Field | Rule |
+| --- | --- |
+| `kind` | `session_snapshot` only in v1. |
+| `host` | 1–128 of `A-Za-z0-9._-`. HTTP auth requires this to match the token's host id. |
+| `harness` | Lowercase id: `claude`, `codex`, `agy`, `grok`, `muse`, `omp`, `copilot`, `cursor`, `gemini`. |
+| `harness_version` | CLI version, or `unknown`. Do not omit it. |
+| `session_id` | Stable harness session id. Not a filesystem path. |
+| `seq` | Integer ≥ 0. Bump it when the cumulative totals change. |
+| `observed_at` | RFC3339 with a numeric offset. |
+| `started_at`, `ended_at`, `duration_ms` | RFC3339 or integer milliseconds, or `null`. |
+| `models` | The full model list for the session so far, at most 64 rows, one row per model id. |
+| `models[].input_tokens` and the other counts | Integer ≥ 0, or `null`. `input_tokens` excludes both cache fields. |
+| `cost_usd` | Non-negative USD, or `null`. |
+| `cost_source` | `harness` or `estimated` when `cost_usd` is a number. `none` when `cost_usd` is `null`. |
+| `dispatch_run_id` | Dispatch run id, or `null`. Not a path. |
+| `repo` | `owner/name` or a single segment, or `null`. |
+
+A body may be one event or `{"events":[...]}` with at most 100 events. The
+whole body must be at most 256 KiB. One invalid event rejects the whole body
+and stores nothing.
+
+### Transports
+
+Both transports use the same validator and store. The listener is off by
+default. Inbox drain does not require it.
+
+**Local spool.** The reporter atomically renames a `*.json` file into
+`$XDG_STATE_HOME/agent-meter/inbox/` (write a temporary file in the same
+directory, then rename it). `agent-meterd` drains that directory on every
+refresh and, when inotify is available, as soon as a file is renamed or
+closed. Valid files move to `processed/`. Invalid files move to `rejected/`
+with a sibling `.reason` file. Dotfiles and names that do not end in `.json`
+are left alone. Each directory keeps at most 1024 archived files.
+
+**Optional HTTP.** Remote hosts (for example mac-worker to homelabdesktop)
+use `agent-meterd --watch --listen <tailnet-ip>:<port>`. The address must be
+a literal IP. `0.0.0.0` and `::` are refused unless `--listen-any` is also
+passed. The process refuses to listen when the token file is missing.
+
+| Request | Result |
+| --- | --- |
+| `POST /v1/usage/events` | `202 {"accepted":n,"duplicates":m}` when the body is valid. `400 {"error":...}` on a schema or size error. `401 {"error":"unauthorized"}` on a bad or mismatched token. |
+| `GET /v1/usage/healthz` | `200 {"ok":true}` with no auth, for reporter backoff. |
+
+`Content-Length` is required on `POST`. Chunked bodies are not accepted.
+
+### Auth
+
+`Authorization: Bearer <token>`. The daemon reads
+`$XDG_CONFIG_HOME/agent-meter/ingest-tokens.json` (usually
+`~/.config/agent-meter/ingest-tokens.json`). The file maps `host` to the
+lowercase hex SHA-256 of the token. It must not contain the token.
+
+```json
+{
+  "schema": "agent-meter.ingest-tokens/v1",
+  "hosts": {
+    "homelabdesktop": "<64 lowercase hex chars>"
+  }
+}
+```
+
+Compute a hash with `printf '%s' "$TOKEN" | sha256sum`. Tokens live in
+Vaultwarden, one item per host, and are provisioned by agent-setup. Every
+event in the request must use the host id that matches that hash. A token for
+host A presented with host B is `401`. No token value belongs in git, issues,
+or this file. Mode `0600` is appropriate. `--ingest-tokens` overrides the path.
+
+### Storage and reads
+
+Accepted events append to `usage-events.jsonl`. A rollup index,
+`usage-index.json`, keeps the latest snapshot per session. Readers use the
+index, so a superseded `seq` is not added again. The log is compacted back to
+those snapshots once it passes 8192 lines. The index keeps at most 2048
+sessions and drops anything older than 30 days. That is the same kind of cap
+as quota forecast history.
+
+```bash
+agent-meter usage --json
+agent-meter usage --json --since 24h
+agent-meter usage --json --since 24h --by harness
+agent-meter usage --json --by model
+agent-meter usage --json --by host
+```
+
+`--since` takes `30s`, `15m`, `24h`, `7d`, `2w`, or an RFC3339 timestamp.
+Without it, the command returns every snapshot still inside the retention
+window. The output schema is `agent-meter.usage-report/v1`:
+
+```json
+{
+  "schema": "agent-meter.usage-report/v1",
+  "generated_at": "2026-11-12T16:00:00Z",
+  "since": "2026-11-11T16:00:00Z",
+  "group_by": "harness",
+  "sessions": 1,
+  "totals": {
+    "input_tokens": 1200,
+    "output_tokens": 340,
+    "cache_read_tokens": 80,
+    "cache_write_tokens": 0,
+    "reasoning_tokens": null,
+    "requests": 2,
+    "cost_usd": null,
+    "duration_ms": 45000
+  },
+  "groups": [
+    {
+      "key": "claude",
+      "sessions": 1,
+      "totals": { "input_tokens": 1200, "output_tokens": 340 }
+    }
+  ]
+}
+```
+
+`totals` sums the latest snapshot of each session. A null count is skipped,
+not treated as zero. If every value for a field is null, the total is null.
+If some are null and some are numbers, the total is the sum of the numbers
+and the field name is listed in `incomplete`. Summing `groups` by harness or
+host matches `totals`. A session with two models appears in two model groups;
+`totals.sessions` still counts that session once. Model groups omit
+`duration_ms`, because duration belongs to the session, not to a model.
+
+On each refresh the daemon also writes `usage-today.json` (schema
+`agent-meter.usage-today/v1`) next to the usage store and under
+`$XDG_RUNTIME_DIR/agent-meter/`. The desktop card shows its `label` only when
+`day` is today in the local timezone, for example
+`Today: 1,200 in · 340 out · 1 session`. No file, an empty label, or a
+previous day leaves the card unchanged.
+
+### What reporters must do
+
+- Send `session_snapshot` v1 with cumulative totals and a `seq` that increases when those totals change.
+- Set `idempotency_key` to `sha256(host|harness|session_id|seq)` as specified above.
+- Use `null` for counts the harness did not report. Do not invent `0`.
+- Subtract cache read and cache write from input when the harness includes them in input.
+- Set `cost_source` to `none` unless the harness or an estimator produced `cost_usd`.
+- Put files in the inbox with an atomic rename, or `POST` one event or a batch to `/v1/usage/events`.
+- On HTTP, send the bearer token for that host and set `host` to the same id. Use `GET /v1/usage/healthz` to decide when to back off.
+- Keep the failure local. A rejected event must not block the harness.
 
 To change the shortcut after package installation:
 

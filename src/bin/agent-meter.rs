@@ -1,4 +1,6 @@
+use agent_meter::usage::{self, GroupBy, UsagePaths, UsageReport};
 use agent_meter::{read_state, runtime_state_path, stable_state_path, AgentMeterState, JsonOutput};
+use chrono::Utc;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -75,8 +77,22 @@ fn load_json_output_at(
 }
 
 fn main() {
-    // Handle --json before initializing GTK.
+    // `usage` is a separate document from quota state. Handle it before the
+    // quota --json path and before GTK, including `agent-meter usage --json`.
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("usage") {
+        match usage_main(&args[2..]) {
+            Ok(report) => {
+                println!("{}", serde_json::to_string_pretty(&report).unwrap());
+            }
+            Err(err) => {
+                eprintln!("agent-meter: {err}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     if args.iter().any(|a| a == "--json") {
         let custom_state = args
             .windows(2)
@@ -96,7 +112,9 @@ fn main() {
     }
 
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("Usage: agent-meter [OPTIONS]\n\nOptions:\n  --json          Output provider state as JSON to stdout\n  --state <PATH>  Read state from custom path\n  -h, --help      Print help");
+        println!(
+            "Usage: agent-meter [OPTIONS]\n       agent-meter usage --json [--since 24h] [--by harness|model|host]\n\nOptions:\n  --json          Output provider state as JSON to stdout\n  --state <PATH>  Read quota state from a custom path\n  -h, --help      Print help\n\nUsage events are not part of state.json. `agent-meter usage --json` reads the\nlocal usage store. --since accepts 24h, 7d, 30m, or an RFC3339 timestamp.\n--usage-dir overrides $XDG_STATE_HOME/agent-meter."
+        );
         return;
     }
 
@@ -215,6 +233,15 @@ mod gui {
         while let Some(child) = content.first_child() {
             content.remove(&child);
         }
+        if let Some(today) = agent_meter::usage::current_today_label() {
+            content.append(
+                &gtk::Label::builder()
+                    .label(&today)
+                    .xalign(0.0)
+                    .css_classes(["detail"])
+                    .build(),
+            );
+        }
         match state {
             Ok(state) => {
                 for provider in &state.providers {
@@ -290,6 +317,64 @@ mod gui {
         app.run();
     }
 } // mod gui
+
+fn usage_main(args: &[String]) -> Result<UsageReport, String> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        println!(
+            "Usage: agent-meter usage --json [--since 24h] [--by harness|model|host] [--usage-dir PATH]\n\nReads cumulative session snapshots from the local usage store.\n--json is accepted and is the only output format.\n--since is a duration (30s, 15m, 24h, 7d, 2w) or an RFC3339 timestamp.\n--by groups totals by harness, model, or host."
+        );
+        std::process::exit(0);
+    }
+    let mut since_spec = None;
+    let mut by_spec = None;
+    let mut usage_dir = None;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--json" {
+            index += 1;
+            continue;
+        }
+        let (flag, inline) = arg
+            .split_once('=')
+            .map(|(flag, value)| (flag, Some(value.to_owned())))
+            .unwrap_or((arg.as_str(), None));
+        let value = match flag {
+            "--since" | "--by" | "--usage-dir" => {
+                if let Some(value) = inline {
+                    value
+                } else {
+                    index += 1;
+                    args.get(index)
+                        .cloned()
+                        .ok_or_else(|| format!("{flag} needs a value"))?
+                }
+            }
+            other => return Err(format!("unknown argument {other}")),
+        };
+        match flag {
+            "--since" => since_spec = Some(value),
+            "--by" => by_spec = Some(value),
+            "--usage-dir" => usage_dir = Some(PathBuf::from(value)),
+            _ => unreachable!(),
+        }
+        index += 1;
+    }
+    let paths = match usage_dir {
+        Some(dir) => UsagePaths::from_root(dir),
+        None => UsagePaths::from_env(),
+    };
+    let store = usage::UsageStore::open(paths).map_err(|err| err.to_string())?;
+    let since = match since_spec {
+        Some(spec) => Some(usage::parse_since(&spec, Utc::now()).map_err(|err| err)?),
+        None => None,
+    };
+    let group_by = match by_spec {
+        Some(spec) => Some(GroupBy::parse(&spec)?),
+        None => None,
+    };
+    Ok(store.query(since, group_by))
+}
 
 #[cfg(test)]
 mod tests {
@@ -368,5 +453,66 @@ mod tests {
         assert_eq!(loaded.providers[0].windows[0].remaining_percent, Some(92.0));
         assert!(loaded.providers[0].available);
         assert!(!loaded.providers[0].stale);
+    }
+
+    #[test]
+    fn usage_command_reads_the_store_without_touching_quota_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("agent-meter");
+        let mut store = usage::UsageStore::open(UsagePaths::from_root(&root)).unwrap();
+        let host = "homelabdesktop";
+        let harness = "claude";
+        let session = "session-1";
+        let seq = 2u64;
+        let observed_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let event = serde_json::json!({
+            "schema": "agent-meter.usage-event/v1",
+            "idempotency_key": usage::canonical_idempotency_key(host, harness, session, seq),
+            "kind": "session_snapshot",
+            "host": host,
+            "harness": harness,
+            "harness_version": "2.1.321",
+            "session_id": session,
+            "seq": seq,
+            "observed_at": observed_at,
+            "started_at": null,
+            "ended_at": null,
+            "duration_ms": 45000,
+            "models": [{
+                "model": "claude-opus-5-5",
+                "input_tokens": 1200,
+                "output_tokens": 340,
+                "cache_read_tokens": 80,
+                "cache_write_tokens": 0,
+                "reasoning_tokens": null,
+                "requests": 2,
+                "cost_usd": null,
+                "cost_source": "none"
+            }],
+            "source": "hook:Stop+transcript",
+            "dispatch_run_id": null,
+            "repo": null
+        });
+        store
+            .accept_payload(&serde_json::to_vec(&event).unwrap(), None)
+            .unwrap();
+        drop(store);
+
+        let report = usage_main(&[
+            "--json".into(),
+            "--usage-dir".into(),
+            root.display().to_string(),
+            "--since".into(),
+            "24h".into(),
+            "--by".into(),
+            "harness".into(),
+        ])
+        .unwrap();
+        assert_eq!(report.schema, "agent-meter.usage-report/v1");
+        assert_eq!(report.sessions, 1);
+        assert_eq!(report.group_by.as_deref(), Some("harness"));
+        assert_eq!(report.totals.input_tokens, Some(1200));
+        assert_eq!(report.groups[0].key, "claude");
+        assert!(!root.join("state.json").exists());
     }
 }

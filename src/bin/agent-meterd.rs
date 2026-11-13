@@ -1,17 +1,21 @@
+use agent_meter::forecast::NotifySink;
+use agent_meter::usage::{self, UsageStore};
 use agent_meter::{
     forecast, runtime_state_path, write_state, AgentMeterState, ProviderState, UsageWindow,
     STATE_VERSION,
 };
-use agent_meter::forecast::NotifySink;
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 use clap::Parser;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
+use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration as StdDuration, Instant};
 
@@ -31,6 +35,18 @@ struct Args {
     /// Destination state file. Defaults to $XDG_RUNTIME_DIR/agent-meter/state.json.
     #[arg(long)]
     state: Option<PathBuf>,
+    /// Optional usage ingest listener, for example `100.64.0.1:8787`.
+    /// Off by default. Refuses `0.0.0.0` and `::` unless `--listen-any` is set.
+    #[arg(long)]
+    listen: Option<String>,
+    /// Allow `--listen` to bind an unspecified address (`0.0.0.0` or `::`).
+    #[arg(long)]
+    listen_any: bool,
+    /// SHA-256 host token file. Defaults to
+    /// `$XDG_CONFIG_HOME/agent-meter/ingest-tokens.json`.
+    /// Values are hashes, never bearer tokens.
+    #[arg(long)]
+    ingest_tokens: Option<PathBuf>,
 }
 
 fn default_refresh_seconds() -> u64 {
@@ -190,6 +206,105 @@ fn config_path() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("agent-meter/sources.json")
+}
+
+fn default_ingest_tokens_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("agent-meter/ingest-tokens.json")
+}
+
+fn usage_root() -> PathBuf {
+    agent_meter::stable_state_path()
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("agent-meter"))
+}
+
+fn open_usage_store() -> Result<Arc<Mutex<UsageStore>>> {
+    let root = usage_root();
+    let mut store = UsageStore::open(usage::UsagePaths::from_root(&root))?;
+    if let Some(parent) = runtime_state_path().parent() {
+        store.set_extra_today_paths(vec![parent.join(usage::TODAY_FILE_NAME)]);
+    }
+    Ok(Arc::new(Mutex::new(store)))
+}
+
+fn drain_usage(store: &Arc<Mutex<UsageStore>>) {
+    let mut guard = store.lock().unwrap_or_else(|err| err.into_inner());
+    match guard.drain_inbox() {
+        Ok(stats) if stats.seen > 0 => {
+            eprintln!(
+                "agent-meterd: inbox accepted={} duplicates={} rejected={}",
+                stats.accepted, stats.duplicates, stats.rejected
+            );
+        }
+        Ok(_) => {}
+        Err(err) => eprintln!("agent-meterd: inbox drain failed: {err}"),
+    }
+    if let Err(err) = guard.publish_today_now() {
+        eprintln!("agent-meterd: could not write usage today: {err}");
+    }
+}
+
+fn warn_token_file_mode(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.permissions().mode() & 0o077 != 0 {
+                eprintln!(
+                    "agent-meterd: {} is readable by group or others; mode 0600 is safer for token hashes",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+/// Watch the inbox for atomic renames. `None` means the refresh loop drains it.
+fn arm_inbox_watch(dir: &Path) -> Option<i32> {
+    let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+    if fd < 0 {
+        eprintln!("agent-meterd: inotify unavailable; inbox drains on the refresh interval");
+        return None;
+    }
+    let Ok(path) = CString::new(dir.as_os_str().as_bytes()) else {
+        unsafe { libc::close(fd) };
+        return None;
+    };
+    let mask = libc::IN_MOVED_TO | libc::IN_CLOSE_WRITE;
+    let watch = unsafe { libc::inotify_add_watch(fd, path.as_ptr(), mask) };
+    if watch < 0 {
+        eprintln!("agent-meterd: inotify watch failed; inbox drains on the refresh interval");
+        unsafe { libc::close(fd) };
+        return None;
+    }
+    Some(fd)
+}
+
+fn wait_inbox(fd: Option<i32>, timeout: StdDuration) {
+    let Some(fd) = fd else {
+        thread::sleep(timeout);
+        return;
+    };
+    let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+    let mut pollfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ready = unsafe { libc::poll(&mut pollfd, 1, millis) };
+    if ready <= 0 {
+        return;
+    }
+    let mut buf = [0u8; 4096];
+    loop {
+        let read = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+        if read <= 0 {
+            break;
+        }
+    }
 }
 
 fn load_config(path: &PathBuf) -> Result<Config> {
@@ -807,35 +922,92 @@ fn emit_state(
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    if args.listen_any && args.listen.is_none() {
+        anyhow::bail!("--listen-any requires --listen");
+    }
     let config_path = args.config.unwrap_or_else(config_path);
     let state_path = args.state.unwrap_or_else(runtime_state_path);
     let config = load_config(&config_path)?;
     if config.refresh_seconds == 0 {
         anyhow::bail!("refresh_seconds must be greater than zero");
     }
+
+    // Usage ingest is local-only unless --listen is set. A missing store does
+    // not block quota refresh; the listener cannot start without one.
+    let usage_store = match open_usage_store() {
+        Ok(store) => Some(store),
+        Err(err) if args.listen.is_some() => return Err(err),
+        Err(err) => {
+            eprintln!("agent-meterd: usage store unavailable: {err}");
+            None
+        }
+    };
+    let listener = if let Some(spec) = args.listen.as_deref() {
+        let store = usage_store
+            .clone()
+            .context("usage store is required for --listen")?;
+        let token_path = args
+            .ingest_tokens
+            .clone()
+            .unwrap_or_else(default_ingest_tokens_path);
+        warn_token_file_mode(&token_path);
+        let listener = usage::serve(spec, args.listen_any, &token_path, store)?;
+        eprintln!(
+            "agent-meterd: usage ingest listening on {}",
+            listener.addr
+        );
+        Some(listener)
+    } else {
+        None
+    };
+
+    let inbox = usage_root().join(usage::INBOX_DIR_NAME);
+    if usage_store.is_some() {
+        let _ = std::fs::create_dir_all(&inbox);
+    }
+    let inbox_watch = if usage_store.is_some() && (args.watch || listener.is_some()) {
+        arm_inbox_watch(&inbox)
+    } else {
+        None
+    };
+
     let mut last_good: HashMap<usize, ProviderState> = HashMap::new();
     let mut last_good_state: Option<AgentMeterState> = None;
+    let mut did_refresh = false;
+    let mut next_refresh = Instant::now();
     loop {
-        let mut write_error: Option<anyhow::Error> = None;
-        let final_state = refresh_publishing(&config, &mut last_good, |state| {
-            if let Err(err) = emit_state(&state_path, state, &mut last_good_state) {
-                write_error = Some(err);
-            }
-        });
-        if config.forecast.enabled {
-            update_forecast_history(&config.forecast, &final_state);
+        if let Some(store) = &usage_store {
+            drain_usage(store);
         }
-        if last_good_state.is_none() {
-            if let Some(err) = write_error {
-                if !args.watch {
-                    return Err(err);
+        if (args.watch || !did_refresh) && Instant::now() >= next_refresh {
+            let mut write_error: Option<anyhow::Error> = None;
+            let final_state = refresh_publishing(&config, &mut last_good, |state| {
+                if let Err(err) = emit_state(&state_path, state, &mut last_good_state) {
+                    write_error = Some(err);
+                }
+            });
+            if config.forecast.enabled {
+                update_forecast_history(&config.forecast, &final_state);
+            }
+            if last_good_state.is_none() {
+                if let Some(err) = write_error {
+                    if !args.watch {
+                        return Err(err);
+                    }
                 }
             }
+            did_refresh = true;
+            next_refresh = Instant::now() + StdDuration::from_secs(config.refresh_seconds);
         }
-        if !args.watch {
+        if !args.watch && listener.is_none() {
             break;
         }
-        thread::sleep(StdDuration::from_secs(config.refresh_seconds));
+        let timeout = if args.watch {
+            next_refresh.saturating_duration_since(Instant::now())
+        } else {
+            StdDuration::from_secs(60)
+        };
+        wait_inbox(inbox_watch, timeout);
     }
     Ok(())
 }
@@ -1775,6 +1947,13 @@ mod tests {
             assert!(provider.updated_at.is_none());
         }
         assert!(state.validate().is_ok());
+    }
+
+    #[test]
+    fn listen_is_off_unless_requested() {
+        let args = Args::try_parse_from(["agent-meterd", "--once"]).unwrap();
+        assert!(args.listen.is_none());
+        assert!(!args.listen_any);
     }
 
     #[test]

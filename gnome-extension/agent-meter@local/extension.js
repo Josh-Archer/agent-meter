@@ -19,6 +19,35 @@ function runtimeStateFile() {
     return Gio.File.new_build_filenamev([GLib.get_user_runtime_dir(), 'agent-meter', 'state.json']);
 }
 
+function runtimeUsageTodayFile() {
+    return Gio.File.new_build_filenamev([GLib.get_user_runtime_dir(), 'agent-meter', 'usage-today.json']);
+}
+
+// Optional one-line summary written by agent-meterd. Missing, empty, or stale
+// files add nothing to the card. Quota state.json is left unchanged.
+function usageTodayLabel() {
+    try {
+        const file = runtimeUsageTodayFile();
+        if (!file.query_exists(null))
+            return null;
+        const [ok, bytes] = file.load_contents(null);
+        if (!ok)
+            return null;
+        const data = JSON.parse(new TextDecoder().decode(bytes));
+        if (!data || typeof data.label !== 'string' || data.label.length === 0)
+            return null;
+        if (typeof data.day === 'string') {
+            const now = new Date();
+            const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+            if (data.day !== today)
+                return null;
+        }
+        return data.label;
+    } catch (e) {
+        return null;
+    }
+}
+
 function widgetConfigPath() {
     return GLib.build_filenamev([GLib.get_user_config_dir(), 'agent-meter', 'position.json']);
 }
@@ -636,6 +665,14 @@ class AgentMeterIndicator extends PanelMenu.Button {
         }
         this._attachDragHandle(header);
         this._desktop.add_child(header);
+
+        const todayText = usageTodayLabel();
+        if (typeof todayText === 'string' && todayText.length > 0) {
+            this._desktop.add_child(new St.Label({
+                text: todayText,
+                style_class: 'agent-meter-usage-today',
+            }));
+        }
 
         if (!state?.providers?.length) {
             this._desktop.add_child(new St.Label({text: 'Waiting for local usage data…', style_class: 'agent-meter-limit'}));

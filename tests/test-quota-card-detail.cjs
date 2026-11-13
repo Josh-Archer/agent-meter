@@ -37,6 +37,7 @@ ${source.slice(quotaStart, quotaEnd)}
 ${source.slice(colorStart, colorEnd)}
 const PROGRESS_WIDTH = ${width[1]};
 function iconFor() { return {}; }
+function usageTodayLabel() { return globalThis.__agentMeterUsageToday ?? null; }
 (class {
 ${source.slice(rebuildStart, rebuildEnd)}
 })
@@ -205,5 +206,13 @@ assert.equal(progressCount(failedCard), 0);
 
 const waiting = render(null);
 assert.deepEqual(labelsOf(waiting), ['⠿  Agent Meter', 'Waiting for local usage data…']);
+
+globalThis.__agentMeterUsageToday = 'Today: 1,200 in · 340 out · 1 session';
+const withToday = render(numeric);
+assert.ok(labelsOf(withToday).includes('Today: 1,200 in · 340 out · 1 session'));
+assert.equal(cardsOf(withToday).length, 2, 'the today line is not a provider card');
+globalThis.__agentMeterUsageToday = null;
+const withoutToday = render(numeric);
+assert.ok(!labelsOf(withoutToday).includes('Today: 1,200 in · 340 out · 1 session'));
 
 console.log('Numeric quota cards show plan and N of M used text');
