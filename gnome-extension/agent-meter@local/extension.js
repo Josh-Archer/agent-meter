@@ -163,11 +163,23 @@ function quotaColor(percent, isFresh = true) {
 function limitText(provider) {
     if (['unavailable', 'error'].includes(provider.status))
         return 'Unavailable';
-    if (provider.status === 'stale')
+    if (provider.status === 'stale') {
+        if (provider.reason === 'cli_not_installed')
+            return 'Not installed';
         return 'Usage unavailable (cached data expired)';
-    const windows = provider.windows ?? [];
-    const lowest = windows.reduce((current, entry) =>
-        current === null || entry.remaining_percent < current.remaining_percent ? entry : current, null);
+    }
+    const windows = (provider.windows ?? []).filter(entry =>
+        entry.id === 'account' ||
+        (typeof entry.remaining_percent === 'number' && Number.isFinite(entry.remaining_percent)));
+    const lowest = windows.reduce((current, entry) => {
+        if (current === null)
+            return entry;
+        if (entry.id === 'account')
+            return current;
+        if (current.id === 'account')
+            return entry;
+        return entry.remaining_percent < current.remaining_percent ? entry : current;
+    }, null);
     if (!lowest)
         return 'No usage data';
     if (lowest.id === 'account')
@@ -750,8 +762,11 @@ class AgentMeterIndicator extends PanelMenu.Button {
                 }
             } else {
                 const detailRow = new St.BoxLayout({style_class: 'agent-meter-desktop-window'});
-                const detailText = isStale ? 'Usage unavailable; cached data expired.' :
-                    (provider.detail ?? 'Signed in and operational');
+                const detailText = isStale
+                    ? (provider.reason === 'cli_not_installed' && provider.detail
+                        ? provider.detail
+                        : 'Usage unavailable; cached data expired.')
+                    : (provider.detail ?? 'Signed in and operational');
                 detailRow.add_child(new St.Label({text: detailText, style_class: 'agent-meter-limit', x_expand: true}));
                 card.add_child(detailRow);
             }

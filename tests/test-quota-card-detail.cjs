@@ -7,11 +7,14 @@ const quotaStart = source.indexOf('function quotaWindows(');
 const quotaEnd = source.indexOf('function iconFor(', quotaStart);
 const colorStart = source.indexOf('const COLOR_STOPS =');
 const colorEnd = source.indexOf('function limitText(', colorStart);
+const limitStart = colorEnd;
+const limitEnd = source.indexOf('function usagePageUrl(', limitStart);
 const rebuildStart = source.indexOf('    _rebuildDesktop(state) {');
 const rebuildEnd = source.indexOf('\n    destroy() {', rebuildStart);
 const width = source.match(/const PROGRESS_WIDTH = (\d+);/);
 assert.ok(quotaStart >= 0 && quotaEnd > quotaStart, 'quotaWindows must stay extractable');
 assert.ok(colorStart >= 0 && colorEnd > colorStart, 'quotaColor must stay extractable');
+assert.ok(limitStart >= 0 && limitEnd > limitStart, 'limitText must stay extractable');
 assert.ok(rebuildStart >= 0 && rebuildEnd > rebuildStart, '_rebuildDesktop must stay extractable');
 assert.ok(width, 'PROGRESS_WIDTH must stay extractable');
 
@@ -32,16 +35,19 @@ const St = {
     Widget: function Widget(props) { return actor('widget', props); },
 };
 
-const Desktop = eval(`
+const {Desktop, limitText} = eval(`(() => {
 ${source.slice(quotaStart, quotaEnd)}
-${source.slice(colorStart, colorEnd)}
+${source.slice(colorStart, limitEnd)}
 const PROGRESS_WIDTH = ${width[1]};
 function iconFor() { return {}; }
 function usageTodayLabel() { return globalThis.__agentMeterUsageToday ?? null; }
-(class {
+return {
+    Desktop: class {
 ${source.slice(rebuildStart, rebuildEnd)}
-})
-`);
+    },
+    limitText,
+};
+})()`);
 
 function walk(node, visit) {
     visit(node);
@@ -214,5 +220,40 @@ assert.equal(cardsOf(withToday).length, 2, 'the today line is not a provider car
 globalThis.__agentMeterUsageToday = null;
 const withoutToday = render(numeric);
 assert.ok(!labelsOf(withoutToday).includes('Today: 1,200 in · 340 out · 1 session'));
+
+const notInstalled = render({
+    providers: [{
+        id: 'codex',
+        label: 'Codex',
+        status: 'stale',
+        reason: 'cli_not_installed',
+        detail: 'codex CLI not installed on this host',
+        windows: [{id: 'availability', label: 'Availability'}],
+    }],
+});
+const notInstalledCard = cardsOf(notInstalled)[0];
+assert.deepEqual(limitTexts(notInstalledCard), ['codex CLI not installed on this host']);
+assert.equal(progressCount(notInstalledCard), 0);
+assert.equal(limitText({
+    status: 'stale',
+    reason: 'cli_not_installed',
+    windows: [{id: 'availability'}],
+}), 'Not installed');
+
+assert.equal(limitText({
+    status: 'unavailable',
+    reason: 'source_failed',
+    windows: [{id: 'availability', remaining_percent: null}],
+}), 'Unavailable');
+
+assert.equal(limitText({
+    status: 'fresh',
+    windows: [{id: 'daily', remaining_percent: null}],
+}), 'No usage data');
+
+assert.equal(limitText({
+    status: 'fresh',
+    windows: [{id: 'five_hour', remaining_percent: 0, reset_label: 'resets soon'}],
+}), '0% · resets soon');
 
 console.log('Numeric quota cards show plan and N of M used text');

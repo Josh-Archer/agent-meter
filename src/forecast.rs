@@ -161,9 +161,9 @@ impl WindowForecast {
     pub fn to_json(&self) -> JsonForecast {
         JsonForecast {
             status: self.status,
-            estimated_exhaustion_at: self.estimated_exhaustion_at.map(|dt| {
-                dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
-            }),
+            estimated_exhaustion_at: self
+                .estimated_exhaustion_at
+                .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, false)),
             exhausts_before_reset: self.exhausts_before_reset,
             consumption_rate_percent_per_hour: self.consumption_rate_percent_per_hour,
             depleting: self.depleting,
@@ -333,8 +333,8 @@ pub fn forecast_window(
     // Extrapolate the fitted line to zero remaining.
     let last = points.last().expect("non-empty");
     let seconds_to_zero = last.1 / -slope;
-    let estimated = newest.observed_at
-        + chrono::Duration::seconds(seconds_to_zero.max(0.0).round() as i64);
+    let estimated =
+        newest.observed_at + chrono::Duration::seconds(seconds_to_zero.max(0.0).round() as i64);
     let exhausts_before_reset = base.resets_at.map(|reset| estimated < reset);
     WindowForecast {
         status: ForecastStatus::Ok,
@@ -392,19 +392,22 @@ pub fn check_window_thresholds(
         {
             continue;
         }
-        entry.notified.push(ThresholdNotice { threshold, cycle: cycle.clone() });
+        entry.notified.push(ThresholdNotice {
+            threshold,
+            cycle: cycle.clone(),
+        });
         events.push(ThresholdEvent {
             notified_at: now,
             provider: entry.provider.clone(),
             window: entry.window.clone(),
             threshold,
             remaining_percent: newest.remaining_percent,
-            estimated_exhaustion_at: forecast.estimated_exhaustion_at.map(|dt| {
-                dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
-            }),
-            resets_at: newest.resets_at.map(|dt| {
-                dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
-            }),
+            estimated_exhaustion_at: forecast
+                .estimated_exhaustion_at
+                .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, false)),
+            resets_at: newest
+                .resets_at
+                .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, false)),
         });
     }
     events
@@ -419,7 +422,12 @@ pub fn check_notifications(
 ) -> Vec<ThresholdEvent> {
     let mut events = Vec::new();
     for entry in history.windows.iter_mut() {
-        events.extend(check_window_thresholds(entry, thresholds, now, stale_after_secs));
+        events.extend(check_window_thresholds(
+            entry,
+            thresholds,
+            now,
+            stale_after_secs,
+        ));
     }
     events
 }
@@ -444,10 +452,7 @@ pub fn forecasts_for_json(
 
 /// Resolve the default usage-history path from explicit env values, mirroring
 /// the stable state location: `$XDG_STATE_HOME/agent-meter/usage-history.json`.
-pub fn history_path_from(
-    xdg_state_home: Option<OsString>,
-    home: Option<OsString>,
-) -> PathBuf {
+pub fn history_path_from(xdg_state_home: Option<OsString>, home: Option<OsString>) -> PathBuf {
     let state_path = state_path_from(xdg_state_home, home);
     state_path
         .parent()
@@ -578,7 +583,13 @@ mod tests {
         };
         // 10%/hour decline: 100 -> 0 over 10 hours.
         for (h, remaining) in [(0, 100.0), (1, 90.0), (2, 80.0), (3, 70.0)] {
-            record_observation(&mut history, "codex", "five_hour", obs(h, remaining, base), 288);
+            record_observation(
+                &mut history,
+                "codex",
+                "five_hour",
+                obs(h, remaining, base),
+                288,
+            );
         }
         (history, base + chrono::Duration::hours(3))
     }
@@ -639,7 +650,13 @@ mod tests {
             windows: Vec::new(),
         };
         for (h, remaining) in [(0, 80.0), (1, 70.0), (2, 60.0)] {
-            record_observation(&mut history, "codex", "five_hour", obs(h, remaining, base), 288);
+            record_observation(
+                &mut history,
+                "codex",
+                "five_hour",
+                obs(h, remaining, base),
+                288,
+            );
         }
         let entry = history.window_mut("codex", "five_hour");
         entry.notified.push(ThresholdNotice {
@@ -662,7 +679,13 @@ mod tests {
             windows: Vec::new(),
         };
         for (h, remaining) in [(0, 80.0), (1, 70.0), (2, 72.0)] {
-            record_observation(&mut history, "codex", "five_hour", obs(h, remaining, base), 288);
+            record_observation(
+                &mut history,
+                "codex",
+                "five_hour",
+                obs(h, remaining, base),
+                288,
+            );
         }
         let entry = history.window("codex", "five_hour").unwrap();
         assert_eq!(entry.observations.len(), 3);
@@ -799,7 +822,13 @@ mod tests {
             (4, 95.0),
             (5, 75.0),
         ] {
-            record_observation(&mut history, "codex", "five_hour", obs(h, remaining, base), 288);
+            record_observation(
+                &mut history,
+                "codex",
+                "five_hour",
+                obs(h, remaining, base),
+                288,
+            );
         }
         let entry = history.window("codex", "five_hour").unwrap();
         let forecast = forecast_window(entry, base + chrono::Duration::hours(5), 3600 * 8);
@@ -824,7 +853,13 @@ mod tests {
             );
         }
         for (h, remaining) in [(8, 92.0), (9, 72.0), (10, 52.0), (11, 32.0), (12, 12.0)] {
-            record_observation(&mut history, "codex", "five_hour", obs(h, remaining, base), 288);
+            record_observation(
+                &mut history,
+                "codex",
+                "five_hour",
+                obs(h, remaining, base),
+                288,
+            );
         }
         let entry = history.window("codex", "five_hour").unwrap();
         let forecast = forecast_window(entry, base + chrono::Duration::hours(12), 3600 * 30);
@@ -844,7 +879,13 @@ mod tests {
             windows: Vec::new(),
         };
         for (h, remaining) in [(0, 100.0), (1, 80.0), (2, 60.0), (3, 20.0)] {
-            record_observation(&mut history, "codex", "five_hour", obs(h, remaining, base), 288);
+            record_observation(
+                &mut history,
+                "codex",
+                "five_hour",
+                obs(h, remaining, base),
+                288,
+            );
         }
         let now = base + chrono::Duration::hours(3);
         let entry = history.window_mut("codex", "five_hour");
@@ -877,7 +918,13 @@ mod tests {
             windows: Vec::new(),
         };
         for (h, remaining) in [(0, 100.0), (1, 90.0), (2, 80.0)] {
-            record_observation(&mut history, "codex", "five_hour", obs(h, remaining, base), 288);
+            record_observation(
+                &mut history,
+                "codex",
+                "five_hour",
+                obs(h, remaining, base),
+                288,
+            );
         }
         let now = base + chrono::Duration::hours(2);
         let entry = history.window_mut("codex", "five_hour");
@@ -899,7 +946,13 @@ mod tests {
             windows: Vec::new(),
         };
         for (h, remaining) in [(0, 100.0), (1, 80.0), (2, 60.0), (3, 20.0)] {
-            record_observation(&mut history, "codex", "five_hour", obs(h, remaining, base), 288);
+            record_observation(
+                &mut history,
+                "codex",
+                "five_hour",
+                obs(h, remaining, base),
+                288,
+            );
         }
         let now = base + chrono::Duration::hours(3);
         // Empty thresholds: nothing fires.
@@ -999,5 +1052,105 @@ mod tests {
         assert_eq!(forecast.status, ForecastStatus::Ok);
         assert_eq!(forecast.observation_count, 4);
         assert!(forecast.estimated_exhaustion_at.is_some());
+    }
+
+    #[test]
+    fn unknown_and_null_remaining_percent_never_record_or_notify() {
+        use crate::{ProviderState, UsageWindow};
+
+        let now = Utc.with_ymd_and_hms(2026, 3, 18, 12, 0, 0).unwrap();
+        let mut history = UsageHistory {
+            version: HISTORY_VERSION,
+            windows: Vec::new(),
+        };
+        let state = AgentMeterState {
+            version: 1,
+            generated_at: now,
+            providers: vec![
+                ProviderState {
+                    id: "codex".into(),
+                    label: "Codex".into(),
+                    icon: "codex".into(),
+                    status: "unavailable".into(),
+                    reason: Some("cli_not_installed".into()),
+                    windows: vec![UsageWindow {
+                        id: "availability".into(),
+                        label: "Availability".into(),
+                        remaining_percent: None,
+                        resets_at: None,
+                        reset_label: None,
+                    }],
+                    detail: Some("missing cli".into()),
+                    usage_url: None,
+                    updated_at: Some(now),
+                },
+                ProviderState {
+                    id: "antigravity".into(),
+                    label: "Antigravity".into(),
+                    icon: "antigravity".into(),
+                    status: "stale".into(),
+                    reason: Some("cli_not_installed".into()),
+                    windows: vec![UsageWindow {
+                        id: "availability".into(),
+                        label: "Availability".into(),
+                        remaining_percent: None,
+                        resets_at: None,
+                        reset_label: None,
+                    }],
+                    detail: Some("missing agy".into()),
+                    usage_url: None,
+                    updated_at: Some(now),
+                },
+                ProviderState {
+                    id: "grok".into(),
+                    label: "Grok".into(),
+                    icon: "grok".into(),
+                    status: "fresh".into(),
+                    reason: None,
+                    windows: vec![UsageWindow {
+                        id: "daily".into(),
+                        label: "Daily".into(),
+                        remaining_percent: None,
+                        resets_at: None,
+                        reset_label: None,
+                    }],
+                    detail: Some("no percent".into()),
+                    usage_url: None,
+                    updated_at: Some(now),
+                },
+            ],
+        };
+
+        record_state(&mut history, &state, now, 288);
+        assert!(history.windows.is_empty());
+
+        let events = check_notifications(&mut history, &[100.0, 25.0, 0.0], now, 600);
+        assert!(events.is_empty());
+
+        let zero_state = AgentMeterState {
+            version: 1,
+            generated_at: now,
+            providers: vec![ProviderState {
+                id: "claude".into(),
+                label: "Claude".into(),
+                icon: "claude".into(),
+                status: "fresh".into(),
+                reason: None,
+                windows: vec![UsageWindow {
+                    id: "five_hour".into(),
+                    label: "5h".into(),
+                    remaining_percent: Some(0.0),
+                    resets_at: None,
+                    reset_label: None,
+                }],
+                detail: Some("exhausted".into()),
+                usage_url: None,
+                updated_at: Some(now),
+            }],
+        };
+        record_state(&mut history, &zero_state, now, 288);
+        assert_eq!(history.windows.len(), 1);
+        let zero_events = check_notifications(&mut history, &[25.0, 0.0], now, 600);
+        assert_eq!(zero_events.len(), 2);
     }
 }

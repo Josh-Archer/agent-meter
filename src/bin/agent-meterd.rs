@@ -325,6 +325,7 @@ fn load_config(path: &PathBuf) -> Result<Config> {
 
 #[derive(Debug)]
 enum CommandError {
+    NotFound,
     Unavailable,
     Timeout,
 }
@@ -391,7 +392,13 @@ fn run_command_with_timeout(
         .stderr(std::process::Stdio::piped())
         .process_group(0)
         .spawn()
-        .map_err(|_| CommandError::Unavailable)?;
+        .map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                CommandError::NotFound
+            } else {
+                CommandError::Unavailable
+            }
+        })?;
 
     let pgid = child.id() as libc::pid_t;
     let stdout_pipe = child.stdout.take();
@@ -465,6 +472,10 @@ fn deduplicate_provider_ids(providers: &mut [ProviderState]) {
     }
 }
 
+const REASON_CLI_NOT_INSTALLED: &str = "cli_not_installed";
+const REASON_SOURCE_FAILED: &str = "source_failed";
+const REASON_TIMEOUT: &str = "timeout";
+
 fn sanitize_state(state: &mut AgentMeterState) {
     state.version = STATE_VERSION;
     for (index, provider) in state.providers.iter_mut().enumerate() {
@@ -474,7 +485,11 @@ fn sanitize_state(state: &mut AgentMeterState) {
             } else {
                 format!("provider-{index}")
             };
-            *provider = unavailable(&hint, &format!("Invalid provider document: {err}"));
+            *provider = unavailable(
+                &hint,
+                &format!("Invalid provider document: {err}"),
+                REASON_SOURCE_FAILED,
+            );
         }
     }
     deduplicate_provider_ids(&mut state.providers);
@@ -483,8 +498,13 @@ fn sanitize_state(state: &mut AgentMeterState) {
 enum SourceRefresh {
     /// A normalized document from the source, which may itself be unavailable.
     Document(ProviderState),
-    /// The source produced no document. `detail` is the failure reason.
-    Failed { hint: String, detail: String },
+    /// The source produced no document. `detail` is the failure message and
+    /// `reason` is the machine-readable cause.
+    Failed {
+        hint: String,
+        detail: String,
+        reason: &'static str,
+    },
 }
 
 fn effective_concurrency(config: &Config) -> usize {
@@ -561,6 +581,7 @@ fn provider_or_invalid(provider: ProviderState, fallback_hint: &str) -> SourceRe
             SourceRefresh::Failed {
                 hint,
                 detail: format!("Invalid provider document: {err}"),
+                reason: REASON_SOURCE_FAILED,
             }
         }
     }
@@ -576,6 +597,7 @@ fn refresh_source(
         return SourceRefresh::Failed {
             hint: source_hint(index, source),
             detail: GLOBAL_DEADLINE_DETAIL.into(),
+            reason: REASON_TIMEOUT,
         };
     }
     match source {
@@ -588,11 +610,13 @@ fn refresh_source(
                     Err(_) => SourceRefresh::Failed {
                         hint: fallback_hint,
                         detail: "File adapter could not read normalized state".into(),
+                        reason: REASON_SOURCE_FAILED,
                     },
                 },
                 Err(_) => SourceRefresh::Failed {
                     hint: fallback_hint,
                     detail: "File adapter could not read normalized state".into(),
+                    reason: REASON_SOURCE_FAILED,
                 },
             }
         }
@@ -607,6 +631,7 @@ fn refresh_source(
                 return SourceRefresh::Failed {
                     hint: program.clone(),
                     detail: GLOBAL_DEADLINE_DETAIL.into(),
+                    reason: REASON_TIMEOUT,
                 };
             }
             let capped_by_deadline = remaining < per_source;
@@ -622,24 +647,34 @@ fn refresh_source(
                         Err(_) => SourceRefresh::Failed {
                             hint: program.clone(),
                             detail: "Adapter did not emit a ProviderState JSON document".into(),
+                            reason: REASON_SOURCE_FAILED,
                         },
                     }
                 }
                 Ok(_) => SourceRefresh::Failed {
                     hint: program.clone(),
                     detail: "Adapter exited unsuccessfully".into(),
+                    reason: REASON_SOURCE_FAILED,
                 },
                 Err(CommandError::Timeout) if capped_by_deadline => SourceRefresh::Failed {
                     hint: program.clone(),
                     detail: GLOBAL_DEADLINE_DETAIL.into(),
+                    reason: REASON_TIMEOUT,
                 },
                 Err(CommandError::Timeout) => SourceRefresh::Failed {
                     hint: program.clone(),
                     detail: "Adapter timed out".into(),
+                    reason: REASON_TIMEOUT,
+                },
+                Err(CommandError::NotFound) => SourceRefresh::Failed {
+                    hint: program.clone(),
+                    detail: "Adapter executable is unavailable".into(),
+                    reason: REASON_CLI_NOT_INSTALLED,
                 },
                 Err(CommandError::Unavailable) => SourceRefresh::Failed {
                     hint: program.clone(),
                     detail: "Adapter executable is unavailable".into(),
+                    reason: REASON_SOURCE_FAILED,
                 },
             }
         }
@@ -662,13 +697,17 @@ fn record_source(
             }
             provider
         }
-        SourceRefresh::Failed { hint, detail } => {
+        SourceRefresh::Failed {
+            hint,
+            detail,
+            reason,
+        } => {
             if let Some(previous) = last_good.get(&index) {
                 let stale = mark_stale(previous.clone(), &detail);
                 last_good.insert(index, stale.clone());
                 stale
             } else {
-                unavailable(&hint, &detail)
+                unavailable(&hint, &detail, reason)
             }
         }
     };
@@ -799,6 +838,7 @@ fn refresh_publishing(
                         SourceRefresh::Failed {
                             hint: source_hint(index, &config.sources[index]),
                             detail: GLOBAL_DEADLINE_DETAIL.into(),
+                            reason: REASON_TIMEOUT,
                         },
                         &mut slots,
                         last_good,
@@ -812,7 +852,7 @@ fn refresh_publishing(
     })
 }
 
-fn unavailable(id_hint: &str, detail: &str) -> ProviderState {
+fn unavailable(id_hint: &str, detail: &str, reason: &str) -> ProviderState {
     let normalized: String = id_hint
         .to_ascii_lowercase()
         .chars()
@@ -827,14 +867,14 @@ fn unavailable(id_hint: &str, detail: &str) -> ProviderState {
         windows: vec![UsageWindow {
             id: "availability".into(),
             label: "Availability".into(),
-            remaining_percent: Some(0.0),
+            remaining_percent: None,
             resets_at: None,
             reset_label: Some("unavailable".into()),
         }],
         status: "unavailable".into(),
         detail: Some(detail.into()),
         usage_url: None,
-        reason: None,
+        reason: Some(reason.into()),
         updated_at: None,
     }
 }
@@ -855,12 +895,7 @@ fn update_forecast_history(config: &ForecastConfig, state: &AgentMeterState) {
         .unwrap_or_else(forecast::default_history_path);
     let mut history = forecast::load_history(&history_path).unwrap_or_default();
     let now = Utc::now();
-    forecast::record_state(
-        &mut history,
-        state,
-        now,
-        config.max_observations_per_window,
-    );
+    forecast::record_state(&mut history, state, now, config.max_observations_per_window);
     if let Err(err) = forecast::save_history(&history_path, &history) {
         eprintln!("agent-meterd: could not write usage history: {err}");
     }
@@ -952,10 +987,7 @@ fn main() -> Result<()> {
             .unwrap_or_else(default_ingest_tokens_path);
         warn_token_file_mode(&token_path);
         let listener = usage::serve(spec, args.listen_any, &token_path, store)?;
-        eprintln!(
-            "agent-meterd: usage ingest listening on {}",
-            listener.addr
-        );
+        eprintln!("agent-meterd: usage ingest listening on {}", listener.addr);
         Some(listener)
     } else {
         None
@@ -1255,12 +1287,20 @@ mod tests {
     }
 
     #[test]
-    fn command_unavailable_on_missing_executable() {
+    fn command_not_found_on_missing_executable() {
         let result = run_command_with_timeout(
             "/nonexistent/binary/for/test",
             &[],
             StdDuration::from_secs(1),
         );
+        assert!(matches!(result, Err(CommandError::NotFound)));
+    }
+
+    #[test]
+    fn command_unavailable_on_non_executable_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let result =
+            run_command_with_timeout(dir.path().to_str().unwrap(), &[], StdDuration::from_secs(1));
         assert!(matches!(result, Err(CommandError::Unavailable)));
     }
 
@@ -1979,5 +2019,127 @@ mod tests {
         assert_eq!(loaded.windows[0].provider, "fast-provider");
         assert_eq!(loaded.windows[0].observations.len(), 1);
         assert_eq!(loaded.windows[0].observations[0].remaining_percent, 80.0);
+    }
+
+    #[test]
+    fn unavailable_omits_remaining_percent_and_sets_reason() {
+        let provider = unavailable("codex", "codex unavailable", REASON_CLI_NOT_INSTALLED);
+        assert_eq!(provider.status, "unavailable");
+        assert_eq!(provider.reason.as_deref(), Some(REASON_CLI_NOT_INSTALLED));
+        assert_eq!(provider.windows.len(), 1);
+        assert_eq!(provider.windows[0].remaining_percent, None);
+
+        let json_output = agent_meter::JsonOutput::from_state(&AgentMeterState {
+            version: STATE_VERSION,
+            generated_at: Utc::now(),
+            providers: vec![provider],
+        });
+        let value = serde_json::to_value(&json_output).unwrap();
+        let p = &value["providers"][0];
+        assert_eq!(p["available"], false);
+        assert_eq!(p["stale"], false);
+        assert_eq!(p["reason"], REASON_CLI_NOT_INSTALLED);
+        assert!(p["windows"][0].get("remaining_percent").is_none());
+    }
+
+    #[test]
+    fn refresh_sets_specific_reasons_and_preserves_real_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_file = dir.path().join("missing.json");
+        let real_zero = fresh_provider("real-zero", 0.0);
+        let zero_echo = echo_provider(&real_zero);
+
+        let cfg = Config {
+            refresh_seconds: 60,
+            command_timeout_seconds: 5,
+            max_concurrent_refreshes: 4,
+            refresh_deadline_seconds: 5,
+            sources: vec![
+                Source::Command {
+                    program: "/nonexistent/cli/for/test".into(),
+                    args: vec![],
+                    timeout_seconds: None,
+                },
+                Source::Command {
+                    program: "false".into(),
+                    args: vec![],
+                    timeout_seconds: None,
+                },
+                Source::Command {
+                    program: "sleep".into(),
+                    args: vec!["2".into()],
+                    timeout_seconds: Some(1),
+                },
+                Source::File { path: missing_file },
+                zero_echo,
+            ],
+            forecast: ForecastConfig::default(),
+        };
+
+        let state = refresh(&cfg);
+        assert_eq!(state.providers.len(), 5);
+
+        let missing_cli = &state.providers[0];
+        assert_eq!(missing_cli.status, "unavailable");
+        assert_eq!(
+            missing_cli.reason.as_deref(),
+            Some(REASON_CLI_NOT_INSTALLED)
+        );
+        assert_eq!(missing_cli.windows[0].remaining_percent, None);
+
+        let failing_cmd = &state.providers[1];
+        assert_eq!(failing_cmd.status, "unavailable");
+        assert_eq!(failing_cmd.reason.as_deref(), Some(REASON_SOURCE_FAILED));
+        assert_eq!(failing_cmd.windows[0].remaining_percent, None);
+
+        let slow_cmd = &state.providers[2];
+        assert_eq!(slow_cmd.status, "unavailable");
+        assert_eq!(slow_cmd.reason.as_deref(), Some(REASON_TIMEOUT));
+        assert_eq!(slow_cmd.windows[0].remaining_percent, None);
+
+        let missing_file_p = &state.providers[3];
+        assert_eq!(missing_file_p.status, "unavailable");
+        assert_eq!(missing_file_p.reason.as_deref(), Some(REASON_SOURCE_FAILED));
+        assert_eq!(missing_file_p.windows[0].remaining_percent, None);
+
+        let real_zero_p = &state.providers[4];
+        assert_eq!(real_zero_p.status, "fresh");
+        assert_eq!(real_zero_p.reason, None);
+        assert_eq!(real_zero_p.windows[0].remaining_percent, Some(0.0));
+
+        let json_output = agent_meter::JsonOutput::from_state(&state);
+        let value = serde_json::to_value(&json_output).unwrap();
+        assert_eq!(
+            value["providers"][4]["windows"][0]["remaining_percent"],
+            0.0
+        );
+        assert!(value["providers"][4].get("reason").is_none());
+    }
+
+    #[test]
+    fn forecast_history_ignores_unknown_and_fires_no_notifications() {
+        let dir = tempfile::tempdir().unwrap();
+        let history_file = dir.path().join("history.json");
+        let notifications_file = dir.path().join("notifications.json");
+        let forecast_cfg = ForecastConfig {
+            enabled: true,
+            max_observations_per_window: 10,
+            stale_after_seconds: 600,
+            notify_thresholds: vec![100.0, 25.0, 0.0],
+            history_path: Some(history_file.clone()),
+            notifications_path: Some(notifications_file.clone()),
+        };
+        let state = AgentMeterState {
+            version: STATE_VERSION,
+            generated_at: Utc::now(),
+            providers: vec![
+                unavailable("codex", "missing codex", REASON_CLI_NOT_INSTALLED),
+                unavailable("antigravity", "failed agy", REASON_SOURCE_FAILED),
+            ],
+        };
+        update_forecast_history(&forecast_cfg, &state);
+        let loaded = forecast::load_history(&history_file).unwrap();
+        assert!(loaded.windows.is_empty());
+        assert!(!notifications_file.exists());
     }
 }
