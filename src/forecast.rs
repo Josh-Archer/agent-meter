@@ -1000,4 +1000,104 @@ mod tests {
         assert_eq!(forecast.observation_count, 4);
         assert!(forecast.estimated_exhaustion_at.is_some());
     }
+
+    #[test]
+    fn unknown_and_null_remaining_percent_never_record_or_notify() {
+        use crate::{ProviderState, UsageWindow};
+
+        let now = Utc.with_ymd_and_hms(2026, 3, 18, 12, 0, 0).unwrap();
+        let mut history = UsageHistory {
+            version: HISTORY_VERSION,
+            windows: Vec::new(),
+        };
+        let state = AgentMeterState {
+            version: 1,
+            generated_at: now,
+            providers: vec![
+                ProviderState {
+                    id: "codex".into(),
+                    label: "Codex".into(),
+                    icon: "codex".into(),
+                    status: "unavailable".into(),
+                    reason: Some("cli_not_installed".into()),
+                    windows: vec![UsageWindow {
+                        id: "availability".into(),
+                        label: "Availability".into(),
+                        remaining_percent: None,
+                        resets_at: None,
+                        reset_label: None,
+                    }],
+                    detail: Some("missing cli".into()),
+                    usage_url: None,
+                    updated_at: Some(now),
+                },
+                ProviderState {
+                    id: "antigravity".into(),
+                    label: "Antigravity".into(),
+                    icon: "antigravity".into(),
+                    status: "stale".into(),
+                    reason: Some("cli_not_installed".into()),
+                    windows: vec![UsageWindow {
+                        id: "availability".into(),
+                        label: "Availability".into(),
+                        remaining_percent: None,
+                        resets_at: None,
+                        reset_label: None,
+                    }],
+                    detail: Some("missing agy".into()),
+                    usage_url: None,
+                    updated_at: Some(now),
+                },
+                ProviderState {
+                    id: "grok".into(),
+                    label: "Grok".into(),
+                    icon: "grok".into(),
+                    status: "fresh".into(),
+                    reason: None,
+                    windows: vec![UsageWindow {
+                        id: "daily".into(),
+                        label: "Daily".into(),
+                        remaining_percent: None,
+                        resets_at: None,
+                        reset_label: None,
+                    }],
+                    detail: Some("no percent".into()),
+                    usage_url: None,
+                    updated_at: Some(now),
+                },
+            ],
+        };
+
+        record_state(&mut history, &state, now, 288);
+        assert!(history.windows.is_empty());
+
+        let events = check_notifications(&mut history, &[100.0, 25.0, 0.0], now, 600);
+        assert!(events.is_empty());
+
+        let zero_state = AgentMeterState {
+            version: 1,
+            generated_at: now,
+            providers: vec![ProviderState {
+                id: "claude".into(),
+                label: "Claude".into(),
+                icon: "claude".into(),
+                status: "fresh".into(),
+                reason: None,
+                windows: vec![UsageWindow {
+                    id: "five_hour".into(),
+                    label: "5h".into(),
+                    remaining_percent: Some(0.0),
+                    resets_at: None,
+                    reset_label: None,
+                }],
+                detail: Some("exhausted".into()),
+                usage_url: None,
+                updated_at: Some(now),
+            }],
+        };
+        record_state(&mut history, &zero_state, now, 288);
+        assert_eq!(history.windows.len(), 1);
+        let zero_events = check_notifications(&mut history, &[25.0, 0.0], now, 600);
+        assert_eq!(zero_events.len(), 2);
+    }
 }

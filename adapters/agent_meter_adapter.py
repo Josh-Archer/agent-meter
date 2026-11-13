@@ -27,7 +27,20 @@ import urllib.parse
 from typing import Any
 
 
-def unavailable(identifier: str, label: str, icon: str, detail: str) -> dict[str, Any]:
+REASON_CLI_NOT_INSTALLED = "cli_not_installed"
+REASON_SOURCE_FAILED = "source_failed"
+REASON_TIMEOUT = "timeout"
+
+
+def _cli_installed(command: str) -> bool:
+    """True when ``command`` is an executable the adapter can start."""
+    if os.path.sep in command:
+        return os.path.isfile(command) and os.access(command, os.X_OK)
+    return shutil.which(command) is not None
+
+
+def _cli_not_installed(identifier: str, label: str, icon: str, detail: str) -> dict[str, Any]:
+    """Unknown usage because the provider CLI is not installed on this host."""
     return {
         "id": identifier,
         "label": label,
@@ -36,12 +49,36 @@ def unavailable(identifier: str, label: str, icon: str, detail: str) -> dict[str
             {
                 "id": "availability",
                 "label": "Availability",
-                "remaining_percent": 0.0,
+                "remaining_percent": None,
+            }
+        ],
+        "status": "stale",
+        "detail": detail,
+        "reason": REASON_CLI_NOT_INSTALLED,
+    }
+
+
+def unavailable(
+    identifier: str,
+    label: str,
+    icon: str,
+    detail: str,
+    reason: str = REASON_SOURCE_FAILED,
+) -> dict[str, Any]:
+    return {
+        "id": identifier,
+        "label": label,
+        "icon": icon,
+        "windows": [
+            {
+                "id": "availability",
+                "label": "Availability",
                 "reset_label": "unavailable",
             }
         ],
         "status": "unavailable",
         "detail": detail,
+        "reason": reason,
     }
 
 
@@ -152,6 +189,13 @@ def _read_lines_with_deadline(
 
 def codex(timeout: float | None = None) -> dict[str, Any]:
     command = os.environ.get("AGENT_METER_CODEX_BIN", "codex")
+    if not _cli_installed(command):
+        return _cli_not_installed(
+            "codex",
+            "Codex",
+            "codex",
+            f"{command} is not installed; install Codex and sign in to see usage.",
+        )
     if timeout is None:
         timeout = float(os.environ.get("AGENT_METER_CODEX_TIMEOUT", "30"))
     deadline = time.monotonic() + timeout
@@ -201,8 +245,25 @@ def codex(timeout: float | None = None) -> dict[str, Any]:
                     raise RuntimeError("Codex did not authorize a rate-limit read")
                 return normalize_codex(message["result"])
         raise RuntimeError("Codex app server ended before returning rate limits")
-    except (OSError, ValueError, KeyError, RuntimeError, json.JSONDecodeError, TimeoutError) as error:
-        return unavailable("codex", "Codex", "codex", f"Codex usage unavailable: {error}")
+    except FileNotFoundError:
+        return _cli_not_installed(
+            "codex",
+            "Codex",
+            "codex",
+            f"{command} is not installed; install Codex and sign in to see usage.",
+        )
+    except TimeoutError as error:
+        return unavailable(
+            "codex", "Codex", "codex",
+            f"Codex usage unavailable: {error}",
+            reason=REASON_TIMEOUT,
+        )
+    except (OSError, ValueError, KeyError, RuntimeError, json.JSONDecodeError) as error:
+        return unavailable(
+            "codex", "Codex", "codex",
+            f"Codex usage unavailable: {error}",
+            reason=REASON_SOURCE_FAILED,
+        )
     finally:
         if "child" in locals():
             if child.poll() is None:
@@ -344,11 +405,16 @@ def normalize_agy(result: dict[str, Any]) -> dict[str, Any]:
 def claude() -> dict[str, Any]:
     state_home = os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state"))
     path = os.path.join(state_home, "agent-meter", "claude.json")
+    claude_cmd = os.environ.get("AGENT_METER_CLAUDE_BIN", "claude")
+    missing_reason = (
+        REASON_SOURCE_FAILED if _cli_installed(claude_cmd) else REASON_CLI_NOT_INSTALLED
+    )
     if not os.path.exists(path):
         return unavailable(
             "claude", "Claude Code", "claude",
             "No Claude Code status-line data received yet. "
             "Configure Claude Code statusLine command to ~/.local/bin/agent-meter-claude-statusline",
+            reason=missing_reason,
         )
     try:
         with open(path, encoding="utf-8") as f:
@@ -359,6 +425,18 @@ def claude() -> dict[str, Any]:
         else:
             # Re-normalize raw status-line JSON that ended up in the file.
             state = normalize_claude(payload)
+
+        if state.get("status") in ("unavailable", "error") and all(
+            isinstance(w, dict) and w.get("id") == "availability"
+            for w in state.get("windows", [])
+        ):
+            return unavailable(
+                "claude",
+                "Claude Code",
+                "claude",
+                str(state.get("detail") or "No Claude Code status-line data received yet."),
+                reason=str(state.get("reason") or missing_reason),
+            )
 
         age_seconds = max(0.0, dt.datetime.now().timestamp() - os.path.getmtime(path))
         now = dt.datetime.now(dt.UTC)
@@ -379,21 +457,46 @@ def claude() -> dict[str, Any]:
             state["detail"] = "Claude usage is cached; run Claude Code once to refresh its status line."
         return state
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
-        return unavailable("claude", "Claude Code", "claude", f"Claude Code state unreadable: {error}")
+        return unavailable(
+            "claude", "Claude Code", "claude",
+            f"Claude Code state unreadable: {error}",
+            reason=REASON_SOURCE_FAILED,
+        )
 
 
 def agy() -> dict[str, Any]:
     command = os.environ.get("AGENT_METER_AGY_BIN", "agy")
+    if not _cli_installed(command):
+        return _cli_not_installed(
+            "antigravity",
+            "Antigravity",
+            "antigravity",
+            f"{command} is not installed; install Antigravity (agy) and sign in to see usage.",
+        )
     try:
         output = subprocess.run(
             [command, "-p", "/usage", "--output-format", "json", "--print-timeout", "20s"],
             check=True, capture_output=True, text=True, timeout=30,
         )
         return normalize_agy(json.loads(output.stdout))
+    except FileNotFoundError:
+        return _cli_not_installed(
+            "antigravity",
+            "Antigravity",
+            "antigravity",
+            f"{command} is not installed; install Antigravity (agy) and sign in to see usage.",
+        )
+    except subprocess.TimeoutExpired as error:
+        return unavailable(
+            "antigravity", "Antigravity", "antigravity",
+            f"Antigravity usage unavailable; run agy and sign in if prompted: {error}",
+            reason=REASON_TIMEOUT,
+        )
     except (OSError, ValueError, KeyError, json.JSONDecodeError, subprocess.SubprocessError) as error:
         return unavailable(
             "antigravity", "Antigravity", "antigravity",
             f"Antigravity usage unavailable; run agy and sign in if prompted: {error}",
+            reason=REASON_SOURCE_FAILED,
         )
 
 
@@ -567,13 +670,18 @@ def normalize_omp_grok_usage(payload: dict[str, Any], now: dt.datetime | None = 
     }
 
 
-def _grok_from_omp(now: dt.datetime | None = None) -> dict[str, Any] | None:
-    """Return a live OMP report stamped with the fetch time, or None."""
+def _omp_bin() -> str:
     omp = os.environ.get("AGENT_METER_OMP_BIN", "omp")
     if omp == "omp":
         bun_omp = os.path.expanduser("~/.bun/bin/omp")
         if os.path.isfile(bun_omp) and os.access(bun_omp, os.X_OK):
             omp = bun_omp
+    return omp
+
+
+def _grok_from_omp_status(now: dt.datetime | None = None) -> tuple[dict[str, Any] | None, bool]:
+    """Return ``(live OMP report, timed_out)``."""
+    omp = _omp_bin()
     try:
         environment = os.environ.copy()
         omp_dir = os.path.dirname(omp)
@@ -584,9 +692,17 @@ def _grok_from_omp(now: dt.datetime | None = None) -> dict[str, Any] | None:
             check=True, capture_output=True, text=True, timeout=30, env=environment,
         )
         fetched_at = now or dt.datetime.now(dt.UTC)
-        return normalize_omp_grok_usage(json.loads(output.stdout), now=fetched_at)
+        return normalize_omp_grok_usage(json.loads(output.stdout), now=fetched_at), False
+    except subprocess.TimeoutExpired:
+        return None, True
     except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError):
-        return None
+        return None, False
+
+
+def _grok_from_omp(now: dt.datetime | None = None) -> dict[str, Any] | None:
+    """Return a live OMP report stamped with the fetch time, or None."""
+    state, _ = _grok_from_omp_status(now)
+    return state
 
 
 def _grok_log_path() -> str:
@@ -720,8 +836,15 @@ def _read_appended_billing(log_path: str, offset: int) -> tuple[dt.datetime | No
     return _newest_billing_time_from_text(text), offset + len(data)
 
 
-def _refresh_grok_billing_snapshot(log_path: str, previous: dt.datetime | None) -> bool:
+def _grok_cli_installed() -> bool:
+    binary = _grok_bin()
+    return bool(binary and _cli_installed(binary))
+
+
+def _refresh_grok_billing_snapshot_status(log_path: str, previous: dt.datetime | None) -> tuple[bool, bool]:
     """Start Grok long enough for it to append a newer billing snapshot.
+
+    Returns ``(refreshed, timed_out)``.
 
     Grok writes ``billing: fetched credits config`` during session startup.
     ``grok usage`` on the shell route does not. The CLI is started on a
@@ -730,13 +853,14 @@ def _refresh_grok_billing_snapshot(log_path: str, previous: dt.datetime | None) 
     stay on that PTY and are discarded. Auth files are not read.
     """
     binary = _grok_bin()
-    if not binary:
-        return False
+    if not binary or not _cli_installed(binary):
+        return False, False
     timeout = _grok_refresh_timeout_seconds()
     cwd = ""
     master: int | None = None
     slave: int | None = None
     proc: subprocess.Popen[bytes] | None = None
+    timed_out = False
     try:
         cwd = _grok_refresh_cwd()
         try:
@@ -770,11 +894,12 @@ def _refresh_grok_billing_snapshot(log_path: str, previous: dt.datetime | None) 
             while time.monotonic() < deadline:
                 observed, offset = _read_appended_billing(log_path, offset)
                 if observed is not None and (previous is None or observed > previous):
-                    return True
+                    return True, False
                 if proc.poll() is not None:
                     break
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    timed_out = True
                     break
                 events = selector.select(timeout=min(0.2, remaining))
                 pty_closed = False
@@ -788,16 +913,19 @@ def _refresh_grok_billing_snapshot(log_path: str, previous: dt.datetime | None) 
                 # A closed PTY stays readable. Sleep so the log poll does not spin.
                 if pty_closed:
                     time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+            else:
+                timed_out = proc.poll() is None
         finally:
             selector.close()
         observed, _offset = _read_appended_billing(log_path, offset)
-        return observed is not None and (previous is None or observed > previous)
+        refreshed = observed is not None and (previous is None or observed > previous)
+        return refreshed, (timed_out and not refreshed)
     except (OSError, subprocess.SubprocessError):
         try:
             observed, _offset = _read_appended_billing(log_path, 0)
         except OSError:
-            return False
-        return observed is not None and (previous is None or observed > previous)
+            return False, False
+        return observed is not None and (previous is None or observed > previous), False
     finally:
         if slave is not None:
             try:
@@ -818,7 +946,12 @@ def _refresh_grok_billing_snapshot(log_path: str, previous: dt.datetime | None) 
                 pass
 
 
-def _grok_from_log(now: dt.datetime | None = None) -> dict[str, Any]:
+def _refresh_grok_billing_snapshot(log_path: str, previous: dt.datetime | None) -> bool:
+    refreshed, _ = _refresh_grok_billing_snapshot_status(log_path, previous)
+    return refreshed
+
+
+def _grok_from_log(now: dt.datetime | None = None, *, omp_timed_out: bool = False) -> dict[str, Any]:
     """Normalize the Grok Build log, refreshing a stale snapshot first.
 
     This path does not invoke OMP and does not read Grok's auth store. When
@@ -832,30 +965,41 @@ def _grok_from_log(now: dt.datetime | None = None) -> dict[str, Any]:
         records = _read_grok_log(log_path)
     except OSError:
         records = None
+    refresh_timed_out = False
     if records is None or _grok_log_needs_refresh(records, now):
         previous = _newest_billing_time(records or [])
-        if _refresh_grok_billing_snapshot(log_path, previous):
+        refreshed, refresh_timed_out = _refresh_grok_billing_snapshot_status(log_path, previous)
+        if refreshed:
             try:
                 records = _read_grok_log(log_path)
             except OSError:
                 records = None
+    if records is None and not omp_timed_out and not _cli_installed(_omp_bin()) and not _grok_cli_installed():
+        return _cli_not_installed(
+            "grok",
+            "Grok Build",
+            "grok",
+            "grok is not installed; install Grok Build and sign in to see usage.",
+        )
     try:
         if records is None:
             raise OSError(log_path)
         return normalize_grok(records, now=now)
     except (OSError, ValueError, TypeError) as error:
+        reason = REASON_TIMEOUT if (refresh_timed_out or omp_timed_out) else REASON_SOURCE_FAILED
         return unavailable(
             "grok", "Grok Build", "grok",
             f"Grok usage unavailable; start Grok Build once after signing in: {error}",
+            reason=reason,
         )
 
 
 def grok(now: dt.datetime | None = None) -> dict[str, Any]:
     """Prefer a live OMP report; otherwise read the Grok Build log on its own."""
-    omp_state = _grok_from_omp(now)
+    omp_state, omp_timed_out = _grok_from_omp_status(now)
     if omp_state is not None:
         return omp_state
-    return _grok_from_log(now)
+    return _grok_from_log(now, omp_timed_out=omp_timed_out)
 
 
 def unavailable_provider(name: str) -> dict[str, Any]:
@@ -1124,6 +1268,13 @@ def normalize_copilot_quota(payload: Any, now: dt.datetime | None = None) -> dic
 
 
 def copilot() -> dict[str, Any]:
+    if not _cli_installed("node"):
+        return _cli_not_installed(
+            "copilot",
+            "GitHub Copilot",
+            "copilot",
+            "node is not installed; install Node.js and Copilot CLI to see usage.",
+        )
     try:
         data_home = os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))
         helper = os.environ.get(
@@ -1132,10 +1283,24 @@ def copilot() -> dict[str, Any]:
         )
         payload = copilot_json(["node", helper])
         return normalize_copilot_quota(payload)
+    except FileNotFoundError:
+        return _cli_not_installed(
+            "copilot",
+            "GitHub Copilot",
+            "copilot",
+            "node is not installed; install Node.js and Copilot CLI to see usage.",
+        )
+    except subprocess.TimeoutExpired as error:
+        return unavailable(
+            "copilot", "GitHub Copilot", "copilot",
+            f"GitHub Copilot quota unavailable; launch Copilot CLI and use /login once: {error}",
+            reason=REASON_TIMEOUT,
+        )
     except (OSError, ValueError, TypeError, json.JSONDecodeError, subprocess.SubprocessError) as error:
         return unavailable(
             "copilot", "GitHub Copilot", "copilot",
             f"GitHub Copilot quota unavailable; launch Copilot CLI and use /login once: {error}",
+            reason=REASON_SOURCE_FAILED,
         )
 
 
@@ -1989,7 +2154,7 @@ def _muse_without_live_usage(
     try:
         cached_state = _muse_from_cache(now)
     except (TypeError, ValueError) as cache_error:
-        return _muse_unavailable(f"Muse usage unavailable: {cache_error}")
+        return _muse_unavailable(f"Muse usage unavailable: {cache_error}", reason=REASON_SOURCE_FAILED)
     if cached_state is not None:
         return cached_state
     # A probe that just ran reports its own error. A later refresh, with no
@@ -2001,9 +2166,12 @@ def _muse_without_live_usage(
     if error is None:
         return _muse_unavailable(
             "Muse usage unavailable: muse serve ended before reporting usage",
+            reason=REASON_SOURCE_FAILED,
         )
+    reason = REASON_TIMEOUT if isinstance(error, TimeoutError) else REASON_SOURCE_FAILED
     return _muse_unavailable(
         f"Muse usage unavailable: {error}",
+        reason=reason,
     )
 
 
@@ -2025,18 +2193,8 @@ def _classify_probe_result(
     return live
 
 
-_MUSE_REASON_CLI_NOT_INSTALLED = "cli_not_installed"
-
-
-def _muse_cli_installed(command: str) -> bool:
-    """True when ``command`` is an executable the probe can start.
-
-    A missing or non-executable binary is not a quota reading. Callers must
-    not report that case as 0% remaining.
-    """
-    if os.path.sep in command:
-        return os.path.isfile(command) and os.access(command, os.X_OK)
-    return shutil.which(command) is not None
+_MUSE_REASON_CLI_NOT_INSTALLED = REASON_CLI_NOT_INSTALLED
+_muse_cli_installed = _cli_installed
 
 
 def _muse_cli_not_installed() -> dict[str, Any]:
@@ -2047,21 +2205,12 @@ def _muse_cli_not_installed() -> dict[str, Any]:
     consumer this host has no Muse CLI, which is distinct from an exhausted
     quota (``usedPercent`` of 100).
     """
-    return {
-        "id": "muse",
-        "label": "Muse",
-        "icon": "muse",
-        "windows": [
-            {
-                "id": "availability",
-                "label": "Availability",
-                "remaining_percent": None,
-            }
-        ],
-        "status": "stale",
-        "detail": "muse is not installed; install Muse and sign in to see usage.",
-        "reason": _MUSE_REASON_CLI_NOT_INSTALLED,
-    }
+    return _cli_not_installed(
+        "muse",
+        "Muse",
+        "muse",
+        "muse is not installed; install Muse and sign in to see usage.",
+    )
 
 
 def muse(now: dt.datetime | None = None) -> dict[str, Any]:

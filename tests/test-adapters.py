@@ -930,10 +930,28 @@ def test_grok_never_infers_quota_from_auth_file() -> None:
             "AGENT_METER_OMP_BIN": "/nonexistent/omp-for-test",
             "AGENT_METER_GROK_BIN": "/nonexistent/grok-for-test",
         }):
-            state = adapter.grok()
-    assert state["status"] == "unavailable"
-    assert "private@example.invalid" not in state["detail"]
-    assert "secret" not in state["detail"]
+            missing_state = adapter.grok()
+
+        failing = Path(tmp) / "grok"
+        _write_executable(failing, "#!/bin/sh\nexit 1\n")
+        with patched_env({
+            "HOME": tmp,
+            "AGENT_METER_OMP_BIN": "/nonexistent/omp-for-test",
+            "AGENT_METER_GROK_BIN": str(failing),
+        }):
+            failed_state = adapter.grok()
+
+    assert missing_state["status"] == "stale"
+    assert missing_state["reason"] == "cli_not_installed"
+    assert missing_state["windows"][0].get("remaining_percent") is None
+    assert "private@example.invalid" not in missing_state["detail"]
+    assert "secret" not in missing_state["detail"]
+
+    assert failed_state["status"] == "unavailable"
+    assert failed_state["reason"] == "source_failed"
+    assert failed_state["windows"][0].get("remaining_percent") is None
+    assert "private@example.invalid" not in failed_state["detail"]
+    assert "secret" not in failed_state["detail"]
 
 
 def test_copilot_env_allowance() -> None:
@@ -2326,6 +2344,25 @@ def test_json_schema_output() -> None:
                     "status": "unavailable",
                     "reason": "server_sent_no_usage",
                 },
+                {
+                    "id": "antigravity",
+                    "label": "Antigravity",
+                    "icon": "antigravity",
+                    "windows": [
+                        {"id": "availability", "label": "Availability"},
+                    ],
+                    "status": "unavailable",
+                    "reason": "cli_not_installed",
+                },
+                {
+                    "id": "claude",
+                    "label": "Claude Code",
+                    "icon": "claude",
+                    "windows": [
+                        {"id": "five_hour", "label": "5 hours", "remaining_percent": 0.0},
+                    ],
+                    "status": "fresh",
+                },
             ],
         }
         state_file.write_text(json.dumps(sample_state))
@@ -2336,7 +2373,7 @@ def test_json_schema_output() -> None:
         data = json.loads(proc.stdout)
         assert data["schema_version"] == 1
         assert isinstance(data["providers"], list)
-        assert len(data["providers"]) == 3
+        assert len(data["providers"]) == 5
 
         codex = data["providers"][0]
         assert codex["provider"] == "codex"
@@ -2360,6 +2397,160 @@ def test_json_schema_output() -> None:
         assert muse["stale"] is False
         assert muse["reason"] == "server_sent_no_usage"
         assert "remaining_percent" not in muse["windows"][0]
+
+        agy = data["providers"][3]
+        assert agy["provider"] == "antigravity"
+        assert agy["available"] is False
+        assert agy["stale"] is False
+        assert agy["reason"] == "cli_not_installed"
+        assert "remaining_percent" not in agy["windows"][0]
+
+        claude = data["providers"][4]
+        assert claude["provider"] == "claude"
+        assert claude["available"] is True
+        assert claude["stale"] is False
+        assert "reason" not in claude
+        assert claude["windows"][0]["remaining_percent"] == 0.0
+
+
+def test_missing_cli_never_emits_zero_all_providers() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        empty_bin = Path(tmp) / "empty-bin"
+        empty_bin.mkdir()
+        home_dir = Path(tmp) / "home"
+        home_dir.mkdir()
+        with patched_env({
+            "PATH": str(empty_bin),
+            "HOME": str(home_dir),
+            "XDG_STATE_HOME": str(Path(tmp) / "state"),
+            "XDG_CONFIG_HOME": str(Path(tmp) / "config"),
+            "XDG_CACHE_HOME": str(Path(tmp) / "cache"),
+            "AGENT_METER_CODEX_BIN": "/nonexistent/codex-bin",
+            "AGENT_METER_AGY_BIN": "/nonexistent/agy-bin",
+            "AGENT_METER_OMP_BIN": "/nonexistent/omp-bin",
+            "AGENT_METER_GROK_BIN": "/nonexistent/grok-bin",
+            "AGENT_METER_COPILOT_BIN": "/nonexistent/copilot-bin",
+            "AGENT_METER_MUSE_BIN": "/nonexistent/muse-bin",
+            "AGENT_METER_MUSE_PROBE": None,
+        }):
+            codex_state = adapter.codex()
+            agy_state = adapter.agy()
+            grok_state = adapter.grok()
+            claude_state = adapter.claude()
+            copilot_state = adapter.copilot()
+            muse_state = adapter.muse()
+
+    for name, state in [
+        ("codex", codex_state),
+        ("agy", agy_state),
+        ("grok", grok_state),
+        ("copilot", copilot_state),
+        ("muse", muse_state),
+    ]:
+        assert state["status"] == "stale", (name, state)
+        assert state["reason"] == "cli_not_installed", (name, state)
+        assert state["windows"][0]["id"] == "availability", (name, state)
+        assert state["windows"][0].get("remaining_percent") is None, (name, state)
+
+    assert claude_state["status"] == "unavailable", claude_state
+    assert claude_state["reason"] == "cli_not_installed", claude_state
+    assert claude_state["windows"][0].get("remaining_percent") is None, claude_state
+
+
+def test_failing_adapter_and_real_zero_all_providers() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        home_dir = Path(tmp) / "home"
+        home_dir.mkdir()
+        empty_bin = Path(tmp) / "bin"
+        empty_bin.mkdir()
+
+        fail_codex = empty_bin / "codex"
+        _write_executable(fail_codex, "#!/bin/sh\necho 'boom' >&2\nexit 1\n")
+        fail_agy = empty_bin / "agy"
+        _write_executable(fail_agy, "#!/bin/sh\necho 'agy boom' >&2\nexit 2\n")
+        fail_grok = empty_bin / "grok"
+        _write_executable(fail_grok, "#!/bin/sh\necho 'grok boom' >&2\nexit 1\n")
+        fake_claude = empty_bin / "claude"
+        _write_executable(fake_claude, "#!/bin/sh\nexit 0\n")
+        fail_copilot = empty_bin / "copilot"
+        _write_executable(fail_copilot, "#!/bin/sh\nexit 0\n")
+        fake_node = empty_bin / "node"
+        _write_executable(fake_node, "#!/bin/sh\nexit 1\n")
+        fail_muse = empty_bin / "muse"
+        _write_executable(fail_muse, "#!/bin/sh\nexit 2\n")
+
+        with patched_env({
+            "PATH": str(empty_bin),
+            "HOME": str(home_dir),
+            "XDG_STATE_HOME": str(Path(tmp) / "state"),
+            "XDG_CONFIG_HOME": str(Path(tmp) / "config"),
+            "XDG_CACHE_HOME": str(Path(tmp) / "cache"),
+            "AGENT_METER_CODEX_BIN": str(fail_codex),
+            "AGENT_METER_AGY_BIN": str(fail_agy),
+            "AGENT_METER_OMP_BIN": "/nonexistent/omp-bin",
+            "AGENT_METER_GROK_BIN": str(fail_grok),
+            "AGENT_METER_COPILOT_BIN": str(fail_copilot),
+            "AGENT_METER_MUSE_BIN": str(fail_muse),
+            "AGENT_METER_MUSE_PROBE": None,
+        }):
+            failed_states = {
+                "codex": adapter.codex(),
+                "agy": adapter.agy(),
+                "grok": adapter.grok(),
+                "claude": adapter.claude(),
+                "copilot": adapter.copilot(),
+                "muse": adapter.muse(),
+                "generic": adapter.unavailable("generic", "Generic", "generic", "probe failed"),
+            }
+
+        for name, state in failed_states.items():
+            assert state["status"] == "unavailable", (name, state)
+            expected_reason = "usage_command_failed" if name == "muse" else "source_failed"
+            assert state["reason"] == expected_reason, (name, state)
+            assert "remaining_percent" not in state["windows"][0], (name, state)
+
+        # Real 0% still serializes as 0.0 with no reason
+        state_dir = Path(tmp) / "state" / "agent-meter"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / "claude.json").write_text(json.dumps({
+            "id": "claude",
+            "label": "Claude Code",
+            "icon": "claude",
+            "windows": [{"id": "five_hour", "label": "5 hours", "remaining_percent": 0.0}],
+            "status": "fresh",
+            "detail": "Claude Code status-line rate limits",
+        }))
+        with patched_env({"XDG_STATE_HOME": str(Path(tmp) / "state")}):
+            claude_zero = adapter.claude()
+        assert claude_zero["status"] == "fresh"
+        assert "reason" not in claude_zero
+        assert claude_zero["windows"][0]["remaining_percent"] == 0.0
+
+        codex_zero = adapter.normalize_codex({
+            "rateLimits": {"primary": {"usedPercent": 100.0, "windowDurationMins": 300, "resetsAt": 1790000000}}
+        })
+        assert codex_zero["status"] == "fresh"
+        assert "reason" not in codex_zero
+        assert codex_zero["windows"][0]["remaining_percent"] == 0.0
+
+        agy_zero = adapter.normalize_agy({
+            "quota_summary": {
+                "groups": [{
+                    "display_name": "Gemini Models",
+                    "buckets": [
+                        {"window": "5h", "remaining_pct": 0.0, "reset_time": "2026-09-16T22:00:00Z"},
+                    ],
+                }]
+            }
+        })
+        assert agy_zero["status"] == "fresh"
+        assert "reason" not in agy_zero
+        assert agy_zero["windows"][0]["remaining_percent"] == 0.0
+
+        copilot_zero = adapter.normalize_copilot({"total_credits": 300}, allowance=300)
+        assert copilot_zero["status"] == "fresh"
+        assert "reason" not in copilot_zero
+        assert copilot_zero["windows"][0]["remaining_percent"] == 0.0
 
 
 if __name__ == "__main__":
@@ -2449,4 +2640,6 @@ if __name__ == "__main__":
     test_muse_probe_after_interval_probes_once()
     test_resets_at_iso8601_all_providers()
     test_json_schema_output()
+    test_missing_cli_never_emits_zero_all_providers()
+    test_failing_adapter_and_real_zero_all_providers()
     print("Adapter normalization checks passed")
