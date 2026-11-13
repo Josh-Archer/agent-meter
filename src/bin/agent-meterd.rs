@@ -895,12 +895,7 @@ fn update_forecast_history(config: &ForecastConfig, state: &AgentMeterState) {
         .unwrap_or_else(forecast::default_history_path);
     let mut history = forecast::load_history(&history_path).unwrap_or_default();
     let now = Utc::now();
-    forecast::record_state(
-        &mut history,
-        state,
-        now,
-        config.max_observations_per_window,
-    );
+    forecast::record_state(&mut history, state, now, config.max_observations_per_window);
     if let Err(err) = forecast::save_history(&history_path, &history) {
         eprintln!("agent-meterd: could not write usage history: {err}");
     }
@@ -992,10 +987,7 @@ fn main() -> Result<()> {
             .unwrap_or_else(default_ingest_tokens_path);
         warn_token_file_mode(&token_path);
         let listener = usage::serve(spec, args.listen_any, &token_path, store)?;
-        eprintln!(
-            "agent-meterd: usage ingest listening on {}",
-            listener.addr
-        );
+        eprintln!("agent-meterd: usage ingest listening on {}", listener.addr);
         Some(listener)
     } else {
         None

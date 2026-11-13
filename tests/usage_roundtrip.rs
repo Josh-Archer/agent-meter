@@ -63,7 +63,11 @@ fn daemon_drains_inbox_and_usage_cli_prints_the_event() {
         "dispatch_run_id": null,
         "repo": "Josh-Archer/agent-meter"
     });
-    fs::write(inbox.join("event.json"), serde_json::to_vec(&event).unwrap()).unwrap();
+    fs::write(
+        inbox.join("event.json"),
+        serde_json::to_vec(&event).unwrap(),
+    )
+    .unwrap();
 
     let state_file = runtime.join("agent-meter").join("state.json");
     let daemon = Command::new(debug_bin("agent-meterd"))

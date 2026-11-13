@@ -161,9 +161,9 @@ impl WindowForecast {
     pub fn to_json(&self) -> JsonForecast {
         JsonForecast {
             status: self.status,
-            estimated_exhaustion_at: self.estimated_exhaustion_at.map(|dt| {
-                dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
-            }),
+            estimated_exhaustion_at: self
+                .estimated_exhaustion_at
+                .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, false)),
             exhausts_before_reset: self.exhausts_before_reset,
             consumption_rate_percent_per_hour: self.consumption_rate_percent_per_hour,
             depleting: self.depleting,
@@ -333,8 +333,8 @@ pub fn forecast_window(
     // Extrapolate the fitted line to zero remaining.
     let last = points.last().expect("non-empty");
     let seconds_to_zero = last.1 / -slope;
-    let estimated = newest.observed_at
-        + chrono::Duration::seconds(seconds_to_zero.max(0.0).round() as i64);
+    let estimated =
+        newest.observed_at + chrono::Duration::seconds(seconds_to_zero.max(0.0).round() as i64);
     let exhausts_before_reset = base.resets_at.map(|reset| estimated < reset);
     WindowForecast {
         status: ForecastStatus::Ok,
@@ -392,19 +392,22 @@ pub fn check_window_thresholds(
         {
             continue;
         }
-        entry.notified.push(ThresholdNotice { threshold, cycle: cycle.clone() });
+        entry.notified.push(ThresholdNotice {
+            threshold,
+            cycle: cycle.clone(),
+        });
         events.push(ThresholdEvent {
             notified_at: now,
             provider: entry.provider.clone(),
             window: entry.window.clone(),
             threshold,
             remaining_percent: newest.remaining_percent,
-            estimated_exhaustion_at: forecast.estimated_exhaustion_at.map(|dt| {
-                dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
-            }),
-            resets_at: newest.resets_at.map(|dt| {
-                dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
-            }),
+            estimated_exhaustion_at: forecast
+                .estimated_exhaustion_at
+                .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, false)),
+            resets_at: newest
+                .resets_at
+                .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, false)),
         });
     }
     events
@@ -419,7 +422,12 @@ pub fn check_notifications(
 ) -> Vec<ThresholdEvent> {
     let mut events = Vec::new();
     for entry in history.windows.iter_mut() {
-        events.extend(check_window_thresholds(entry, thresholds, now, stale_after_secs));
+        events.extend(check_window_thresholds(
+            entry,
+            thresholds,
+            now,
+            stale_after_secs,
+        ));
     }
     events
 }
@@ -444,10 +452,7 @@ pub fn forecasts_for_json(
 
 /// Resolve the default usage-history path from explicit env values, mirroring
 /// the stable state location: `$XDG_STATE_HOME/agent-meter/usage-history.json`.
-pub fn history_path_from(
-    xdg_state_home: Option<OsString>,
-    home: Option<OsString>,
-) -> PathBuf {
+pub fn history_path_from(xdg_state_home: Option<OsString>, home: Option<OsString>) -> PathBuf {
     let state_path = state_path_from(xdg_state_home, home);
     state_path
         .parent()
@@ -578,7 +583,13 @@ mod tests {
         };
         // 10%/hour decline: 100 -> 0 over 10 hours.
         for (h, remaining) in [(0, 100.0), (1, 90.0), (2, 80.0), (3, 70.0)] {
-            record_observation(&mut history, "codex", "five_hour", obs(h, remaining, base), 288);
+            record_observation(
+                &mut history,
+                "codex",
+                "five_hour",
+                obs(h, remaining, base),
+                288,
+            );
         }
         (history, base + chrono::Duration::hours(3))
     }
@@ -639,7 +650,13 @@ mod tests {
             windows: Vec::new(),
         };
         for (h, remaining) in [(0, 80.0), (1, 70.0), (2, 60.0)] {
-            record_observation(&mut history, "codex", "five_hour", obs(h, remaining, base), 288);
+            record_observation(
+                &mut history,
+                "codex",
+                "five_hour",
+                obs(h, remaining, base),
+                288,
+            );
         }
         let entry = history.window_mut("codex", "five_hour");
         entry.notified.push(ThresholdNotice {
@@ -662,7 +679,13 @@ mod tests {
             windows: Vec::new(),
         };
         for (h, remaining) in [(0, 80.0), (1, 70.0), (2, 72.0)] {
-            record_observation(&mut history, "codex", "five_hour", obs(h, remaining, base), 288);
+            record_observation(
+                &mut history,
+                "codex",
+                "five_hour",
+                obs(h, remaining, base),
+                288,
+            );
         }
         let entry = history.window("codex", "five_hour").unwrap();
         assert_eq!(entry.observations.len(), 3);
@@ -799,7 +822,13 @@ mod tests {
             (4, 95.0),
             (5, 75.0),
         ] {
-            record_observation(&mut history, "codex", "five_hour", obs(h, remaining, base), 288);
+            record_observation(
+                &mut history,
+                "codex",
+                "five_hour",
+                obs(h, remaining, base),
+                288,
+            );
         }
         let entry = history.window("codex", "five_hour").unwrap();
         let forecast = forecast_window(entry, base + chrono::Duration::hours(5), 3600 * 8);
@@ -824,7 +853,13 @@ mod tests {
             );
         }
         for (h, remaining) in [(8, 92.0), (9, 72.0), (10, 52.0), (11, 32.0), (12, 12.0)] {
-            record_observation(&mut history, "codex", "five_hour", obs(h, remaining, base), 288);
+            record_observation(
+                &mut history,
+                "codex",
+                "five_hour",
+                obs(h, remaining, base),
+                288,
+            );
         }
         let entry = history.window("codex", "five_hour").unwrap();
         let forecast = forecast_window(entry, base + chrono::Duration::hours(12), 3600 * 30);
@@ -844,7 +879,13 @@ mod tests {
             windows: Vec::new(),
         };
         for (h, remaining) in [(0, 100.0), (1, 80.0), (2, 60.0), (3, 20.0)] {
-            record_observation(&mut history, "codex", "five_hour", obs(h, remaining, base), 288);
+            record_observation(
+                &mut history,
+                "codex",
+                "five_hour",
+                obs(h, remaining, base),
+                288,
+            );
         }
         let now = base + chrono::Duration::hours(3);
         let entry = history.window_mut("codex", "five_hour");
@@ -877,7 +918,13 @@ mod tests {
             windows: Vec::new(),
         };
         for (h, remaining) in [(0, 100.0), (1, 90.0), (2, 80.0)] {
-            record_observation(&mut history, "codex", "five_hour", obs(h, remaining, base), 288);
+            record_observation(
+                &mut history,
+                "codex",
+                "five_hour",
+                obs(h, remaining, base),
+                288,
+            );
         }
         let now = base + chrono::Duration::hours(2);
         let entry = history.window_mut("codex", "five_hour");
@@ -899,7 +946,13 @@ mod tests {
             windows: Vec::new(),
         };
         for (h, remaining) in [(0, 100.0), (1, 80.0), (2, 60.0), (3, 20.0)] {
-            record_observation(&mut history, "codex", "five_hour", obs(h, remaining, base), 288);
+            record_observation(
+                &mut history,
+                "codex",
+                "five_hour",
+                obs(h, remaining, base),
+                288,
+            );
         }
         let now = base + chrono::Duration::hours(3);
         // Empty thresholds: nothing fires.

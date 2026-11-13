@@ -91,7 +91,10 @@ impl std::fmt::Display for UsageReject {
         match self {
             UsageReject::Schema(msg) => write!(f, "{msg}"),
             UsageReject::TooLarge { size } => {
-                write!(f, "payload is {size} bytes; limit is {MAX_EVENT_BYTES} bytes")
+                write!(
+                    f,
+                    "payload is {size} bytes; limit is {MAX_EVENT_BYTES} bytes"
+                )
             }
         }
     }
@@ -112,7 +115,10 @@ impl std::fmt::Display for AcceptError {
         match self {
             AcceptError::Schema(msg) => write!(f, "{msg}"),
             AcceptError::TooLarge { size } => {
-                write!(f, "payload is {size} bytes; limit is {MAX_EVENT_BYTES} bytes")
+                write!(
+                    f,
+                    "payload is {size} bytes; limit is {MAX_EVENT_BYTES} bytes"
+                )
             }
             AcceptError::Unauthorized => write!(f, "unauthorized"),
             AcceptError::Store(msg) => write!(f, "{msg}"),
@@ -389,9 +395,7 @@ pub fn parse_payload(bytes: &[u8]) -> std::result::Result<Vec<UsageEvent>, Usage
     let events = match &value {
         Value::Object(map) if map.contains_key("events") => {
             if map.len() != 1 {
-                return Err(schema_err(
-                    "a batch object may only contain the events key",
-                ));
+                return Err(schema_err("a batch object may only contain the events key"));
             }
             match map.get("events") {
                 Some(Value::Array(items)) => {
@@ -485,12 +489,8 @@ fn validate_event(event: &UsageEvent) -> std::result::Result<(), UsageReject> {
             "idempotency_key must be 64 lowercase hex characters",
         ));
     }
-    let expected = canonical_idempotency_key(
-        &event.host,
-        &event.harness,
-        &event.session_id,
-        event.seq,
-    );
+    let expected =
+        canonical_idempotency_key(&event.host, &event.harness, &event.session_id, event.seq);
     if !ct_eq(event.idempotency_key.as_bytes(), expected.as_bytes()) {
         return Err(schema_err(
             "idempotency_key must be sha256 hex of host|harness|session_id|seq",
@@ -551,13 +551,13 @@ fn validate_model(model: &ModelUsage) -> std::result::Result<(), UsageReject> {
         {
             Ok(())
         }
-        (None, _) => Err(schema_err(
-            "cost_source must be none when cost_usd is null",
-        )),
+        (None, _) => Err(schema_err("cost_source must be none when cost_usd is null")),
         (Some(_), CostSource::None) => Err(schema_err(
             "cost_source must be harness or estimated when cost_usd is set",
         )),
-        (Some(_), _) => Err(schema_err("cost_usd must be a non-negative finite number or null")),
+        (Some(_), _) => Err(schema_err(
+            "cost_usd must be a non-negative finite number or null",
+        )),
     }
 }
 
@@ -577,9 +577,9 @@ fn is_harness(value: &str) -> bool {
     if bytes.is_empty() || bytes.len() > 64 || !bytes[0].is_ascii_lowercase() {
         return false;
     }
-    bytes[1..]
-        .iter()
-        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-'))
+    bytes[1..].iter().all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+    })
 }
 
 fn is_version(value: &str) -> bool {
@@ -636,7 +636,10 @@ fn repo_segment(value: &str) -> bool {
 }
 
 fn is_idempotency_hex(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 #[derive(Clone)]
@@ -784,8 +787,7 @@ impl UsageStore {
     fn append_log(&mut self, event: &UsageEvent) -> Result<()> {
         let path = self.paths.events_log();
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
         let mut file = OpenOptions::new()
             .create(true)
@@ -803,7 +805,8 @@ impl UsageStore {
 
     fn enforce_bounds(&mut self) {
         let cutoff = Utc::now() - self.limits.max_age;
-        self.sessions.retain(|session| event_time(&session.event) >= cutoff);
+        self.sessions
+            .retain(|session| event_time(&session.event) >= cutoff);
         if self.sessions.len() > self.limits.max_sessions {
             self.sessions.sort_by(|left, right| {
                 event_time(&left.event)
@@ -859,8 +862,7 @@ impl UsageStore {
             }
             file.sync_all().ok();
         }
-        fs::rename(&temporary, &path)
-            .with_context(|| format!("replacing {}", path.display()))?;
+        fs::rename(&temporary, &path).with_context(|| format!("replacing {}", path.display()))?;
         self.jsonl_lines = self.sessions.len() as u64;
         Ok(())
     }
@@ -984,13 +986,10 @@ impl UsageStore {
 
     fn archive(&self, src: &Path, dir: &Path, reason: Option<&str>) -> Result<()> {
         fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        let name = src
-            .file_name()
-            .context("inbox file is missing a name")?;
+        let name = src.file_name().context("inbox file is missing a name")?;
         let dest = unique_dest(dir, name);
-        fs::rename(src, &dest).with_context(|| {
-            format!("moving {} to {}", src.display(), dest.display())
-        })?;
+        fs::rename(src, &dest)
+            .with_context(|| format!("moving {} to {}", src.display(), dest.display()))?;
         if let Some(reason) = reason {
             let reason_path = dest.with_extension("reason");
             fs::write(&reason_path, reason)
@@ -1127,7 +1126,11 @@ fn today_label(sessions: u64, totals: &TokenTotals) -> String {
     }
     let noun = if sessions == 1 { "session" } else { "sessions" };
     parts.push(format!("{sessions} {noun}"));
-    if totals.incomplete.iter().any(|field| field == "input_tokens" || field == "output_tokens") {
+    if totals
+        .incomplete
+        .iter()
+        .any(|field| field == "input_tokens" || field == "output_tokens")
+    {
         parts.push("partial".into());
     }
     format!("Today: {}", parts.join(" · "))
@@ -1337,8 +1340,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         .unwrap_or("usage");
     let temporary = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
     fs::write(&temporary, bytes).with_context(|| format!("writing {}", temporary.display()))?;
-    fs::rename(&temporary, path)
-        .with_context(|| format!("replacing {}", path.display()))?;
+    fs::rename(&temporary, path).with_context(|| format!("replacing {}", path.display()))?;
     Ok(())
 }
 
@@ -1469,14 +1471,11 @@ pub fn load_ingest_tokens(path: &Path) -> Result<IngestTokens> {
 }
 
 pub fn parse_listen_addr(spec: &str, listen_any: bool) -> Result<SocketAddr> {
-    let addr: SocketAddr = spec.parse().with_context(|| {
-        format!("--listen {spec} must be an ip:port such as 100.64.0.1:8787")
-    })?;
+    let addr: SocketAddr = spec
+        .parse()
+        .with_context(|| format!("--listen {spec} must be an ip:port such as 100.64.0.1:8787"))?;
     if addr.ip().is_unspecified() && !listen_any {
-        bail!(
-            "refusing to bind {} without --listen-any",
-            addr.ip()
-        );
+        bail!("refusing to bind {} without --listen-any", addr.ip());
     }
     Ok(addr)
 }
@@ -1625,9 +1624,7 @@ fn handle_request(
                 authenticate: false,
             }
         }
-        Err(AcceptError::Unauthorized) => {
-            error_response(401, "Unauthorized", "unauthorized", true)
-        }
+        Err(AcceptError::Unauthorized) => error_response(401, "Unauthorized", "unauthorized", true),
         Err(AcceptError::TooLarge { size }) => error_response(
             400,
             "Bad Request",
@@ -1642,7 +1639,12 @@ fn handle_request(
     }
 }
 
-fn error_response(status: u16, reason: &'static str, message: &str, authenticate: bool) -> HttpResponse {
+fn error_response(
+    status: u16,
+    reason: &'static str,
+    message: &str,
+    authenticate: bool,
+) -> HttpResponse {
     HttpResponse {
         status,
         reason,
@@ -1825,8 +1827,20 @@ mod tests {
         );
         let first = accept(&mut store, &event);
         let second = accept(&mut store, &event);
-        assert_eq!(first, IngestResult { accepted: 1, duplicates: 0 });
-        assert_eq!(second, IngestResult { accepted: 0, duplicates: 1 });
+        assert_eq!(
+            first,
+            IngestResult {
+                accepted: 1,
+                duplicates: 0
+            }
+        );
+        assert_eq!(
+            second,
+            IngestResult {
+                accepted: 0,
+                duplicates: 1
+            }
+        );
         let report = store.query(None, None);
         assert_eq!(report.sessions, 1);
         assert_eq!(report.totals.input_tokens, Some(10));
@@ -1884,7 +1898,9 @@ mod tests {
         let err = store
             .accept_payload(&serde_json::to_vec(&value).unwrap(), None)
             .unwrap_err();
-        assert!(matches!(err, AcceptError::Schema(ref msg) if msg.contains("prompt") || msg.contains("forbidden") || msg.contains("unknown")));
+        assert!(
+            matches!(err, AcceptError::Schema(ref msg) if msg.contains("prompt") || msg.contains("forbidden") || msg.contains("unknown"))
+        );
         value = serde_json::to_value(&event).unwrap();
         value["models"][0]["message"] = json!("hello");
         let err = store
@@ -1898,7 +1914,7 @@ mod tests {
     fn payloads_over_the_size_limit_are_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = store_in(dir.path());
-        let bytes = vec![b'{' ; MAX_EVENT_BYTES + 1];
+        let bytes = vec![b'{'; MAX_EVENT_BYTES + 1];
         let err = store.accept_payload(&bytes, None).unwrap_err();
         assert!(matches!(err, AcceptError::TooLarge { size } if size == MAX_EVENT_BYTES + 1));
         assert_eq!(store.query(None, None).sessions, 0);
@@ -1952,7 +1968,11 @@ mod tests {
         accept(&mut store, &event);
         let report = store.query(None, Some(GroupBy::Model));
         assert_eq!(report.totals.input_tokens, Some(10));
-        assert!(report.totals.incomplete.iter().any(|field| field == "input_tokens"));
+        assert!(report
+            .totals
+            .incomplete
+            .iter()
+            .any(|field| field == "input_tokens"));
         assert_eq!(report.groups.len(), 2);
     }
 
@@ -2052,7 +2072,13 @@ mod tests {
         let result = store
             .accept_payload(&serde_json::to_vec(&payload).unwrap(), None)
             .unwrap();
-        assert_eq!(result, IngestResult { accepted: 2, duplicates: 1 });
+        assert_eq!(
+            result,
+            IngestResult {
+                accepted: 2,
+                duplicates: 1
+            }
+        );
         assert_eq!(store.query(None, None).totals.input_tokens, Some(9));
     }
 
@@ -2109,7 +2135,13 @@ mod tests {
                 Some(2),
             ),
         );
-        let since = parse_since("24h", DateTime::parse_from_rfc3339("2026-11-12T16:00:00Z").unwrap().with_timezone(&Utc)).unwrap();
+        let since = parse_since(
+            "24h",
+            DateTime::parse_from_rfc3339("2026-11-12T16:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        )
+        .unwrap();
         let report = store.query(Some(since), Some(GroupBy::Host));
         assert_eq!(report.sessions, 1);
         assert_eq!(report.groups.len(), 1);
@@ -2126,7 +2158,15 @@ mod tests {
             let stamp = format!("2026-11-12T15:0{index}:00Z");
             accept(
                 &mut store,
-                &event_with("host-a", "agy", session, 1, &stamp, Some(index as u64), Some(1)),
+                &event_with(
+                    "host-a",
+                    "agy",
+                    session,
+                    1,
+                    &stamp,
+                    Some(index as u64),
+                    Some(1),
+                ),
             );
         }
         let report = store.query(None, None);
@@ -2197,7 +2237,11 @@ mod tests {
         );
         let now = DateTime::parse_from_rfc3339("2026-11-12T18:00:00Z").unwrap();
         store.publish_today(now).unwrap();
-        let label = today_label_from_file(&store.paths.today_path(), NaiveDate::from_ymd_opt(2026, 11, 12).unwrap()).unwrap();
+        let label = today_label_from_file(
+            &store.paths.today_path(),
+            NaiveDate::from_ymd_opt(2026, 11, 12).unwrap(),
+        )
+        .unwrap();
         assert_eq!(label, "Today: 1,200 in · 340 out · 1 session");
         assert!(today_label_from_file(
             &store.paths.today_path(),
@@ -2224,7 +2268,10 @@ mod tests {
         let store = Arc::new(Mutex::new(store_in(dir.path())));
         let err = serve("127.0.0.1:0", false, &missing, store).unwrap_err();
         let message = err.to_string();
-        assert!(message.contains("token") || message.contains("ingest"), "{message}");
+        assert!(
+            message.contains("token") || message.contains("ingest"),
+            "{message}"
+        );
     }
 
     fn fake_token(host: &str) -> String {
@@ -2243,10 +2290,20 @@ mod tests {
         fs::write(path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
     }
 
-    fn http_exchange(addr: SocketAddr, method: &str, path: &str, token: Option<&str>, body: &str) -> (u16, String) {
+    fn http_exchange(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        body: &str,
+    ) -> (u16, String) {
         let mut stream = TcpStream::connect(addr).unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         let mut request = format!(
             "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: close\r\n",
             body.len()
@@ -2259,12 +2316,7 @@ mod tests {
         stream.write_all(request.as_bytes()).unwrap();
         let mut response = String::new();
         stream.read_to_string(&mut response).unwrap();
-        let status = response
-            .split_whitespace()
-            .nth(1)
-            .unwrap()
-            .parse()
-            .unwrap();
+        let status = response.split_whitespace().nth(1).unwrap().parse().unwrap();
         let body = response.split("\r\n\r\n").nth(1).unwrap_or("").to_owned();
         (status, body)
     }
@@ -2362,7 +2414,9 @@ mod tests {
             fake_token("host-a")
         );
         stream.write_all(request.as_bytes()).unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         let mut response = String::new();
         let _ = stream.read_to_string(&mut response);
         assert!(response.starts_with("HTTP/1.1 400"), "{response}");

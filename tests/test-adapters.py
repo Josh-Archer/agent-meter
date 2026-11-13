@@ -2552,6 +2552,26 @@ def test_failing_adapter_and_real_zero_all_providers() -> None:
         assert "reason" not in copilot_zero
         assert copilot_zero["windows"][0]["remaining_percent"] == 0.0
 
+        grok_zero = adapter.normalize_grok(
+            [{
+                "ts": "2026-08-29T23:59:30Z",
+                "msg": "billing: fetched credits config",
+                "ctx": {"config": {"creditUsagePercent": 100.0, "billingPeriodEnd": "2026-09-05T01:45:30Z"}},
+            }],
+            now=adapter.dt.datetime(2026, 8, 30, tzinfo=adapter.dt.UTC),
+        )
+        assert grok_zero["status"] == "fresh"
+        assert "reason" not in grok_zero
+        assert grok_zero["windows"][0]["remaining_percent"] == 0.0
+
+        muse_zero = adapter.normalize_muse(
+            {"observedAtMs": 1790000000000, "window": {"usedPercent": 100.0, "resetsAtMs": 1790003600000}},
+            now=adapter.dt.datetime.fromtimestamp(1790000000, tz=adapter.dt.UTC),
+        )
+        assert muse_zero["status"] == "fresh"
+        assert "reason" not in muse_zero
+        assert muse_zero["windows"][0]["remaining_percent"] == 0.0
+
 
 if __name__ == "__main__":
     test_reset_calendar_and_timezone()
