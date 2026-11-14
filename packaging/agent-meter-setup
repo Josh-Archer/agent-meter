@@ -1,6 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+usage() {
+    cat <<'EOF'
+Usage: agent-meter-setup [-h|--help]
+
+Configures Agent Meter for the current user:
+  - installs the Copilot quota helper under ~/.local/share/agent-meter
+  - writes ~/.config/agent-meter/sources.json if it does not exist
+  - enables and starts the agent-meter user service
+  - enables the GNOME extension when it is installed
+
+Safe to re-run; an existing sources.json is left untouched.
+EOF
+}
+
+case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+    "") ;;
+    *) printf 'agent-meter-setup: unknown option: %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
+esac
+
 bin_dir=$(dirname -- "$(command -v agent-meter-adapter)")
 data_dir=${XDG_DATA_HOME:-"$HOME/.local/share"}/agent-meter
 config_dir=${XDG_CONFIG_HOME:-"$HOME/.config"}/agent-meter
