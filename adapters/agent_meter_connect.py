@@ -12,10 +12,10 @@ import sys
 
 COMMANDS = {
     "codex": ["codex", "login"],
-    # agy has no separate login subcommand; its first interactive launch owns
-    # the browser sign-in flow when the current session is unauthenticated.
-    "agy": ["agy"],
-    "antigravity": ["agy"],
+    # ACP provides a provider-owned login command that exits after sign-in.
+    # Do not collect credentials in Agent Meter.
+    "agy": ["agy", "acp", "--login"],
+    "antigravity": ["agy", "acp", "--login"],
     "grok": ["grok", "login"],
     # The SDK-bundled Copilot CLI owns its GitHub OAuth/keychain state.
     "copilot": [os.path.expanduser("~/.local/share/agent-meter/copilot-sdk/node_modules/.bin/copilot")],
@@ -63,7 +63,15 @@ def main() -> None:
         raise SystemExit(1)
 
     # After sign-in, restart the user unit agent-meter.service (the agent-meterd binary).
-    shell_cmd = shlex.join(command) + "; systemctl --user restart agent-meter.service"
+    if provider in ("agy", "antigravity"):
+        state_home = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+        marker = os.path.join(state_home, "agent-meter", "agy-reconnect-required")
+        # Only our failure latch is removed, only after a successful provider
+        # login. Never remove the provider's keyring marker or token files.
+        shell_cmd = (shlex.join(command) + " && rm -f -- " + shlex.quote(marker)
+                     + " && systemctl --user restart agent-meter.service")
+    else:
+        shell_cmd = shlex.join(command) + "; systemctl --user restart agent-meter.service"
     wrapped = ["bash", "-c", shell_cmd]
     terminal = terminal_command(wrapped)
     if terminal is None:
