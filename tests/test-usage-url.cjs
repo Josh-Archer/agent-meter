@@ -157,6 +157,10 @@ for (const name of Object.keys(PopupMenu)) {
 function quotaWindows(provider) {
     return (provider.windows ?? []).filter(window => typeof window.remaining_percent === 'number');
 }
+function providerRemainingPercent(provider) {
+    const windows = quotaWindows(provider);
+    return windows.length > 0 ? Math.min(...windows.map(w => w.remaining_percent)) : 100;
+}
 function iconFor() {
     return {};
 }
