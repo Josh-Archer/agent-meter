@@ -206,4 +206,25 @@ assert.equal(progressCount(failedCard), 0);
 const waiting = render(null);
 assert.deepEqual(labelsOf(waiting), ['⠿  Agent Meter', 'Waiting for local usage data…']);
 
+const helpers = eval(`(() => {
+    ${source.slice(source.indexOf('function quotaWindows('), source.indexOf('// Provider state is local JSON.'))}
+    return {providerRemainingPercent, limitText};
+})()`);
+
+const agyProvider = {
+    id: 'antigravity',
+    label: 'Antigravity',
+    status: 'fresh',
+    windows: [
+        {id: 'gemini-models-weekly', remaining_percent: 59.6, reset_label: 'resets Sat'},
+        {id: 'gemini-models-5h', remaining_percent: 96.5, reset_label: 'resets 5h'},
+        {id: 'claude-models-weekly', remaining_percent: 15.6, reset_label: 'resets Wed'},
+        {id: 'claude-models-5h', remaining_percent: 100, reset_label: 'resets 5h'},
+        {id: 'gemini-argon-weekly', remaining_percent: 75.3, reset_label: 'resets Sat'},
+    ],
+};
+assert.equal(Math.round(helpers.providerRemainingPercent(agyProvider)), 75);
+assert.equal(helpers.limitText(agyProvider), 'Gemini 60% · Claude 16% · Argon 75%');
+assert.equal(helpers.providerRemainingPercent(numeric.providers[0]), 51);
+
 console.log('Numeric quota cards show plan and N of M used text');

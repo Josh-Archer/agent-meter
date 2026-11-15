@@ -131,12 +131,64 @@ function quotaColor(percent, isFresh = true) {
     return '#ff3b56';
 }
 
+function poolPrefix(window) {
+    const id = String(window?.id ?? window?.name ?? '').toLowerCase();
+    const stripped = id.replace(/-(?:5h|weekly)$/, '');
+    return stripped !== id ? stripped : '';
+}
+
+function providerRemainingPercent(provider) {
+    const windows = quotaWindows(provider);
+    if (windows.length === 0)
+        return 100;
+    const pools = new Map();
+    for (const window of windows) {
+        const prefix = poolPrefix(window);
+        if (!pools.has(prefix))
+            pools.set(prefix, []);
+        pools.get(prefix).push(window.remaining_percent);
+    }
+    if (pools.size <= 1 || pools.has(''))
+        return Math.min(...windows.map(w => w.remaining_percent));
+    const poolMins = [...pools.values()].map(vals => Math.min(...vals));
+    return Math.max(...poolMins);
+}
+
+function shortPoolLabel(prefix) {
+    if (prefix === 'gemini-models')
+        return 'Gemini';
+    if (prefix === 'claude-models')
+        return 'Claude';
+    if (prefix === 'gemini-argon')
+        return 'Argon';
+    return prefix;
+}
+
 function limitText(provider) {
     if (['unavailable', 'error'].includes(provider.status))
         return 'Unavailable';
     if (provider.status === 'stale')
         return 'Usage unavailable (cached data expired)';
     const windows = provider.windows ?? [];
+    if (windows.length === 0)
+        return 'No usage data';
+    const pools = new Map();
+    for (const window of windows) {
+        if (typeof window.remaining_percent !== 'number' || !Number.isFinite(window.remaining_percent))
+            continue;
+        const prefix = poolPrefix(window);
+        if (!pools.has(prefix))
+            pools.set(prefix, []);
+        pools.get(prefix).push(window);
+    }
+    if (pools.size > 1 && !pools.has('')) {
+        return [...pools.entries()]
+            .map(([prefix, poolWins]) => {
+                const pct = Math.min(...poolWins.map(w => w.remaining_percent));
+                return `${shortPoolLabel(prefix)} ${Math.round(pct)}%`;
+            })
+            .join(' · ');
+    }
     const lowest = windows.reduce((current, entry) =>
         current === null || entry.remaining_percent < current.remaining_percent ? entry : current, null);
     if (!lowest)
@@ -468,7 +520,7 @@ class AgentMeterIndicator extends PanelMenu.Button {
             const isFailure = ['unavailable', 'error'].includes(provider.status);
             const windows = quotaWindows(provider);
             const hasNumericQuota = windows.length > 0;
-            const percentage = hasNumericQuota ? Math.min(...windows.map(w => w.remaining_percent)) : 100;
+            const percentage = providerRemainingPercent(provider);
             const shouldShowQuota = isFresh && hasNumericQuota;
 
             let pctText = '—';
@@ -657,7 +709,7 @@ class AgentMeterIndicator extends PanelMenu.Button {
             const card = new St.BoxLayout({vertical: true, style_class: cardClass});
 
             const heading = new St.BoxLayout({});
-            const percentage = hasNumericQuota ? Math.min(...windows.map(w => w.remaining_percent)) : 100;
+            const percentage = providerRemainingPercent(provider);
             const color = isFailure ? '#8b949e' : quotaColor(percentage, isFresh);
 
             const icon = new St.Icon({
