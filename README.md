@@ -857,3 +857,21 @@ Every merge to `main` whose CI passes is released automatically by
 only touch docs, Markdown, `.github/` or `tests/` are not released. See
 `scripts/next-release-version.sh`.
 
+
+### Antigravity sign-in loops
+
+Agent Meter respects agy's one-hour keyring-timeout cooldown without reading or
+removing provider credential files. During that cooldown quota is unavailable,
+not zero, and an interactive agy session may still be signed in. A usage timeout
+pauses later automatic attempts until **Connect** succeeds. Connect runs the
+provider-owned `agy acp --login` flow and clears only Agent Meter's retry latch;
+it does not accept tokens. Provider cooldown remains in force after login until
+its hour expires. Generic source/JSON errors remain retryable.
+
+This guard mitigates repeated login windows; it is not a general no-login mode
+for agy. The CLI's print mode can initiate OAuth when credentials cannot be
+loaded, and no documented no-auth print flag is available. The first timeout
+may therefore still open a login window. An unwritable Agent Meter state directory
+also prevents persisting its retry latch. Fix the desktop keyring/session issue
+through the provider's supported login rather than copying tokens or deleting
+its circuit-breaker marker. Live keyring recovery must be verified separately.

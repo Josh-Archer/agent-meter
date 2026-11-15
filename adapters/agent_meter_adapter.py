@@ -464,6 +464,52 @@ def claude() -> dict[str, Any]:
         )
 
 
+def _agy_reconnect_marker() -> str:
+    state_home = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return os.path.join(state_home, "agent-meter", "agy-reconnect-required")
+
+
+def _agy_pause_reason() -> str | None:
+    if os.path.exists(_agy_reconnect_marker()):
+        return "refresh_paused"
+    # Provider-owned circuit breaker, not a credential. Respect its one-hour
+    # cooldown without deleting it or interpreting its existence as logout.
+    marker = os.path.expanduser(
+        "~/.gemini/antigravity-cli/cache/antigravity-keyring-unavailable"
+    )
+    try:
+        if time.time() - os.stat(marker).st_mtime < 3600:
+            return "keyring_cooldown"
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return "refresh_paused"
+    return None
+
+
+def _agy_latch_reconnect() -> bool:
+    path = _agy_reconnect_marker()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as stream:
+            stream.write("reconnect required\n")
+        return True
+    except OSError:
+        return False
+
+
+def _agy_refresh_paused(reason: str) -> dict[str, Any]:
+    detail = (
+        "Antigravity keyring is in its one-hour cooldown; background refresh is paused. "
+        "An interactive login may still be valid."
+        if reason == "keyring_cooldown" else
+        "Antigravity background refresh paused after a timeout. Use Connect to retry "
+        "provider-owned sign-in. Agent Meter never accepts or stores a token."
+    )
+    return unavailable("antigravity", "Antigravity", "antigravity", detail, reason=reason)
+
+
 def agy() -> dict[str, Any]:
     command = os.environ.get("AGENT_METER_AGY_BIN", "agy")
     if not _cli_installed(command):
@@ -473,10 +519,13 @@ def agy() -> dict[str, Any]:
             "antigravity",
             f"{command} is not installed; install Antigravity (agy) and sign in to see usage.",
         )
+    pause = _agy_pause_reason()
+    if pause:
+        return _agy_refresh_paused(pause)
     try:
         output = subprocess.run(
-            [command, "-p", "/usage", "--output-format", "json", "--print-timeout", "20s"],
-            check=True, capture_output=True, text=True, timeout=30,
+            [command, "-p", "/usage", "--output-format", "json", "--print-timeout", "15s"],
+            check=True, capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL,
         )
         return normalize_agy(json.loads(output.stdout))
     except FileNotFoundError:
@@ -487,6 +536,7 @@ def agy() -> dict[str, Any]:
             f"{command} is not installed; install Antigravity (agy) and sign in to see usage.",
         )
     except subprocess.TimeoutExpired as error:
+        _agy_latch_reconnect()
         return unavailable(
             "antigravity", "Antigravity", "antigravity",
             f"Antigravity usage unavailable; run agy and sign in if prompted: {error}",

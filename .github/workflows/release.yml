@@ -33,6 +33,7 @@ jobs:
       - name: Run validation
         run: |
           python3 tests/check-extension-layout.py
+          python3 tests/test-agy-auth-loop.py
           python3 tests/test-adapters.py
           cargo test --all-features
       - name: Build release packages
