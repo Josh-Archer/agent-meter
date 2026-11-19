@@ -275,6 +275,8 @@ class AgentMeterIndicator extends PanelMenu.Button {
         this._dragHandle = null;
         this._clampIdle = null;
         this._refreshPending = false;
+        this._stateMonitor = null;
+        this._stateMonitorChangedId = null;
         this._renderKey = null;
         this._spinnerActor = null;
         this._spinnerSource = null;
@@ -308,6 +310,7 @@ class AgentMeterIndicator extends PanelMenu.Button {
 
         this._refresh();
         this._syncDesktopVisibility();
+        this._startStateMonitor();
         this._timeout = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, POLL_SECONDS, () => {
             this._refresh();
             return GLib.SOURCE_CONTINUE;
@@ -437,6 +440,28 @@ class AgentMeterIndicator extends PanelMenu.Button {
             this._setDesktopVisible(true);
         }
         this._queueClamp();
+    }
+
+    _startStateMonitor() {
+        try {
+            const dir = Gio.File.new_build_filenamev([GLib.get_user_runtime_dir(), 'agent-meter']);
+            this._stateMonitor = dir.monitor_directory(Gio.FileMonitorFlags.NONE, null);
+            this._stateMonitorChangedId = this._stateMonitor.connect(
+                'changed',
+                (_monitor, file, otherFile) => {
+                    const name = file?.get_basename?.() ?? otherFile?.get_basename?.();
+                    if (name === 'state.json' || name === 'usage-today.json') {
+                        if (name === 'state.json')
+                            this._refreshPending = false;
+                        this._refresh();
+                    }
+                }
+            );
+        } catch (error) {
+            console.debug(`Agent Meter could not monitor runtime state: ${error.message}`);
+            this._stateMonitor = null;
+            this._stateMonitorChangedId = null;
+        }
     }
 
     _readState() {
@@ -829,6 +854,15 @@ class AgentMeterIndicator extends PanelMenu.Button {
             GLib.Source.remove(this._timeout);
             this._timeout = null;
         }
+        if (this._stateMonitorChangedId && this._stateMonitor) {
+            this._stateMonitor.disconnect(this._stateMonitorChangedId);
+            this._stateMonitorChangedId = null;
+        }
+        if (this._stateMonitor) {
+            this._stateMonitor.cancel();
+            this._stateMonitor = null;
+        }
+        this._stateMonitorChangedId = null;
         if (this._clampIdle) {
             GLib.Source.remove(this._clampIdle);
             this._clampIdle = null;
