@@ -122,12 +122,20 @@ function iconFor(extension, symbol) {
         symbol = 'antigravity';
     const allowed = new Set(['codex', 'antigravity', 'grok', 'copilot', 'claude', 'muse', 'generic']);
     const name = allowed.has(symbol) ? symbol : 'generic';
+    let cache = null;
+    if (extension && typeof extension === 'object') {
+        extension._iconCache ??= new Map();
+        cache = extension._iconCache;
+        if (cache.has(name))
+            return cache.get(name);
+    }
     const iconsDir = extension.dir.get_child('icons');
     const symbolicFile = iconsDir.get_child(`${name}-symbolic.svg`);
-    if (symbolicFile.query_exists(null)) {
-        return new Gio.FileIcon({file: symbolicFile});
-    }
-    return new Gio.FileIcon({file: iconsDir.get_child(`${name}.svg`)});
+    const icon = symbolicFile.query_exists(null)
+        ? new Gio.FileIcon({file: symbolicFile})
+        : new Gio.FileIcon({file: iconsDir.get_child(`${name}.svg`)});
+    cache?.set(name, icon);
+    return icon;
 }
 
 const COLOR_STOPS = [
