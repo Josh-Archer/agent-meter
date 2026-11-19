@@ -852,14 +852,250 @@ fn refresh_publishing(
     })
 }
 
-fn unavailable(id_hint: &str, detail: &str, reason: &str) -> ProviderState {
-    let normalized: String = id_hint
+fn normalize_id(hint: &str) -> String {
+    let normalized: String = hint
         .to_ascii_lowercase()
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
     let id = normalized.trim_matches('-');
-    let id = if id.is_empty() { "adapter" } else { id }.to_owned();
+    if id.is_empty() {
+        "adapter".to_owned()
+    } else {
+        id.to_owned()
+    }
+}
+
+fn canonical_provider_id(id: &str) -> &str {
+    match id {
+        "agy" => "antigravity",
+        other => other,
+    }
+}
+
+fn is_seedable_provider(provider: &ProviderState) -> bool {
+    keeps_last_good(provider)
+        || provider
+            .windows
+            .iter()
+            .any(|window| window.remaining_percent.is_some())
+}
+
+fn source_secondary_hints(source: &Source) -> Vec<String> {
+    let mut hints = Vec::new();
+    match source {
+        Source::Mock { .. } => {}
+        Source::File { path } => {
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                hints.push(normalize_id(stem));
+            }
+        }
+        Source::Command { program, args, .. } => {
+            if let Some(stem) = Path::new(program).file_stem().and_then(|s| s.to_str()) {
+                hints.push(normalize_id(stem));
+            }
+            for arg in args {
+                if !arg.starts_with('-') && !arg.contains(char::is_whitespace) && !arg.contains('{')
+                {
+                    hints.push(normalize_id(arg));
+                }
+            }
+        }
+    }
+    hints
+}
+
+#[derive(Copy, Clone)]
+enum MatchTier {
+    PrimaryExact,
+    PrimaryAlias,
+    SecondaryExact,
+    SecondaryAlias,
+}
+
+fn source_matches_tier(
+    primary: &str,
+    secondary: &[String],
+    provider_id: &str,
+    tier: MatchTier,
+) -> bool {
+    match tier {
+        MatchTier::PrimaryExact => primary == provider_id,
+        MatchTier::PrimaryAlias => {
+            canonical_provider_id(primary) == canonical_provider_id(provider_id)
+        }
+        MatchTier::SecondaryExact => secondary.iter().any(|hint| hint == provider_id),
+        MatchTier::SecondaryAlias => {
+            let canonical_provider = canonical_provider_id(provider_id);
+            secondary
+                .iter()
+                .any(|hint| canonical_provider_id(hint) == canonical_provider)
+        }
+    }
+}
+
+/// Seed `last_good` from a previously persisted `AgentMeterState` so slow
+/// sources retain their last known good snapshot while their startup refresh
+/// is still in flight.
+fn seed_last_good_from_state(
+    config: &Config,
+    existing: &AgentMeterState,
+) -> HashMap<usize, ProviderState> {
+    let mut seeded = HashMap::new();
+    if config.sources.is_empty() || existing.providers.is_empty() {
+        return seeded;
+    }
+
+    let source_hints: Vec<(String, Vec<String>)> = config
+        .sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| {
+            (
+                normalize_id(&source_hint(index, source)),
+                source_secondary_hints(source),
+            )
+        })
+        .collect();
+    let eligible: Vec<(usize, &ProviderState)> = existing
+        .providers
+        .iter()
+        .enumerate()
+        .filter(|(_, provider)| is_seedable_provider(provider))
+        .collect();
+    let mut assigned_sources = vec![false; config.sources.len()];
+    let mut matched_providers = vec![false; existing.providers.len()];
+
+    for tier in [
+        MatchTier::PrimaryExact,
+        MatchTier::PrimaryAlias,
+        MatchTier::SecondaryExact,
+        MatchTier::SecondaryAlias,
+    ] {
+        for &(existing_idx, provider) in &eligible {
+            if matched_providers[existing_idx] {
+                continue;
+            }
+            let provider_id = normalize_id(&provider.id);
+            let preferred = (existing_idx < config.sources.len()
+                && !assigned_sources[existing_idx]
+                && source_matches_tier(
+                    &source_hints[existing_idx].0,
+                    &source_hints[existing_idx].1,
+                    &provider_id,
+                    tier,
+                ))
+            .then_some(existing_idx);
+            let target_idx = preferred.or_else(|| {
+                source_hints
+                    .iter()
+                    .enumerate()
+                    .find_map(|(source_idx, (primary, secondary))| {
+                        (!assigned_sources[source_idx]
+                            && source_matches_tier(primary, secondary, &provider_id, tier))
+                        .then_some(source_idx)
+                    })
+            });
+            if let Some(source_idx) = target_idx {
+                assigned_sources[source_idx] = true;
+                matched_providers[existing_idx] = true;
+                seeded.insert(source_idx, provider.clone());
+            }
+        }
+    }
+
+    seeded
+}
+
+fn state_from_json_output(output: &agent_meter::JsonOutput) -> Option<AgentMeterState> {
+    if output.schema_version != 1 {
+        return None;
+    }
+    let mut providers = Vec::with_capacity(output.providers.len());
+    let mut latest_updated: Option<chrono::DateTime<Utc>> = None;
+    for jp in &output.providers {
+        let updated_at = chrono::DateTime::parse_from_rfc3339(&jp.updated_at)
+            .ok()
+            .map(|dt| dt.with_timezone(&Utc));
+        if let Some(ts) = updated_at {
+            latest_updated = Some(latest_updated.map_or(ts, |cur| cur.max(ts)));
+        }
+        let status = if !jp.available {
+            "unavailable"
+        } else if jp.stale {
+            "stale"
+        } else {
+            "fresh"
+        };
+        let windows = jp
+            .windows
+            .iter()
+            .map(|w| UsageWindow {
+                id: w.name.clone(),
+                label: w.name.clone(),
+                remaining_percent: w.remaining_percent,
+                resets_at: w
+                    .resets_at
+                    .as_deref()
+                    .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+                    .map(|dt| dt.with_timezone(&Utc)),
+                reset_label: None,
+            })
+            .collect();
+        providers.push(ProviderState {
+            id: jp.provider.clone(),
+            label: jp.provider.clone(),
+            icon: jp.provider.clone(),
+            windows,
+            status: status.into(),
+            detail: None,
+            reason: jp.reason.clone(),
+            usage_url: None,
+            updated_at,
+        });
+    }
+    let state = AgentMeterState {
+        version: STATE_VERSION,
+        generated_at: latest_updated.unwrap_or_else(Utc::now),
+        providers,
+    };
+    state.validate().ok()?;
+    Some(state)
+}
+
+fn load_state_file(path: &Path, allow_json_output: bool) -> Option<AgentMeterState> {
+    if let Ok(state) = agent_meter::read_state(path) {
+        return Some(state);
+    }
+    if allow_json_output {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            if let Ok(output) = serde_json::from_str::<agent_meter::JsonOutput>(&contents) {
+                return state_from_json_output(&output);
+            }
+        }
+    }
+    None
+}
+
+fn load_existing_state_with_fallback(
+    state_path: &Path,
+    fallback_path: &Path,
+) -> Option<AgentMeterState> {
+    if let Some(state) = load_state_file(state_path, false) {
+        return Some(state);
+    }
+    if fallback_path != state_path {
+        return load_state_file(fallback_path, true);
+    }
+    None
+}
+
+fn load_existing_state(state_path: &std::path::Path) -> Option<AgentMeterState> {
+    load_existing_state_with_fallback(state_path, &agent_meter::stable_state_path())
+}
+
+fn unavailable(id_hint: &str, detail: &str, reason: &str) -> ProviderState {
+    let id = normalize_id(id_hint);
     ProviderState {
         id,
         label: id_hint.into(),
@@ -1003,8 +1239,12 @@ fn main() -> Result<()> {
         None
     };
 
-    let mut last_good: HashMap<usize, ProviderState> = HashMap::new();
-    let mut last_good_state: Option<AgentMeterState> = None;
+    let existing_state = load_existing_state(&state_path);
+    let mut last_good: HashMap<usize, ProviderState> = existing_state
+        .as_ref()
+        .map(|existing| seed_last_good_from_state(&config, existing))
+        .unwrap_or_default();
+    let mut last_good_state: Option<AgentMeterState> = existing_state;
     let mut did_refresh = false;
     let mut next_refresh = Instant::now();
     loop {
@@ -1013,15 +1253,18 @@ fn main() -> Result<()> {
         }
         if (args.watch || !did_refresh) && Instant::now() >= next_refresh {
             let mut write_error: Option<anyhow::Error> = None;
-            let final_state = refresh_publishing(&config, &mut last_good, |state| {
-                if let Err(err) = emit_state(&state_path, state, &mut last_good_state) {
-                    write_error = Some(err);
-                }
-            });
+            let mut wrote_this_refresh = false;
+            let final_state =
+                refresh_publishing(&config, &mut last_good, |state| {
+                    match emit_state(&state_path, state, &mut last_good_state) {
+                        Ok(()) => wrote_this_refresh = true,
+                        Err(err) => write_error = Some(err),
+                    }
+                });
             if config.forecast.enabled {
                 update_forecast_history(&config.forecast, &final_state);
             }
-            if last_good_state.is_none() {
+            if !wrote_this_refresh {
                 if let Some(err) = write_error {
                     if !args.watch {
                         return Err(err);
@@ -2141,5 +2384,228 @@ mod tests {
         let loaded = forecast::load_history(&history_file).unwrap();
         assert!(loaded.windows.is_empty());
         assert!(!notifications_file.exists());
+    }
+
+    #[test]
+    fn seed_last_good_matches_sources_and_agy_alias() {
+        let mut codex = fresh_provider("codex", 68.0);
+        codex.updated_at = Some(Utc::now() - Duration::minutes(5));
+        let mut antigravity = fresh_provider("antigravity", 91.0);
+        antigravity.updated_at = Some(Utc::now() - Duration::minutes(4));
+        let mut claude = fresh_provider("claude", 42.0);
+        claude.status = "error".into();
+        let placeholder_unavailable = unavailable("grok", "missing cli", REASON_CLI_NOT_INSTALLED);
+        let mut error_without_windows = unavailable("muse", "errored", REASON_SOURCE_FAILED);
+        error_without_windows.status = "error".into();
+
+        let existing = AgentMeterState {
+            version: STATE_VERSION,
+            generated_at: Utc::now(),
+            providers: vec![
+                antigravity.clone(),
+                codex.clone(),
+                placeholder_unavailable,
+                error_without_windows,
+                claude.clone(),
+            ],
+        };
+
+        let config = Config {
+            refresh_seconds: 60,
+            command_timeout_seconds: 5,
+            max_concurrent_refreshes: 4,
+            refresh_deadline_seconds: 5,
+            sources: vec![
+                Source::Command {
+                    program: "codex".into(),
+                    args: vec![],
+                    timeout_seconds: None,
+                },
+                Source::Command {
+                    program: "/usr/local/bin/agent-meter-adapter".into(),
+                    args: vec!["agy".into()],
+                    timeout_seconds: None,
+                },
+                Source::Command {
+                    program: "grok".into(),
+                    args: vec![],
+                    timeout_seconds: None,
+                },
+                Source::Command {
+                    program: "muse".into(),
+                    args: vec![],
+                    timeout_seconds: None,
+                },
+                Source::File {
+                    path: PathBuf::from("/tmp/state/claude.json"),
+                },
+            ],
+            forecast: ForecastConfig::default(),
+        };
+
+        let seeded = seed_last_good_from_state(&config, &existing);
+        assert_eq!(seeded.len(), 3);
+        assert_eq!(seeded.get(&0), Some(&codex));
+        assert_eq!(seeded.get(&1), Some(&antigravity));
+        assert_eq!(seeded.get(&4), Some(&claude));
+        assert!(!seeded.contains_key(&2));
+        assert!(!seeded.contains_key(&3));
+
+        // Direct "agy" command hint and unassigned index fallback with duplicate source IDs.
+        let direct_config = Config {
+            refresh_seconds: 60,
+            command_timeout_seconds: 5,
+            max_concurrent_refreshes: 4,
+            refresh_deadline_seconds: 5,
+            sources: vec![
+                Source::Command {
+                    program: "agy".into(),
+                    args: vec![],
+                    timeout_seconds: None,
+                },
+                Source::Mock {
+                    provider: fresh_provider("codex", 10.0),
+                },
+                Source::Mock {
+                    provider: fresh_provider("codex", 20.0),
+                },
+            ],
+            forecast: ForecastConfig::default(),
+        };
+        let dup_existing = AgentMeterState {
+            version: STATE_VERSION,
+            generated_at: Utc::now(),
+            providers: vec![codex.clone(), codex.clone(), antigravity.clone()],
+        };
+        let dup_seeded = seed_last_good_from_state(&direct_config, &dup_existing);
+        assert_eq!(dup_seeded.get(&0), Some(&antigravity));
+        assert_eq!(dup_seeded.get(&1), Some(&codex));
+        assert_eq!(dup_seeded.get(&2), Some(&codex));
+    }
+
+    #[test]
+    fn seed_last_good_preserves_seeded_entries_during_refresh_publishing() {
+        let prev_stamp = Utc::now() - Duration::minutes(10);
+        let mut prev_agy = fresh_provider("antigravity", 77.0);
+        prev_agy.updated_at = Some(prev_stamp);
+
+        let existing = AgentMeterState {
+            version: STATE_VERSION,
+            generated_at: prev_stamp,
+            providers: vec![prev_agy.clone()],
+        };
+        let fast = fresh_provider("fast-provider", 55.0);
+        let config = Config {
+            refresh_seconds: 60,
+            command_timeout_seconds: 30,
+            max_concurrent_refreshes: 2,
+            refresh_deadline_seconds: 1,
+            sources: vec![
+                Source::Command {
+                    program: "agy".into(),
+                    args: vec![],
+                    timeout_seconds: Some(30),
+                },
+                echo_provider(&fast),
+            ],
+            forecast: ForecastConfig::default(),
+        };
+        let mut seeded = seed_last_good_from_state(&config, &existing);
+        assert_eq!(seeded.get(&0), Some(&prev_agy));
+
+        // Replace source 0 with a hung command while keeping the seeded last_good
+        // at index 0, simulating a slow startup poll that misses the deadline.
+        let slow_config = Config {
+            refresh_seconds: 60,
+            command_timeout_seconds: 30,
+            max_concurrent_refreshes: 2,
+            refresh_deadline_seconds: 1,
+            sources: vec![
+                Source::Command {
+                    program: "sleep".into(),
+                    args: vec!["30".into()],
+                    timeout_seconds: Some(30),
+                },
+                echo_provider(&fast),
+            ],
+            forecast: ForecastConfig::default(),
+        };
+
+        let mut snapshots = Vec::new();
+        let final_state = refresh_publishing(&slow_config, &mut seeded, |snapshot| {
+            snapshots.push(snapshot.clone());
+        });
+
+        // While source 0 is still in flight and source 1 publishes, the seeded
+        // antigravity snapshot must remain present rather than disappearing.
+        let inflight_snapshot = snapshots
+            .iter()
+            .find(|snap| {
+                snap.providers
+                    .iter()
+                    .any(|p| p.id == "fast-provider" && p.status == "fresh")
+            })
+            .expect("fast-provider should publish first");
+        let inflight_agy = inflight_snapshot
+            .providers
+            .iter()
+            .find(|p| p.id == "antigravity")
+            .expect("seeded antigravity should remain present while in flight");
+        assert_eq!(inflight_agy.status, "fresh");
+        assert_eq!(inflight_agy.windows[0].remaining_percent, Some(77.0));
+        assert_eq!(inflight_agy.updated_at, Some(prev_stamp));
+
+        // After the deadline expires, antigravity becomes stale while retaining
+        // its prior windows and updated_at instead of dropping to unavailable.
+        let settled_agy = final_state
+            .providers
+            .iter()
+            .find(|p| p.id == "antigravity")
+            .expect("settled antigravity should stay in final state");
+        assert_eq!(settled_agy.status, "stale");
+        assert_eq!(settled_agy.windows[0].remaining_percent, Some(77.0));
+        assert_eq!(settled_agy.updated_at, Some(prev_stamp));
+    }
+
+    #[test]
+    fn load_existing_state_reads_primary_and_falls_back_to_stable_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime-state.json");
+        let stable = dir.path().join("stable-state.json");
+
+        let mut codex = fresh_provider("codex", 83.0);
+        let stamp = Utc::now() - Duration::minutes(3);
+        codex.updated_at = Some(stamp);
+        let primary_state = AgentMeterState {
+            version: STATE_VERSION,
+            generated_at: stamp,
+            providers: vec![codex.clone()],
+        };
+        agent_meter::write_state(&runtime, &primary_state).unwrap();
+
+        let loaded = load_existing_state_with_fallback(&runtime, &stable).unwrap();
+        assert_eq!(loaded, primary_state);
+
+        // Missing or unreadable runtime path falls back to stable JsonOutput.
+        std::fs::write(&runtime, "{not-valid-json").unwrap();
+        agent_meter::write_json_output(&stable, &primary_state).unwrap();
+        let fallback_loaded = load_existing_state_with_fallback(&runtime, &stable).unwrap();
+        assert_eq!(fallback_loaded.providers.len(), 1);
+        assert_eq!(fallback_loaded.providers[0].id, "codex");
+        assert_eq!(fallback_loaded.providers[0].status, "fresh");
+        assert_eq!(
+            fallback_loaded.providers[0].windows[0].remaining_percent,
+            Some(83.0)
+        );
+        assert_eq!(
+            fallback_loaded.providers[0].updated_at.unwrap().timestamp(),
+            stamp.timestamp()
+        );
+
+        // Fallback also reads AgentMeterState directly when present.
+        let missing = dir.path().join("does-not-exist.json");
+        agent_meter::write_state(&stable, &primary_state).unwrap();
+        let fallback_state = load_existing_state_with_fallback(&missing, &stable).unwrap();
+        assert_eq!(fallback_state, primary_state);
     }
 }
