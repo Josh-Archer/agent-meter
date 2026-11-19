@@ -1,131 +1,87 @@
-// Open each provider usage_url from the panel menu in the default browser.
+// Panel menu per-provider connect/refresh action buttons and hover hints.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 
 const source = fs.readFileSync('gnome-extension/agent-meter@local/extension.js', 'utf8');
-const usageStart = source.indexOf('function usagePageUrl(');
-const openStart = source.indexOf('function openUsagePage(', usageStart);
-const openEnd = source.indexOf('\nconst AgentMeterIndicator', openStart);
-assert.ok(usageStart >= 0 && openStart > usageStart && openEnd > openStart, 'usage helpers must stay extractable');
+const actionStart = source.indexOf('function providerMenuAction(');
+const actionEnd = source.indexOf('\nconst AgentMeterIndicator', actionStart);
+assert.ok(actionStart >= 0 && actionEnd > actionStart, 'providerMenuAction helper must stay extractable');
 
-const usagePageUrl = eval(`(${source.slice(usageStart, openStart)})`);
-const openUsagePage = eval(`(${source.slice(openStart, openEnd)})`);
+const providerMenuAction = eval(`(${source.slice(actionStart, actionEnd)})`);
 
-const accepted = [
-    'https://chatgpt.com/#settings/usage',
-    'http://github.com/settings/copilot/features',
-    'HTTPS://claude.ai/settings/usage',
-    'https://localhost:8443/usage?view=week',
-    'https://[::1]:8080',
-    'https://chatgpt.com/@user',
-    'https://example.com:1/',
-    'https://example.com:65535/',
-];
-for (const url of accepted)
-    assert.equal(usagePageUrl(`  ${url}  `), url);
-
-const rejected = [
-    null,
-    undefined,
-    12,
-    '',
-    '   ',
-    'javascript:alert(1)',
-    'JAVASCRIPT:alert(1)',
-    'file:///etc/passwd',
-    'data:text/html,hi',
-    'vscode://x',
-    'ftp://example.com/usage',
-    'https:///etc/passwd',
-    'https://',
-    'https:///',
-    'https://host with space/usage',
-    'https://host\u2028name/usage',
-    'not a url',
-    '/relative',
-    '//host/x',
-    'https://user:secret@chatgpt.com/usage',
-    'https://user@host',
-    'https://a.com\\@b.com',
-    // Blocker: control characters [\x00-\x1f\x7f] anywhere in the URL (host, path, query, fragment)
-    'https://a\x01b.com/',
-    'https://a.com/\x00x',
-    'https://a.com/\x7f',
-    'https://a.com/\x1f',
-    'https://a.com/?q=\x05',
-    'https://a.com/#\x02',
-    // Nits: empty host
-    'https://:80/',
-    'https://:80',
-    'https://:',
-    'https://?query',
-    'https://#fragment',
-    // Nits: ports outside 1-65535
-    'https://example.com:99999/',
-    'https://example.com:99999',
-    'https://example.com:0/',
-    'https://example.com:0',
-    'https://example.com:65536/',
-    'https://[::1]:99999',
-    'https://[::1]:0',
-    // Nits: backslashes in host
-    'https://good.com\\evil.com',
-    'https://good.com\\evil.com/',
-    'https://a\\b.com/',
-    'https://\\evil.com',
-];
-for (const value of rejected)
-    assert.equal(usagePageUrl(value), null, `rejected ${JSON.stringify(value)}`);
-
-const launched = [];
-let launchError = null;
-global.create_app_launch_context = (timestamp, workspace) => ({timestamp, workspace});
-const Gio = {
-    AppInfo: {
-        launch_default_for_uri(url, context) {
-            if (launchError)
-                throw launchError;
-            launched.push({url, context});
-            return true;
-        },
-    },
-};
-
-assert.equal(openUsagePage('javascript:alert(1)'), false);
-assert.equal(launched.length, 0, 'Rejected schemes never reach the browser');
-assert.equal(openUsagePage('  https://chatgpt.com/#settings/usage  '), true);
-assert.deepEqual(launched, [{
-    url: 'https://chatgpt.com/#settings/usage',
-    context: {timestamp: 0, workspace: -1},
-}]);
-
-launched.length = 0;
-Gio.AppInfo.launch_default_for_uri = () => false;
-const warnings = [];
-const originalWarn = console.warn;
-console.warn = message => warnings.push(message);
-try {
-    assert.equal(openUsagePage('https://claude.ai/settings/usage'), false);
-    launchError = new Error('no handler');
-    Gio.AppInfo.launch_default_for_uri = () => { throw launchError; };
-    assert.equal(openUsagePage('https://grok.com/#settings/usage'), false);
-} finally {
-    console.warn = originalWarn;
-}
-assert.ok(warnings.some(message => message.includes('no default application')));
-assert.ok(warnings.some(message => message.includes('no handler')));
-
-const openSource = source.slice(openStart, openEnd);
-assert.equal(openSource.includes('xdg-open'), false);
-assert.equal(openSource.includes('Subprocess'), false);
-assert.ok(openSource.includes('launch_default_for_uri'));
+assert.deepEqual(providerMenuAction({id: 'muse', label: 'Muse', status: 'unavailable'}), {
+    action: 'connect',
+    iconName: 'insert-link-symbolic',
+    hint: 'Connect Muse',
+});
+assert.deepEqual(providerMenuAction({id: 'muse', label: 'Muse', status: 'fresh'}), {
+    action: 'refresh',
+    iconName: 'view-refresh-symbolic',
+    hint: 'Refresh Muse limits',
+});
+assert.deepEqual(providerMenuAction({id: 'grok', label: 'Grok Build', status: 'stale'}), {
+    action: 'open',
+    iconName: 'view-refresh-symbolic',
+    hint: 'Open Grok Build to refresh',
+});
+assert.deepEqual(providerMenuAction({id: 'copilot', label: 'GitHub Copilot', status: 'error'}), {
+    action: 'refresh',
+    iconName: 'view-refresh-symbolic',
+    hint: 'Refresh GitHub Copilot limits',
+});
 
 function Actor(props) {
     Object.assign(this, props);
+    this._signals = {};
+    this.children = [];
 }
-Actor.prototype.add_child = function() {};
-const St = {BoxLayout: Actor, Icon: Actor, Label: Actor};
+Actor.prototype.add_child = function(child) {
+    this.children.push(child);
+};
+Actor.prototype.remove_child = function(child) {
+    this.children = this.children.filter(c => c !== child);
+};
+Actor.prototype.connect = function(signal, callback) {
+    this._signals[signal] = callback;
+    return 1;
+};
+Actor.prototype.emit = function(signal, ...args) {
+    return this._signals[signal]?.(this, ...args);
+};
+Actor.prototype.show = function() {
+    this.visible = true;
+};
+Actor.prototype.hide = function() {
+    this.visible = false;
+};
+Actor.prototype.destroy = function() {
+    this.destroyed = true;
+};
+Actor.prototype.get_transformed_position = function() {
+    return [200, 120];
+};
+Actor.prototype.get_transformed_size = function() {
+    return [28, 28];
+};
+Actor.prototype.get_preferred_width = function() {
+    return [0, 120];
+};
+Actor.prototype.get_preferred_height = function() {
+    return [0, 24];
+};
+Actor.prototype.set_position = function(x, y) {
+    this.x = x;
+    this.y = y;
+};
+
+const St = {BoxLayout: Actor, Button: Actor, Icon: Actor, Label: Actor};
 const Clutter = {ActorAlign: {CENTER: 1}};
+const Main = {
+    uiGroup: new Actor({}),
+    layoutManager: {
+        primaryMonitor: {x: 0, y: 0, width: 1920, height: 1080},
+    },
+};
 const PopupMenu = {
     PopupMenuItem: function(text, params) {
         this.text = text;
@@ -174,8 +130,14 @@ function savePosition() {}
 
 const renderStart = source.indexOf('    _renderState(state) {');
 const renderEnd = source.indexOf('    _startControl(action, provider = null) {', renderStart);
+const hintStart = source.indexOf('    _showActionHint(actor, text) {');
+const hintEnd = source.indexOf('    destroy() {', hintStart);
 assert.ok(renderStart >= 0 && renderEnd > renderStart);
-const Indicator = eval(`(class {${source.slice(renderStart, renderEnd)}})`);
+assert.ok(hintStart >= 0 && hintEnd > hintStart);
+const Indicator = eval(`(class {
+${source.slice(renderStart, renderEnd)}
+${source.slice(hintStart, hintEnd)}
+})`);
 const widget = new Indicator();
 const menu = {
     items: [],
@@ -186,68 +148,89 @@ const menu = {
         this.items.push(item);
     },
 };
+const controls = [];
 widget.menu = menu;
 widget._icons = {destroy_all_children() {}, add_child() {}};
 widget._stopSpinner = () => {};
 widget._addSpinner = () => {};
 widget._rebuildDesktop = () => {};
-widget._startControl = () => {};
+widget._startControl = (action, provider) => controls.push({action, provider});
 widget._syncDesktopVisibility = () => {};
 widget._queueClamp = () => {};
 widget._desktop = {set_position() {}};
 widget._desktopVisible = true;
 widget._extension = {};
 widget._refreshPending = false;
+widget._actionHint = null;
+widget._actionHintActor = null;
 
 const state = {
     generated_at: '2026-09-16T20:45:00Z',
     providers: [
-        {id: 'codex', label: 'Codex', status: 'fresh', windows: [{remaining_percent: 72}], usage_url: '  https://chatgpt.com/#settings/usage  '},
+        {id: 'codex', label: 'Codex', status: 'fresh', windows: [{remaining_percent: 72}], usage_url: 'https://chatgpt.com/#settings/usage'},
         {id: 'muse', label: 'Muse', status: 'fresh', windows: [{remaining_percent: 80}]},
-        {id: 'bad', label: 'Bad', status: 'fresh', windows: [{remaining_percent: 10}], usage_url: 'javascript:alert(1)'},
         {id: 'claude', label: 'Claude Code', status: 'unavailable', windows: [{id: 'availability', remaining_percent: 0}], usage_url: 'https://claude.ai/settings/usage'},
         {id: 'grok', label: 'Grok Build', status: 'stale', windows: [{remaining_percent: 40}], usage_url: 'https://grok.com/#settings/usage'},
-        {id: 'local', label: 'Local', status: 'fresh', windows: [{remaining_percent: 5}], usage_url: 'file:///tmp/usage.html'},
         {id: 'copilot', label: 'GitHub Copilot', status: 'error', windows: [{remaining_percent: 1}], usage_url: 'http://github.com/settings/copilot/features'},
     ],
 };
 
-launched.length = 0;
-launchError = null;
-Gio.AppInfo.launch_default_for_uri = (url, context) => {
-    launched.push({url, context});
-    return true;
-};
 widget._renderState(state);
 
 const texts = menu.items.map(item => item.text).filter(Boolean);
-const usageItems = () => menu.items.filter(item => item.text?.includes('→ Open') && item.text.includes('usage…'));
-assert.deepEqual(texts.filter(text => text.includes('→ Open') && text.includes('usage…')), [
-    '  → Open Codex usage…',
-    '  → Open Claude Code usage…',
-    '  → Open Grok Build usage…',
-    '  → Open GitHub Copilot usage…',
-]);
-assert.ok(texts.includes('  → Connect Claude Code…'));
-assert.ok(texts.includes('  → Open Grok Build to refresh…'));
+assert.equal(texts.some(text => text.includes('→ Open') && text.includes('usage…')), false, 'No usage link sub-rows');
+assert.equal(texts.some(text => text.includes('→ Connect')), false, 'No separate Connect sub-rows');
+assert.equal(texts.some(text => text.includes('Open Grok Build to refresh')), false, 'No separate Grok sub-row');
+assert.equal(texts.includes('Refresh usage now'), false, 'No Refresh usage now button at bottom');
 assert.ok(texts.includes('Desktop Widget'));
-assert.ok(texts.includes('Refresh usage now'));
+assert.ok(texts.includes('Reset Widget Position'));
 
-for (const item of usageItems())
-    item.on_activate();
-assert.deepEqual(launched.map(entry => entry.url), [
-    'https://chatgpt.com/#settings/usage',
-    'https://claude.ai/settings/usage',
-    'https://grok.com/#settings/usage',
-    'http://github.com/settings/copilot/features',
+const providerRows = menu.items.filter(item => item.children && item.children.length === 3);
+assert.equal(providerRows.length, state.providers.length, 'Each provider renders a single row with icon, labels, and action button');
+
+const buttons = providerRows.map(row => row.children[2]);
+assert.deepEqual(buttons.map(btn => btn.child.icon_name), [
+    'view-refresh-symbolic',
+    'view-refresh-symbolic',
+    'insert-link-symbolic',
+    'view-refresh-symbolic',
+    'view-refresh-symbolic',
 ]);
-assert.ok(launched.every(entry => entry.context.timestamp === 0 && entry.context.workspace === -1));
+assert.deepEqual(buttons.map(btn => btn._hintText), [
+    'Refresh Codex limits',
+    'Refresh Muse limits',
+    'Connect Claude Code',
+    'Open Grok Build to refresh',
+    'Refresh GitHub Copilot limits',
+]);
+
+// Hover shows hint tooltip and unhover hides it
+buttons[2].hover = true;
+buttons[2].emit('notify::hover');
+assert.ok(widget._actionHint, 'Tooltip label created on hover');
+assert.equal(widget._actionHint.visible, true);
+assert.equal(widget._actionHint.text, 'Connect Claude Code');
+
+buttons[2].hover = false;
+buttons[2].emit('notify::hover');
+assert.equal(widget._actionHint.visible, false);
+
+// Clicking buttons triggers per-provider action
+for (const btn of buttons)
+    btn.emit('clicked');
+assert.deepEqual(controls, [
+    {action: 'refresh', provider: 'codex'},
+    {action: 'refresh', provider: 'muse'},
+    {action: 'connect', provider: 'claude'},
+    {action: 'open', provider: 'grok'},
+    {action: 'refresh', provider: 'copilot'},
+]);
 
 widget._refreshPending = true;
 widget._renderState(state);
-assert.equal(usageItems().length, 0, 'Refresh placeholder replaces usage items');
+assert.equal(menu.items.filter(item => item.children?.length === 3).length, 0, 'Refresh placeholder replaces provider rows');
 widget._refreshPending = false;
 widget._renderState({providers: []});
-assert.equal(usageItems().length, 0);
+assert.equal(menu.items.filter(item => item.children?.length === 3).length, 0);
 
-console.log('Provider usage page menu checks passed');
+console.log('Panel menu action button and hover hint checks passed');

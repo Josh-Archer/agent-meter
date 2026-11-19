@@ -209,3 +209,39 @@
 .agent-meter-connect:hover {
   background-color: rgba(56, 212, 114, 0.35);
 }
+
+.agent-meter-menu-action {
+  margin-left: 10px;
+  padding: 5px 7px;
+  border-radius: 8px;
+  background-color: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  color: #d0d5e0;
+}
+
+.agent-meter-menu-action:hover,
+.agent-meter-menu-action:focus {
+  background-color: rgba(255, 255, 255, 0.16);
+  border-color: rgba(255, 255, 255, 0.28);
+  color: #ffffff;
+}
+
+.agent-meter-menu-action:active {
+  background-color: rgba(255, 255, 255, 0.24);
+}
+
+.agent-meter-menu-action-icon {
+  icon-size: 16px;
+  -st-icon-style: symbolic;
+}
+
+.agent-meter-tooltip {
+  padding: 4px 8px;
+  border-radius: 6px;
+  background-color: rgba(22, 25, 32, 0.96);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  color: #ffffff;
+  font-size: 12px;
+  font-weight: 600;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.45);
+}

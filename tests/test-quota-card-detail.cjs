@@ -8,9 +8,9 @@ const quotaEnd = source.indexOf('function iconFor(', quotaStart);
 const colorStart = source.indexOf('const COLOR_STOPS =');
 const colorEnd = source.indexOf('function limitText(', colorStart);
 const limitStart = colorEnd;
-const limitEnd = source.indexOf('function usagePageUrl(', limitStart);
+const limitEnd = source.indexOf('function providerMenuAction(', limitStart);
 const rebuildStart = source.indexOf('    _rebuildDesktop(state) {');
-const rebuildEnd = source.indexOf('\n    destroy() {', rebuildStart);
+const rebuildEnd = source.indexOf('\n    _showActionHint(', rebuildStart);
 const width = source.match(/const PROGRESS_WIDTH = (\d+);/);
 assert.ok(quotaStart >= 0 && quotaEnd > quotaStart, 'quotaWindows must stay extractable');
 assert.ok(colorStart >= 0 && colorEnd > colorStart, 'quotaColor must stay extractable');
@@ -259,7 +259,7 @@ assert.equal(limitText({
 console.log('Numeric quota cards show plan and N of M used text');
 
 const helpers = eval(`(() => {
-    ${source.slice(source.indexOf('function quotaWindows('), source.indexOf('// Provider state is local JSON.'))}
+    ${source.slice(source.indexOf('function quotaWindows('), source.indexOf('function providerMenuAction('))}
     return {providerRemainingPercent, limitText};
 })()`);
 
