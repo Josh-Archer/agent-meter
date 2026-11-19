@@ -47,6 +47,9 @@ struct Args {
     /// Values are hashes, never bearer tokens.
     #[arg(long)]
     ingest_tokens: Option<PathBuf>,
+    /// Refresh only the matching provider (used with `--once`).
+    #[arg(long)]
+    provider: Option<String>,
 }
 
 fn default_refresh_seconds() -> u64 {
@@ -549,6 +552,171 @@ fn source_hint(index: usize, source: &Source) -> String {
     }
 }
 
+fn normalize_provider_key(raw: &str) -> String {
+    let normalized: String = raw
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let trimmed = normalized.trim_matches('-');
+    if trimmed == "agy" {
+        "antigravity".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+fn source_matches_provider(
+    index: usize,
+    source: &Source,
+    seeded: Option<&ProviderState>,
+    target: &str,
+) -> bool {
+    let target_key = normalize_provider_key(target);
+    if target_key.is_empty() {
+        return false;
+    }
+    if normalize_provider_key(&source_hint(index, source)) == target_key {
+        return true;
+    }
+    if let Some(provider) = seeded {
+        if normalize_provider_key(&provider.id) == target_key {
+            return true;
+        }
+    }
+    match source {
+        Source::Mock { provider } => normalize_provider_key(&provider.id) == target_key,
+        Source::File { path } => path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(|stem| normalize_provider_key(stem) == target_key),
+        Source::Command { program, args, .. } => {
+            let program_path = Path::new(program);
+            if program_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|stem| normalize_provider_key(stem) == target_key)
+            {
+                return true;
+            }
+            if program_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|name| normalize_provider_key(name) == target_key)
+            {
+                return true;
+            }
+            args.iter().any(|arg| {
+                !arg.starts_with('-')
+                    && !arg.is_empty()
+                    && arg
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                    && normalize_provider_key(arg) == target_key
+            })
+        }
+    }
+}
+
+fn state_from_json_output(output: &agent_meter::JsonOutput) -> AgentMeterState {
+    let providers = output
+        .providers
+        .iter()
+        .map(|p| {
+            let windows = p
+                .windows
+                .iter()
+                .map(|w| UsageWindow {
+                    id: w.name.clone(),
+                    label: w.name.clone(),
+                    remaining_percent: w.remaining_percent,
+                    resets_at: w.resets_at.as_deref().and_then(|s| {
+                        chrono::DateTime::parse_from_rfc3339(s)
+                            .ok()
+                            .map(|dt| dt.with_timezone(&Utc))
+                    }),
+                    reset_label: None,
+                })
+                .collect();
+            let status = if !p.available {
+                "unavailable".to_owned()
+            } else if p.stale {
+                "stale".to_owned()
+            } else {
+                "fresh".to_owned()
+            };
+            let updated_at = chrono::DateTime::parse_from_rfc3339(&p.updated_at)
+                .ok()
+                .map(|dt| dt.with_timezone(&Utc));
+            let icon = if p.provider == "agy" {
+                "antigravity".to_owned()
+            } else {
+                p.provider.clone()
+            };
+            ProviderState {
+                id: p.provider.clone(),
+                label: p.provider.clone(),
+                icon,
+                windows,
+                status,
+                detail: None,
+                reason: p.reason.clone(),
+                usage_url: None,
+                updated_at,
+            }
+        })
+        .collect();
+    AgentMeterState {
+        version: STATE_VERSION,
+        generated_at: Utc::now(),
+        providers,
+    }
+}
+
+fn load_existing_state(state_path: &Path, stable_path: &Path) -> Option<AgentMeterState> {
+    for path in [state_path, stable_path] {
+        if let Ok(state) = agent_meter::read_state(path) {
+            return Some(state);
+        }
+        if let Ok(raw) = std::fs::read_to_string(path) {
+            if let Ok(output) = serde_json::from_str::<agent_meter::JsonOutput>(&raw) {
+                let mut state = state_from_json_output(&output);
+                if state.validate().is_ok() {
+                    return Some(state);
+                }
+                sanitize_state(&mut state);
+                return Some(state);
+            }
+        }
+    }
+    None
+}
+
+fn seed_last_good_from_state(
+    sources: &[Source],
+    existing: &AgentMeterState,
+    last_good: &mut HashMap<usize, ProviderState>,
+) {
+    let mut claimed = vec![false; existing.providers.len()];
+    for (index, source) in sources.iter().enumerate() {
+        if let Some((p_idx, provider)) = existing.providers.iter().enumerate().find(|(p_idx, p)| {
+            !claimed[*p_idx] && source_matches_provider(index, source, None, &p.id)
+        }) {
+            claimed[p_idx] = true;
+            last_good.insert(index, provider.clone());
+        }
+    }
+    if existing.providers.len() == sources.len() {
+        for index in 0..sources.len() {
+            if !last_good.contains_key(&index) && !claimed[index] {
+                claimed[index] = true;
+                last_good.insert(index, existing.providers[index].clone());
+            }
+        }
+    }
+}
+
 fn keeps_last_good(provider: &ProviderState) -> bool {
     provider.status != "unavailable" && provider.status != "error"
 }
@@ -702,11 +870,12 @@ fn record_source(
             detail,
             reason,
         } => {
-            if let Some(previous) = last_good.get(&index) {
+            if let Some(previous) = last_good.get(&index).filter(|p| keeps_last_good(p)) {
                 let stale = mark_stale(previous.clone(), &detail);
                 last_good.insert(index, stale.clone());
                 stale
             } else {
+                last_good.remove(&index);
                 unavailable(&hint, &detail, reason)
             }
         }
@@ -743,15 +912,27 @@ fn refresh(config: &Config) -> AgentMeterState {
     refresh_publishing(config, &mut last_good, |_| {})
 }
 
-/// Refresh every source with at most `max_concurrent_refreshes` in flight.
+#[cfg(test)]
+fn refresh_publishing(
+    config: &Config,
+    last_good: &mut HashMap<usize, ProviderState>,
+    publish: impl FnMut(&AgentMeterState),
+) -> AgentMeterState {
+    refresh_publishing_target(config, None, last_good, publish)
+}
+
+/// Refresh either all sources (`target_provider = None`) or only sources
+/// matching `target_provider`, preserving existing `last_good` entries in
+/// `slots` for non-targeted sources without executing their adapter commands.
 ///
 /// `publish` runs as soon as a source settles, with source order preserved.
 /// Providers still running keep their previous last-good snapshot. The wave
 /// stops at `refresh_deadline_seconds` even when a per-source timeout is longer.
 /// `last_good` survives across calls so a later failure can be marked stale
 /// without moving that provider's `updated_at`.
-fn refresh_publishing(
+fn refresh_publishing_target(
     config: &Config,
+    target_provider: Option<&str>,
     last_good: &mut HashMap<usize, ProviderState>,
     mut publish: impl FnMut(&AgentMeterState),
 ) -> AgentMeterState {
@@ -765,8 +946,38 @@ fn refresh_publishing(
         return state;
     }
 
+    let targeted: Vec<bool> = match target_provider {
+        Some(target) => config
+            .sources
+            .iter()
+            .enumerate()
+            .map(|(index, source)| {
+                source_matches_provider(index, source, last_good.get(&index), target)
+            })
+            .collect(),
+        None => vec![true; config.sources.len()],
+    };
+
+    let mut slots = vec![None; config.sources.len()];
+    let mut targeted_indices = Vec::new();
+    for (index, &is_targeted) in targeted.iter().enumerate() {
+        if is_targeted {
+            targeted_indices.push(index);
+        } else if let Some(existing) = last_good.get(&index) {
+            slots[index] = Some(existing.clone());
+        }
+    }
+
+    if targeted_indices.is_empty() {
+        let latest = snapshot_from(&slots, last_good, false);
+        publish(&latest);
+        return latest;
+    }
+
     let deadline = refresh_deadline_instant(config);
-    let worker_count = effective_concurrency(config);
+    let worker_count = effective_concurrency(config)
+        .min(targeted_indices.len())
+        .max(1);
     // Workers borrow the queue for the whole `thread::scope` lifetime, so it
     // cannot be a local inside the scope closure.
     let (job_tx, job_rx) = mpsc::channel::<usize>();
@@ -794,13 +1005,12 @@ fn refresh_publishing(
         }
         drop(result_tx);
 
-        for index in 0..config.sources.len() {
+        let mut outstanding = targeted_indices.len();
+        for index in targeted_indices {
             let _ = job_tx.send(index);
         }
         drop(job_tx);
 
-        let mut slots = vec![None; config.sources.len()];
-        let mut outstanding = config.sources.len();
         let mut latest = AgentMeterState {
             version: STATE_VERSION,
             generated_at: Utc::now(),
@@ -830,9 +1040,9 @@ fn refresh_publishing(
             publish(&latest);
         }
 
-        if slots.iter().any(|slot| slot.is_none()) {
+        if (0..slots.len()).any(|index| targeted[index] && slots[index].is_none()) {
             for index in 0..slots.len() {
-                if slots[index].is_none() {
+                if targeted[index] && slots[index].is_none() {
                     record_source(
                         index,
                         SourceRefresh::Failed {
@@ -1004,6 +1214,11 @@ fn main() -> Result<()> {
     };
 
     let mut last_good: HashMap<usize, ProviderState> = HashMap::new();
+    if args.provider.is_some() {
+        if let Some(existing) = load_existing_state(&state_path, &agent_meter::stable_state_path()) {
+            seed_last_good_from_state(&config.sources, &existing, &mut last_good);
+        }
+    }
     let mut last_good_state: Option<AgentMeterState> = None;
     let mut did_refresh = false;
     let mut next_refresh = Instant::now();
@@ -1013,11 +1228,16 @@ fn main() -> Result<()> {
         }
         if (args.watch || !did_refresh) && Instant::now() >= next_refresh {
             let mut write_error: Option<anyhow::Error> = None;
-            let final_state = refresh_publishing(&config, &mut last_good, |state| {
-                if let Err(err) = emit_state(&state_path, state, &mut last_good_state) {
-                    write_error = Some(err);
-                }
-            });
+            let final_state = refresh_publishing_target(
+                &config,
+                args.provider.as_deref(),
+                &mut last_good,
+                |state| {
+                    if let Err(err) = emit_state(&state_path, state, &mut last_good_state) {
+                        write_error = Some(err);
+                    }
+                },
+            );
             if config.forecast.enabled {
                 update_forecast_history(&config.forecast, &final_state);
             }
@@ -2141,5 +2361,171 @@ mod tests {
         let loaded = forecast::load_history(&history_file).unwrap();
         assert!(loaded.windows.is_empty());
         assert!(!notifications_file.exists());
+    }
+
+    #[test]
+    fn single_provider_refresh_only_executes_matching_source_and_preserves_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let stable_path = dir.path().join("stable-state.json");
+        let untouched_marker = dir.path().join("codex-executed.marker");
+
+        let mut codex_existing = fresh_provider("codex", 75.0);
+        let earlier = Utc::now() - Duration::minutes(10);
+        codex_existing.updated_at = Some(earlier);
+
+        let mut agy_existing = fresh_provider("antigravity", 60.0);
+        agy_existing.updated_at = Some(earlier);
+
+        let mut muse_existing = fresh_provider("muse", 40.0);
+        muse_existing.updated_at = Some(earlier);
+
+        let existing_state = AgentMeterState {
+            version: STATE_VERSION,
+            generated_at: earlier,
+            providers: vec![codex_existing.clone(), agy_existing.clone(), muse_existing],
+        };
+        write_state(&state_path, &existing_state).unwrap();
+
+        let muse_updated = fresh_provider("muse", 92.0);
+        let codex_fresh = fresh_provider("codex", 10.0);
+        let codex_json = serde_json::to_string(&codex_fresh).unwrap();
+        let muse_json = serde_json::to_string(&muse_updated).unwrap();
+
+        let config = Config {
+            refresh_seconds: 60,
+            command_timeout_seconds: 5,
+            max_concurrent_refreshes: 4,
+            refresh_deadline_seconds: 5,
+            sources: vec![
+                Source::Command {
+                    program: "sh".into(),
+                    args: vec![
+                        "-c".into(),
+                        format!(
+                            "touch '{}' && echo '{codex_json}'",
+                            untouched_marker.display()
+                        ),
+                    ],
+                    timeout_seconds: Some(5),
+                },
+                Source::Mock {
+                    provider: fresh_provider("antigravity", 15.0),
+                },
+                Source::Command {
+                    program: "sh".into(),
+                    args: vec!["-c".into(), format!("echo '{muse_json}'")],
+                    timeout_seconds: Some(5),
+                },
+            ],
+            forecast: ForecastConfig::default(),
+        };
+
+        let mut last_good = HashMap::new();
+        let loaded = load_existing_state(&state_path, &stable_path)
+            .expect("existing state should load from state_path");
+        seed_last_good_from_state(&config.sources, &loaded, &mut last_good);
+
+        let state = refresh_publishing_target(&config, Some("muse"), &mut last_good, |_| {});
+
+        assert!(
+            !untouched_marker.exists(),
+            "non-targeted command source must not be executed"
+        );
+        assert_eq!(state.providers.len(), 3);
+        assert_eq!(state.providers[0].id, "codex");
+        assert_eq!(state.providers[0].windows[0].remaining_percent, Some(75.0));
+        assert_eq!(state.providers[0].updated_at, Some(earlier));
+
+        assert_eq!(state.providers[1].id, "antigravity");
+        assert_eq!(state.providers[1].windows[0].remaining_percent, Some(60.0));
+        assert_eq!(state.providers[1].updated_at, Some(earlier));
+
+        assert_eq!(state.providers[2].id, "muse");
+        assert_eq!(state.providers[2].windows[0].remaining_percent, Some(92.0));
+        assert!(state.providers[2].updated_at.unwrap() > earlier);
+    }
+
+    #[test]
+    fn single_provider_refresh_handles_agy_equivalence_and_stable_state_fallback() {
+        let parsed = Args::try_parse_from(["agent-meterd", "--once", "--provider", "muse"])
+            .expect("--provider flag should parse");
+        assert_eq!(parsed.provider.as_deref(), Some("muse"));
+        assert!(parsed.once);
+
+        let dir = tempfile::tempdir().unwrap();
+        let missing_runtime_state = dir.path().join("missing-runtime-state.json");
+        let stable_path = dir.path().join("stable-state.json");
+        let untouched_marker = dir.path().join("codex-executed.marker");
+
+        let earlier = Utc::now() - Duration::minutes(5);
+        let mut codex_existing = fresh_provider("codex", 88.0);
+        codex_existing.updated_at = Some(earlier);
+        let mut agy_existing = fresh_provider("antigravity", 30.0);
+        agy_existing.updated_at = Some(earlier);
+
+        let seed_state = AgentMeterState {
+            version: STATE_VERSION,
+            generated_at: earlier,
+            providers: vec![codex_existing, agy_existing],
+        };
+        agent_meter::write_json_output(&stable_path, &seed_state).unwrap();
+
+        let agy_refreshed = fresh_provider("antigravity", 97.0);
+        let agy_json = serde_json::to_string(&agy_refreshed).unwrap();
+        let script_path = dir.path().join("agent-meter-adapter");
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"agy\" ]; then\n  echo '{agy_json}'\nelse\n  touch '{}'\nfi\n",
+                untouched_marker.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms).unwrap();
+        }
+
+        let config = Config {
+            refresh_seconds: 60,
+            command_timeout_seconds: 5,
+            max_concurrent_refreshes: 4,
+            refresh_deadline_seconds: 5,
+            sources: vec![
+                Source::Command {
+                    program: script_path.to_string_lossy().into_owned(),
+                    args: vec!["codex".into()],
+                    timeout_seconds: Some(5),
+                },
+                Source::Command {
+                    program: script_path.to_string_lossy().into_owned(),
+                    args: vec!["agy".into()],
+                    timeout_seconds: Some(5),
+                },
+            ],
+            forecast: ForecastConfig::default(),
+        };
+
+        let mut last_good = HashMap::new();
+        let loaded = load_existing_state(&missing_runtime_state, &stable_path)
+            .expect("should fall back to stable state path");
+        seed_last_good_from_state(&config.sources, &loaded, &mut last_good);
+
+        let state =
+            refresh_publishing_target(&config, Some("antigravity"), &mut last_good, |_| {});
+
+        assert!(
+            !untouched_marker.exists(),
+            "codex source must not run when refreshing antigravity"
+        );
+        assert_eq!(state.providers.len(), 2);
+        assert_eq!(state.providers[0].id, "codex");
+        assert_eq!(state.providers[0].windows[0].remaining_percent, Some(88.0));
+        assert_eq!(state.providers[1].id, "antigravity");
+        assert_eq!(state.providers[1].windows[0].remaining_percent, Some(97.0));
     }
 }
