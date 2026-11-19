@@ -63,8 +63,88 @@ for (const [actual, expected] of asserts) {
 }
 console.log('quotaColor progressive scale validated successfully across all stops');
 """
+icon_cache_test = r"""
+const assert = require('node:assert/strict');
+const source = require('fs').readFileSync('gnome-extension/agent-meter@local/extension.js', 'utf8');
+const iconStart = source.indexOf('function iconFor(');
+const iconEnd = source.indexOf('const COLOR_STOPS =', iconStart);
+assert.ok(iconStart >= 0 && iconEnd > iconStart, 'iconFor must be extractable');
+
+let queryExistsCalls = 0;
+let fileIconCalls = 0;
+const Gio = {
+  FileIcon: class FileIcon {
+    constructor({file}) {
+      fileIconCalls++;
+      this.file = file;
+    }
+  },
+};
+
+const iconFor = eval(`(() => {
+${source.slice(iconStart, iconEnd)}
+return iconFor;
+})()`);
+
+function makeExt(symbolicExists = true) {
+  return {
+    dir: {
+      get_child(dirName) {
+        assert.equal(dirName, 'icons');
+        return {
+          get_child(fileName) {
+            return {
+              fileName,
+              query_exists() {
+                queryExistsCalls++;
+                return symbolicExists;
+              },
+            };
+          },
+        };
+      },
+    },
+  };
+}
+
+const ext = makeExt(true);
+const codex1 = iconFor(ext, 'codex');
+const codex2 = iconFor(ext, 'codex');
+assert.strictEqual(codex1, codex2, 'Repeated codex calls must return identical cached FileIcon');
+assert.equal(queryExistsCalls, 1, 'query_exists called once for codex');
+assert.equal(fileIconCalls, 1, 'Gio.FileIcon constructed once for codex');
+assert.equal(codex1.file.fileName, 'codex-symbolic.svg');
+
+const agy1 = iconFor(ext, 'agy');
+const agy2 = iconFor(ext, 'agy');
+const antigravity = iconFor(ext, 'antigravity');
+assert.strictEqual(agy1, agy2, 'Repeated agy calls must return identical cached FileIcon');
+assert.strictEqual(agy1, antigravity, 'agy and antigravity share normalized cache entry');
+assert.equal(queryExistsCalls, 2, 'query_exists called once per normalized symbol');
+assert.equal(fileIconCalls, 2, 'Gio.FileIcon constructed once per normalized symbol');
+assert.equal(agy1.file.fileName, 'antigravity-symbolic.svg');
+
+const extFallback = makeExt(false);
+const fallback1 = iconFor(extFallback, 'codex');
+const fallback2 = iconFor(extFallback, 'codex');
+assert.strictEqual(fallback1, fallback2, 'Fallback non-symbolic icon must also be cached');
+assert.notStrictEqual(fallback1, codex1, 'Cache must be scoped per extension instance');
+assert.equal(fallback1.file.fileName, 'codex.svg');
+assert.equal(queryExistsCalls, 3);
+assert.equal(fileIconCalls, 3);
+
+const unknown1 = iconFor(ext, 'unknown-provider');
+const unknown2 = iconFor(ext, 'generic');
+assert.strictEqual(unknown1, unknown2, 'Unknown symbols normalize to generic cache entry');
+assert.equal(unknown1.file.fileName, 'generic-symbolic.svg');
+assert.equal(queryExistsCalls, 4);
+assert.equal(fileIconCalls, 4);
+
+console.log('iconFor caching validated successfully');
+"""
 subprocess.run(["node", "tests/test-quota-card-detail.cjs"], check=True, cwd=root)
 subprocess.run(["node", "-e", js_test], check=True, cwd=root)
+subprocess.run(["node", "-e", icon_cache_test], check=True, cwd=root)
 subprocess.run(["node", "tests/test-drag.cjs"], check=True, cwd=root)
 subprocess.run(["node", "tests/test-refresh.cjs"], check=True, cwd=root)
 subprocess.run(["node", "tests/test-desktop-visible.cjs"], check=True, cwd=root)
