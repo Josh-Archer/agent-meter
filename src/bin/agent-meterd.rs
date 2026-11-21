@@ -1116,6 +1116,19 @@ fn seed_last_good_from_state(
         }
     }
 
+    // Sources with no identifying hint (a generic `sh -c ...` command) cannot
+    // be matched by name. Snapshots keep source order, so when the previous
+    // state has one provider per source, the leftovers pair up by position.
+    if existing.providers.len() == config.sources.len() {
+        for &(index, provider) in &eligible {
+            if !matched_providers[index] && !assigned_sources[index] {
+                assigned_sources[index] = true;
+                matched_providers[index] = true;
+                seeded.insert(index, provider.clone());
+            }
+        }
+    }
+
     seeded
 }
 
