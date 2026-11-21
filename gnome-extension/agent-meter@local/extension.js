@@ -667,15 +667,24 @@ class AgentMeterIndicator extends PanelMenu.Button {
     _startControl(action, provider = null) {
         const home = GLib.get_home_dir();
         const localConnect = GLib.build_filenamev([home, '.local', 'bin', 'agent-meter-connect']);
+        const localMeterd = GLib.build_filenamev([home, '.local', 'bin', 'agent-meterd']);
         const providerCommand = ['connect', 'open'].includes(action);
-        const executable = providerCommand
-            ? (GLib.file_test(localConnect, GLib.FileTest.IS_EXECUTABLE)
+        const meterdExecutable = action === 'refresh' && provider
+            ? (GLib.file_test(localMeterd, GLib.FileTest.IS_EXECUTABLE)
+                ? localMeterd
+                : GLib.find_program_in_path('agent-meterd'))
+            : null;
+        let argv;
+        if (providerCommand) {
+            const executable = GLib.file_test(localConnect, GLib.FileTest.IS_EXECUTABLE)
                 ? localConnect
-                : (GLib.find_program_in_path('agent-meter-connect') ?? 'agent-meter-connect'))
-            : 'systemctl';
-        const argv = providerCommand
-            ? [executable, ...(action === 'open' ? ['--mode', 'open'] : []), provider]
-            : [executable, '--user', 'restart', 'agent-meter.service'];
+                : (GLib.find_program_in_path('agent-meter-connect') ?? 'agent-meter-connect');
+            argv = [executable, ...(action === 'open' ? ['--mode', 'open'] : []), provider];
+        } else if (meterdExecutable) {
+            argv = [meterdExecutable, '--once', '--provider', provider];
+        } else {
+            argv = ['systemctl', '--user', 'restart', 'agent-meter.service'];
+        }
         try {
             Gio.Subprocess.new(argv, Gio.SubprocessFlags.NONE);
             if (action === 'refresh') {

@@ -8,12 +8,15 @@ const end = source.indexOf('    _renderState(state) {', start);
 const controlStart = source.indexOf('    _startControl(action, provider = null) {');
 const controlEnd = source.indexOf('    _rebuildDesktop(state) {', controlStart);
 let timeoutCallbacks = [];
+let fileTestImpl = () => false;
+let findProgramImpl = () => null;
+let spawnedArgvs = [];
 const GLib = {
     get_home_dir: () => '/home/test',
     get_user_runtime_dir: () => '/run/user/1000',
     build_filenamev: parts => parts.join('/'),
-    file_test: () => false,
-    find_program_in_path: () => null,
+    file_test: (path, test) => fileTestImpl(path, test),
+    find_program_in_path: name => findProgramImpl(name),
     FileTest: {IS_EXECUTABLE: 1},
     PRIORITY_DEFAULT: 0,
     SOURCE_REMOVE: false,
@@ -50,7 +53,8 @@ const Gio = {
     },
     SubprocessFlags: {NONE: 0},
     Subprocess: {
-        new: () => {
+        new: argv => {
+            spawnedArgvs.push(argv);
             if (subprocessShouldThrow)
                 throw new Error('spawn failed');
             return {};
@@ -218,5 +222,38 @@ usageToday = null;
 widget._refresh();
 assert.equal(renders, rendersBeforeUsageToday + 3, 'Clearing usage-today label triggers re-render');
 assert.equal(widget._usageTodayLabel, null);
+
+// Single-provider refresh uses agent-meterd --once --provider <id> when available
+widget._renderState = () => { renders++; isSpinning = Boolean(widget._refreshPending); };
+spawnedArgvs = [];
+timeoutCallbacks = [];
+fileTestImpl = path => path === '/home/test/.local/bin/agent-meterd';
+widget._startControl('refresh', 'muse');
+assert.deepEqual(
+    spawnedArgvs[0],
+    ['/home/test/.local/bin/agent-meterd', '--once', '--provider', 'muse'],
+    'Per-provider refresh spawns local agent-meterd with --once --provider'
+);
+
+spawnedArgvs = [];
+timeoutCallbacks = [];
+fileTestImpl = () => false;
+findProgramImpl = name => (name === 'agent-meterd' ? '/usr/local/bin/agent-meterd' : null);
+widget._startControl('refresh', 'muse');
+assert.deepEqual(
+    spawnedArgvs[0],
+    ['/usr/local/bin/agent-meterd', '--once', '--provider', 'muse'],
+    'Per-provider refresh falls back to PATH agent-meterd when local binary is absent'
+);
+
+spawnedArgvs = [];
+timeoutCallbacks = [];
+findProgramImpl = () => null;
+widget._startControl('refresh', 'muse');
+assert.deepEqual(
+    spawnedArgvs[0],
+    ['systemctl', '--user', 'restart', 'agent-meter.service'],
+    'Per-provider refresh falls back to systemctl when agent-meterd is unavailable'
+);
 
 console.log('Change-driven rendering checks passed');
