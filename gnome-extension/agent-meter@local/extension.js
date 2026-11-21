@@ -284,6 +284,7 @@ class AgentMeterIndicator extends PanelMenu.Button {
         this._clampIdle = null;
         this._refreshPending = false;
         this._renderKey = null;
+        this._usageTodayLabel = undefined;
         this._spinnerActor = null;
         this._spinnerSource = null;
         this._spinnerAngle = 0;
@@ -459,6 +460,10 @@ class AgentMeterIndicator extends PanelMenu.Button {
         }
     }
 
+    _readUsageToday() {
+        return usageTodayLabel();
+    }
+
     _stopSpinner() {
         if (this._spinnerSource) {
             GLib.Source.remove(this._spinnerSource);
@@ -492,11 +497,13 @@ class AgentMeterIndicator extends PanelMenu.Button {
         if (this._dragState)
             return;
         const state = this._readState();
+        const usageToday = this._readUsageToday ? this._readUsageToday() : null;
         // Keep existing actors, menu state, and spinner when nothing visible changed.
         // generated_at is retained so the displayed update time still advances.
-        const key = JSON.stringify([state, this._refreshPending, this._desktopVisible]);
+        const key = JSON.stringify([state, this._refreshPending, this._desktopVisible, usageToday]);
         if (key === this._renderKey)
             return;
+        this._usageTodayLabel = usageToday;
         this._renderState(state);
         this._renderKey = key;
     }
@@ -697,10 +704,10 @@ class AgentMeterIndicator extends PanelMenu.Button {
         this._attachDragHandle(header);
         this._desktop.add_child(header);
 
-        const todayText = usageTodayLabel();
-        if (typeof todayText === 'string' && todayText.length > 0) {
+        const todayLabel = this._usageTodayLabel !== undefined ? this._usageTodayLabel : usageTodayLabel();
+        if (typeof todayLabel === 'string' && todayLabel.length > 0) {
             this._desktop.add_child(new St.Label({
-                text: todayText,
+                text: todayLabel,
                 style_class: 'agent-meter-usage-today',
             }));
         }
