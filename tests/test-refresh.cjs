@@ -195,4 +195,28 @@ assert.equal(widget._stateMonitorChangedId, null, 'Monitor failure resets _state
 assert.ok(source.includes('this._startStateMonitor();'), 'Indicator initializes runtime monitor');
 assert.ok(source.includes('this._stateMonitor.cancel();'), 'Indicator cancels runtime monitor on destroy');
 
+// Usage-today label changes must trigger a re-render even when state is unchanged
+widget._renderState = () => { renders++; isSpinning = Boolean(widget._refreshPending); };
+widget._refresh();
+let usageToday = null;
+widget._readUsageToday = () => usageToday;
+const rendersBeforeUsageToday = renders;
+widget._refresh();
+assert.equal(renders, rendersBeforeUsageToday, 'Null usage-today matches initial null key');
+assert.equal(widget._usageTodayLabel, null);
+usageToday = 'Today: 12.4k tok';
+widget._refresh();
+assert.equal(renders, rendersBeforeUsageToday + 1, 'Changing usage-today from null to label triggers re-render');
+assert.equal(widget._usageTodayLabel, 'Today: 12.4k tok');
+widget._refresh();
+assert.equal(renders, rendersBeforeUsageToday + 1, 'Unchanged usage-today label must not re-render');
+usageToday = 'Today: 15.0k tok';
+widget._refresh();
+assert.equal(renders, rendersBeforeUsageToday + 2, 'Updated usage-today label triggers re-render');
+assert.equal(widget._usageTodayLabel, 'Today: 15.0k tok');
+usageToday = null;
+widget._refresh();
+assert.equal(renders, rendersBeforeUsageToday + 3, 'Clearing usage-today label triggers re-render');
+assert.equal(widget._usageTodayLabel, null);
+
 console.log('Change-driven rendering checks passed');
