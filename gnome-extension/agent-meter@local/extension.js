@@ -122,12 +122,20 @@ function iconFor(extension, symbol) {
         symbol = 'antigravity';
     const allowed = new Set(['codex', 'antigravity', 'grok', 'copilot', 'claude', 'muse', 'generic']);
     const name = allowed.has(symbol) ? symbol : 'generic';
+    let cache = null;
+    if (extension && typeof extension === 'object') {
+        extension._iconCache ??= new Map();
+        cache = extension._iconCache;
+        if (cache.has(name))
+            return cache.get(name);
+    }
     const iconsDir = extension.dir.get_child('icons');
     const symbolicFile = iconsDir.get_child(`${name}-symbolic.svg`);
-    if (symbolicFile.query_exists(null)) {
-        return new Gio.FileIcon({file: symbolicFile});
-    }
-    return new Gio.FileIcon({file: iconsDir.get_child(`${name}.svg`)});
+    const icon = symbolicFile.query_exists(null)
+        ? new Gio.FileIcon({file: symbolicFile})
+        : new Gio.FileIcon({file: iconsDir.get_child(`${name}.svg`)});
+    cache?.set(name, icon);
+    return icon;
 }
 
 const COLOR_STOPS = [
@@ -275,7 +283,10 @@ class AgentMeterIndicator extends PanelMenu.Button {
         this._dragHandle = null;
         this._clampIdle = null;
         this._refreshPending = false;
+        this._stateMonitor = null;
+        this._stateMonitorChangedId = null;
         this._renderKey = null;
+        this._usageTodayLabel = undefined;
         this._spinnerActor = null;
         this._spinnerSource = null;
         this._spinnerAngle = 0;
@@ -308,6 +319,7 @@ class AgentMeterIndicator extends PanelMenu.Button {
 
         this._refresh();
         this._syncDesktopVisibility();
+        this._startStateMonitor();
         this._timeout = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, POLL_SECONDS, () => {
             this._refresh();
             return GLib.SOURCE_CONTINUE;
@@ -439,6 +451,28 @@ class AgentMeterIndicator extends PanelMenu.Button {
         this._queueClamp();
     }
 
+    _startStateMonitor() {
+        try {
+            const dir = Gio.File.new_build_filenamev([GLib.get_user_runtime_dir(), 'agent-meter']);
+            this._stateMonitor = dir.monitor_directory(Gio.FileMonitorFlags.NONE, null);
+            this._stateMonitorChangedId = this._stateMonitor.connect(
+                'changed',
+                (_monitor, file, otherFile) => {
+                    const name = file?.get_basename?.() ?? otherFile?.get_basename?.();
+                    if (name === 'state.json' || name === 'usage-today.json') {
+                        if (name === 'state.json')
+                            this._refreshPending = false;
+                        this._refresh();
+                    }
+                }
+            );
+        } catch (error) {
+            console.debug(`Agent Meter could not monitor runtime state: ${error.message}`);
+            this._stateMonitor = null;
+            this._stateMonitorChangedId = null;
+        }
+    }
+
     _readState() {
         try {
             const [ok, bytes] = runtimeStateFile().load_contents(null);
@@ -449,6 +483,10 @@ class AgentMeterIndicator extends PanelMenu.Button {
             console.debug(`Agent Meter has no readable state: ${error.message}`);
             return null;
         }
+    }
+
+    _readUsageToday() {
+        return usageTodayLabel();
     }
 
     _stopSpinner() {
@@ -484,11 +522,13 @@ class AgentMeterIndicator extends PanelMenu.Button {
         if (this._dragState)
             return;
         const state = this._readState();
+        const usageToday = this._readUsageToday ? this._readUsageToday() : null;
         // Keep existing actors, menu state, and spinner when nothing visible changed.
         // generated_at is retained so the displayed update time still advances.
-        const key = JSON.stringify([state, this._refreshPending, this._desktopVisible]);
+        const key = JSON.stringify([state, this._refreshPending, this._desktopVisible, usageToday]);
         if (key === this._renderKey)
             return;
+        this._usageTodayLabel = usageToday;
         this._renderState(state);
         this._renderKey = key;
     }
@@ -698,10 +738,10 @@ class AgentMeterIndicator extends PanelMenu.Button {
         this._attachDragHandle(header);
         this._desktop.add_child(header);
 
-        const todayText = usageTodayLabel();
-        if (typeof todayText === 'string' && todayText.length > 0) {
+        const todayLabel = this._usageTodayLabel !== undefined ? this._usageTodayLabel : usageTodayLabel();
+        if (typeof todayLabel === 'string' && todayLabel.length > 0) {
             this._desktop.add_child(new St.Label({
-                text: todayText,
+                text: todayLabel,
                 style_class: 'agent-meter-usage-today',
             }));
         }
@@ -838,6 +878,15 @@ class AgentMeterIndicator extends PanelMenu.Button {
             GLib.Source.remove(this._timeout);
             this._timeout = null;
         }
+        if (this._stateMonitorChangedId && this._stateMonitor) {
+            this._stateMonitor.disconnect(this._stateMonitorChangedId);
+            this._stateMonitorChangedId = null;
+        }
+        if (this._stateMonitor) {
+            this._stateMonitor.cancel();
+            this._stateMonitor = null;
+        }
+        this._stateMonitorChangedId = null;
         if (this._clampIdle) {
             GLib.Source.remove(this._clampIdle);
             this._clampIdle = null;

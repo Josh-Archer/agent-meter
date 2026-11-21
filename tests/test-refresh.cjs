@@ -1,6 +1,8 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const source = fs.readFileSync('gnome-extension/agent-meter@local/extension.js', 'utf8');
+const monitorStart = source.indexOf('    _startStateMonitor() {');
+const monitorEnd = source.indexOf('    _readState() {', monitorStart);
 const start = source.indexOf('    _refresh() {');
 const end = source.indexOf('    _renderState(state) {', start);
 const controlStart = source.indexOf('    _startControl(action, provider = null) {');
@@ -11,6 +13,7 @@ let findProgramImpl = () => null;
 let spawnedArgvs = [];
 const GLib = {
     get_home_dir: () => '/home/test',
+    get_user_runtime_dir: () => '/run/user/1000',
     build_filenamev: parts => parts.join('/'),
     file_test: (path, test) => fileTestImpl(path, test),
     find_program_in_path: name => findProgramImpl(name),
@@ -23,7 +26,31 @@ const GLib = {
     },
 };
 let subprocessShouldThrow = true;
+let monitorShouldThrow = false;
+let monitoredPath = null;
+let monitorChangedCallback = null;
 const Gio = {
+    FileMonitorFlags: {NONE: 0},
+    File: {
+        new_build_filenamev: parts => ({
+            monitor_directory: (flags, cancellable) => {
+                assert.equal(flags, 0);
+                assert.equal(cancellable, null);
+                if (monitorShouldThrow)
+                    throw new Error('monitor failed');
+                monitoredPath = parts.join('/');
+                return {
+                    connect: (signal, cb) => {
+                        assert.equal(signal, 'changed');
+                        monitorChangedCallback = cb;
+                        return 99;
+                    },
+                    disconnect: () => {},
+                    cancel: () => {},
+                };
+            },
+        }),
+    },
     SubprocessFlags: {NONE: 0},
     Subprocess: {
         new: argv => {
@@ -35,6 +62,7 @@ const Gio = {
     },
 };
 const Refresh = eval(`(class {
+${source.slice(monitorStart, monitorEnd)}
 ${source.slice(start, end)}
 ${source.slice(controlStart, controlEnd)}
 })`);
@@ -129,6 +157,71 @@ try {
     console.warn = originalWarn;
 }
 assert.equal(widget._refreshPending, false, 'Pending flag is cleared on async completion error');
+
+// Runtime directory monitor refreshes on state.json / usage-today.json and ignores unrelated files
+widget._renderState = () => { renders++; isSpinning = Boolean(widget._refreshPending); };
+let refreshCalls = 0;
+const origRefresh = widget._refresh.bind(widget);
+widget._refresh = () => {
+    refreshCalls++;
+    origRefresh();
+};
+
+widget._startStateMonitor();
+assert.equal(monitoredPath, '/run/user/1000/agent-meter');
+assert.equal(widget._stateMonitorChangedId, 99);
+assert.ok(typeof monitorChangedCallback === 'function');
+
+const rendersBeforeStateChange = renders;
+widget._refreshPending = true;
+state = {generated_at: '2026-09-12T10:15:00Z', providers: [{id: 'grok', status: 'fresh', windows: [{remaining_percent: 2}]}]};
+monitorChangedCallback(widget._stateMonitor, {get_basename: () => 'state.json'}, null, 0);
+assert.equal(refreshCalls, 1, 'state.json change triggers _refresh()');
+assert.equal(widget._refreshPending, false, 'state.json change clears _refreshPending');
+assert.equal(isSpinning, false, 'state.json change clears spinner');
+assert.equal(renders, rendersBeforeStateChange + 1, 'state.json change renders updated state');
+
+widget._refreshPending = true;
+monitorChangedCallback(widget._stateMonitor, null, {get_basename: () => 'usage-today.json'}, 0);
+assert.equal(refreshCalls, 2, 'usage-today.json change via otherFile triggers _refresh()');
+assert.equal(widget._refreshPending, true, 'usage-today.json change preserves _refreshPending');
+
+monitorChangedCallback(widget._stateMonitor, {get_basename: () => 'position.json'}, null, 0);
+monitorChangedCallback(widget._stateMonitor, null, {get_basename: () => 'other.tmp'}, 0);
+monitorChangedCallback(widget._stateMonitor, null, null, 0);
+assert.equal(refreshCalls, 2, 'Unrelated file changes must not trigger _refresh()');
+
+monitorShouldThrow = true;
+widget._startStateMonitor();
+assert.equal(widget._stateMonitor, null, 'Monitor failure resets _stateMonitor');
+assert.equal(widget._stateMonitorChangedId, null, 'Monitor failure resets _stateMonitorChangedId');
+
+assert.ok(source.includes('this._startStateMonitor();'), 'Indicator initializes runtime monitor');
+assert.ok(source.includes('this._stateMonitor.cancel();'), 'Indicator cancels runtime monitor on destroy');
+
+// Usage-today label changes must trigger a re-render even when state is unchanged
+widget._renderState = () => { renders++; isSpinning = Boolean(widget._refreshPending); };
+widget._refresh();
+let usageToday = null;
+widget._readUsageToday = () => usageToday;
+const rendersBeforeUsageToday = renders;
+widget._refresh();
+assert.equal(renders, rendersBeforeUsageToday, 'Null usage-today matches initial null key');
+assert.equal(widget._usageTodayLabel, null);
+usageToday = 'Today: 12.4k tok';
+widget._refresh();
+assert.equal(renders, rendersBeforeUsageToday + 1, 'Changing usage-today from null to label triggers re-render');
+assert.equal(widget._usageTodayLabel, 'Today: 12.4k tok');
+widget._refresh();
+assert.equal(renders, rendersBeforeUsageToday + 1, 'Unchanged usage-today label must not re-render');
+usageToday = 'Today: 15.0k tok';
+widget._refresh();
+assert.equal(renders, rendersBeforeUsageToday + 2, 'Updated usage-today label triggers re-render');
+assert.equal(widget._usageTodayLabel, 'Today: 15.0k tok');
+usageToday = null;
+widget._refresh();
+assert.equal(renders, rendersBeforeUsageToday + 3, 'Clearing usage-today label triggers re-render');
+assert.equal(widget._usageTodayLabel, null);
 
 // Single-provider refresh uses agent-meterd --once --provider <id> when available
 widget._renderState = () => { renders++; isSpinning = Boolean(widget._refreshPending); };
