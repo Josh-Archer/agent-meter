@@ -1121,43 +1121,65 @@ fn write_stable_json(state: &AgentMeterState) {
     }
 }
 
-/// Record the refresh in the bounded usage history and emit any configured
-/// threshold notifications. A single call site after `refresh()` so the
-/// refresh loop itself stays untouched.
-fn update_forecast_history(config: &ForecastConfig, state: &AgentMeterState) {
-    let history_path = config
+fn forecast_history_path(config: &ForecastConfig) -> PathBuf {
+    config
         .history_path
         .clone()
-        .unwrap_or_else(forecast::default_history_path);
-    let mut history = forecast::load_history(&history_path).unwrap_or_default();
+        .unwrap_or_else(forecast::default_history_path)
+}
+
+fn load_forecast_history(config: &ForecastConfig) -> forecast::UsageHistory {
+    let history_path = forecast_history_path(config);
+    forecast::load_history(&history_path).unwrap_or_else(|err| {
+        eprintln!("agent-meterd: could not load usage history: {err}");
+        forecast::UsageHistory {
+            version: forecast::HISTORY_VERSION,
+            windows: Vec::new(),
+        }
+    })
+}
+
+/// Record the refresh in the bounded usage history, emit any configured
+/// threshold notifications, and flush the updated history once to disk.
+fn update_forecast_history(
+    config: &ForecastConfig,
+    history: &mut forecast::UsageHistory,
+    state: &AgentMeterState,
+) {
+    update_forecast_history_with(config, history, state, forecast::save_history);
+}
+
+fn update_forecast_history_with<F>(
+    config: &ForecastConfig,
+    history: &mut forecast::UsageHistory,
+    state: &AgentMeterState,
+    mut save: F,
+) where
+    F: FnMut(&Path, &forecast::UsageHistory) -> Result<()>,
+{
+    let history_path = forecast_history_path(config);
     let now = Utc::now();
-    forecast::record_state(&mut history, state, now, config.max_observations_per_window);
-    if let Err(err) = forecast::save_history(&history_path, &history) {
+    forecast::record_state(history, state, now, config.max_observations_per_window);
+    if !config.notify_thresholds.is_empty() {
+        let events = forecast::check_notifications(
+            history,
+            &config.notify_thresholds,
+            now,
+            config.stale_after_seconds,
+        );
+        if !events.is_empty() {
+            let sink_path = config
+                .notifications_path
+                .clone()
+                .unwrap_or_else(forecast::default_notifications_path);
+            let mut sink = forecast::FileLogSink::new(sink_path);
+            for event in &events {
+                sink.notify(event);
+            }
+        }
+    }
+    if let Err(err) = save(&history_path, history) {
         eprintln!("agent-meterd: could not write usage history: {err}");
-    }
-    if config.notify_thresholds.is_empty() {
-        return;
-    }
-    let events = forecast::check_notifications(
-        &mut history,
-        &config.notify_thresholds,
-        now,
-        config.stale_after_seconds,
-    );
-    if events.is_empty() {
-        return;
-    }
-    let sink_path = config
-        .notifications_path
-        .clone()
-        .unwrap_or_else(forecast::default_notifications_path);
-    let mut sink = forecast::FileLogSink::new(sink_path);
-    for event in &events {
-        sink.notify(event);
-    }
-    // Persist duplicate-suppression state: notifications mutate `notified`.
-    if let Err(err) = forecast::save_history(&history_path, &history) {
-        eprintln!("agent-meterd: could not persist notification state: {err}");
     }
 }
 
@@ -1239,6 +1261,12 @@ fn main() -> Result<()> {
         None
     };
 
+    let mut forecast_history = if config.forecast.enabled {
+        Some(load_forecast_history(&config.forecast))
+    } else {
+        None
+    };
+
     let existing_state = load_existing_state(&state_path);
     let mut last_good: HashMap<usize, ProviderState> = existing_state
         .as_ref()
@@ -1261,8 +1289,8 @@ fn main() -> Result<()> {
                         Err(err) => write_error = Some(err),
                     }
                 });
-            if config.forecast.enabled {
-                update_forecast_history(&config.forecast, &final_state);
+            if let Some(history) = forecast_history.as_mut() {
+                update_forecast_history(&config.forecast, history, &final_state);
             }
             if !wrote_this_refresh {
                 if let Some(err) = write_error {
@@ -2256,7 +2284,10 @@ mod tests {
             generated_at: Utc::now(),
             providers: vec![fresh_provider("fast-provider", 80.0)],
         };
-        update_forecast_history(&forecast_cfg, &state);
+        let mut history = load_forecast_history(&forecast_cfg);
+        update_forecast_history(&forecast_cfg, &mut history, &state);
+        assert_eq!(history.windows.len(), 1);
+        assert_eq!(history.windows[0].observations.len(), 1);
         let loaded = forecast::load_history(&history_file).unwrap();
         assert_eq!(loaded.windows.len(), 1);
         assert_eq!(loaded.windows[0].provider, "fast-provider");
@@ -2380,7 +2411,9 @@ mod tests {
                 unavailable("antigravity", "failed agy", REASON_SOURCE_FAILED),
             ],
         };
-        update_forecast_history(&forecast_cfg, &state);
+        let mut history = load_forecast_history(&forecast_cfg);
+        update_forecast_history(&forecast_cfg, &mut history, &state);
+        assert!(history.windows.is_empty());
         let loaded = forecast::load_history(&history_file).unwrap();
         assert!(loaded.windows.is_empty());
         assert!(!notifications_file.exists());
@@ -2607,5 +2640,78 @@ mod tests {
         agent_meter::write_state(&stable, &primary_state).unwrap();
         let fallback_state = load_existing_state_with_fallback(&missing, &stable).unwrap();
         assert_eq!(fallback_state, primary_state);
+    }
+
+    #[test]
+    fn forecast_history_in_memory_flushes_once_and_suppresses_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let history_file = dir.path().join("history.json");
+        let notifications_file = dir.path().join("notifications.jsonl");
+        let forecast_cfg = ForecastConfig {
+            enabled: true,
+            max_observations_per_window: 10,
+            stale_after_seconds: 600,
+            notify_thresholds: vec![25.0, 10.0],
+            history_path: Some(history_file.clone()),
+            notifications_path: Some(notifications_file.clone()),
+        };
+
+        let mut history = load_forecast_history(&forecast_cfg);
+        let state_for = |remaining_percent: f32| AgentMeterState {
+            version: STATE_VERSION,
+            generated_at: Utc::now(),
+            providers: vec![fresh_provider("codex", remaining_percent)],
+        };
+
+        // Cycle 1: 20% crosses 25% threshold -> 1 notification, 1 disk write.
+        let mut cycle1_saves = 0usize;
+        update_forecast_history_with(&forecast_cfg, &mut history, &state_for(20.0), |path, h| {
+            cycle1_saves += 1;
+            assert_eq!(h.windows[0].observations.len(), 1);
+            assert_eq!(h.windows[0].notified.len(), 1);
+            forecast::save_history(path, h)
+        });
+        assert_eq!(cycle1_saves, 1);
+
+        // Cycle 2: 18% stays below 25% -> duplicate suppressed, still 1 disk write.
+        let mut cycle2_saves = 0usize;
+        update_forecast_history_with(&forecast_cfg, &mut history, &state_for(18.0), |path, h| {
+            cycle2_saves += 1;
+            assert_eq!(h.windows[0].observations.len(), 2);
+            assert_eq!(h.windows[0].notified.len(), 1);
+            forecast::save_history(path, h)
+        });
+        assert_eq!(cycle2_saves, 1);
+
+        // Cycle 3: 8% crosses 10% threshold -> 1 new notification (25% suppressed), 1 disk write.
+        let mut cycle3_saves = 0usize;
+        update_forecast_history_with(&forecast_cfg, &mut history, &state_for(8.0), |path, h| {
+            cycle3_saves += 1;
+            assert_eq!(h.windows[0].observations.len(), 3);
+            assert_eq!(h.windows[0].notified.len(), 2);
+            forecast::save_history(path, h)
+        });
+        assert_eq!(cycle3_saves, 1);
+
+        // Cycle 4: direct update_forecast_history call also keeps in-memory state and suppresses duplicates.
+        update_forecast_history(&forecast_cfg, &mut history, &state_for(7.0));
+
+        assert_eq!(history.windows.len(), 1);
+        assert_eq!(history.windows[0].observations.len(), 4);
+        assert_eq!(history.windows[0].notified.len(), 2);
+
+        let loaded = forecast::load_history(&history_file).unwrap();
+        assert_eq!(loaded, history);
+
+        let log_contents = std::fs::read_to_string(&notifications_file).unwrap();
+        let events: Vec<forecast::ThresholdEvent> = log_contents
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].threshold, 25.0);
+        assert_eq!(events[0].remaining_percent, 20.0);
+        assert_eq!(events[1].threshold, 10.0);
+        assert_eq!(events[1].remaining_percent, 8.0);
     }
 }
