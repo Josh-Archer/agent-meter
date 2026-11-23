@@ -45,6 +45,14 @@ class AuthLoop(unittest.TestCase):
   done=subprocess.CompletedProcess(['agy'],0,stdout='Please sign in via OAuth',stderr='')
   with patch.object(a,'_cli_installed',return_value=True),patch.object(a.subprocess,'run',return_value=done) as run:
    self.assertEqual(a.agy()['reason'],'login_required');self.assertEqual(a.agy()['reason'],'refresh_paused');self.assertEqual(run.call_count,1)
+ def test_json_login_error_suspends_later_polls(self):
+  done=subprocess.CompletedProcess(['agy'],0,stdout='{"quota_summary_error":"Please sign in"}',stderr='')
+  with patch.object(a,'_cli_installed',return_value=True),patch.object(a.subprocess,'run',return_value=done) as run:
+   self.assertEqual(a.agy()['reason'],'login_required');self.assertEqual(a.agy()['reason'],'refresh_paused');self.assertEqual(run.call_count,1)
+ def test_unwritable_latch_reports_retry_risk(self):
+  err=subprocess.CalledProcessError(1,'agy',stderr='sign in required')
+  with patch.object(a,'_cli_installed',return_value=True),patch.object(a.subprocess,'run',side_effect=err),patch.object(a,'_agy_latch_reconnect',return_value=False):
+   self.assertIn('background refresh may retry',a.agy()['detail'])
  def test_transient_failure_does_not_latch(self):
   with patch.object(a,'_cli_installed',return_value=True),patch.object(a.subprocess,'run',side_effect=OSError('temporary')) as run:
    self.assertEqual(a.agy()['reason'],'source_failed');self.assertEqual(a.agy()['reason'],'source_failed');self.assertEqual(run.call_count,2)

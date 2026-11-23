@@ -517,12 +517,14 @@ def _agy_text_requires_login(*chunks: Any) -> bool:
     return any(hint in text for hint in _AGY_LOGIN_HINTS)
 
 
-def _agy_login_required(error: BaseException) -> dict[str, Any]:
-    _agy_latch_reconnect()
+def _agy_login_required() -> dict[str, Any]:
+    latched = _agy_latch_reconnect()
     return unavailable(
         "antigravity", "Antigravity", "antigravity",
-        "Antigravity reported that sign-in is required. Background refresh is paused "
-        f"so it will not open another login. Use Connect to run provider-owned sign-in: {error}",
+        ("Antigravity reported that sign-in is required. " +
+         ("Background refresh is paused. " if latched else
+          "Could not save the reconnect latch; background refresh may retry. ") +
+         "Use Connect to run provider-owned sign-in."),
         reason="login_required",
     )
 
@@ -557,11 +559,16 @@ def agy() -> dict[str, Any]:
         )
         try:
             payload = json.loads(output.stdout)
-        except json.JSONDecodeError as error:
+        except json.JSONDecodeError:
             if _agy_text_requires_login(output.stdout, output.stderr):
-                return _agy_login_required(error)
+                return _agy_login_required()
             raise
-        return normalize_agy(payload)
+        try:
+            return normalize_agy(payload)
+        except (ValueError, KeyError, TypeError, AttributeError):
+            if _agy_text_requires_login(output.stdout, output.stderr):
+                return _agy_login_required()
+            raise
     except FileNotFoundError:
         return _cli_not_installed(
             "antigravity",
@@ -569,22 +576,25 @@ def agy() -> dict[str, Any]:
             "antigravity",
             f"{command} is not installed; install Antigravity (agy) and sign in to see usage.",
         )
-    except subprocess.TimeoutExpired as error:
-        _agy_latch_reconnect()
+    except subprocess.TimeoutExpired:
+        latched = _agy_latch_reconnect()
         return unavailable(
             "antigravity", "Antigravity", "antigravity",
-            f"Antigravity usage unavailable; run agy and sign in if prompted: {error}",
+            "Antigravity usage timed out. " +
+            ("Background refresh is paused. " if latched else
+             "Could not save the reconnect latch; background refresh may retry. ") +
+            "Use Connect to run provider-owned sign-in.",
             reason=REASON_TIMEOUT,
         )
     except subprocess.CalledProcessError as error:
         if _agy_text_requires_login(error.stdout, error.stderr):
-            return _agy_login_required(error)
+            return _agy_login_required()
         return unavailable(
             "antigravity", "Antigravity", "antigravity",
             f"Antigravity usage unavailable; run agy and sign in if prompted: {error}",
             reason=REASON_SOURCE_FAILED,
         )
-    except (OSError, ValueError, KeyError, json.JSONDecodeError, subprocess.SubprocessError) as error:
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, json.JSONDecodeError, subprocess.SubprocessError) as error:
         return unavailable(
             "antigravity", "Antigravity", "antigravity",
             f"Antigravity usage unavailable; run agy and sign in if prompted: {error}",

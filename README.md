@@ -864,8 +864,10 @@ only touch docs, Markdown, `.github/` or `tests/` are not released. See
 
 Agent Meter respects agy's one-hour keyring-timeout cooldown without reading or
 removing provider credential files. During that cooldown quota is unavailable,
-not zero, and an interactive agy session may still be signed in. A usage timeout, or command output that asks for login or OAuth, pauses later
-automatic attempts until **Connect** succeeds. Connect runs the
+not zero, and an interactive agy session may still be signed in. A usage timeout,
+or command output that asks for login or OAuth, pauses later automatic attempts
+until **Connect** succeeds. This pause requires a writable Agent Meter state
+directory; if the reconnect latch cannot be saved, refresh may retry. Connect runs the
 provider-owned `agy acp --login` flow and clears only Agent Meter's retry latch;
 it does not accept tokens. Provider cooldown remains in force after login until
 its hour expires. Generic source/JSON errors remain retryable.
