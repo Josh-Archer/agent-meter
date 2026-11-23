@@ -499,13 +499,41 @@ def _agy_latch_reconnect() -> bool:
         return False
 
 
+# CLI text only. These phrases select a pause; they are not parsed as credentials.
+_AGY_LOGIN_HINTS = (
+    "login required",
+    "not logged in",
+    "log in",
+    "sign in",
+    "oauth",
+    "authentication required",
+    "keyring timeout",
+    "reauth",
+)
+
+
+def _agy_text_requires_login(*chunks: Any) -> bool:
+    text = "\n".join(chunk for chunk in chunks if isinstance(chunk, str)).lower()
+    return any(hint in text for hint in _AGY_LOGIN_HINTS)
+
+
+def _agy_login_required(error: BaseException) -> dict[str, Any]:
+    _agy_latch_reconnect()
+    return unavailable(
+        "antigravity", "Antigravity", "antigravity",
+        "Antigravity reported that sign-in is required. Background refresh is paused "
+        f"so it will not open another login. Use Connect to run provider-owned sign-in: {error}",
+        reason="login_required",
+    )
+
+
 def _agy_refresh_paused(reason: str) -> dict[str, Any]:
     detail = (
         "Antigravity keyring is in its one-hour cooldown; background refresh is paused. "
         "An interactive login may still be valid."
         if reason == "keyring_cooldown" else
-        "Antigravity background refresh paused after a timeout. Use Connect to retry "
-        "provider-owned sign-in. Agent Meter never accepts or stores a token."
+        "Antigravity background refresh paused after a timeout or login request. "
+        "Use Connect to retry provider-owned sign-in. Agent Meter never accepts or stores a token."
     )
     return unavailable("antigravity", "Antigravity", "antigravity", detail, reason=reason)
 
@@ -527,7 +555,13 @@ def agy() -> dict[str, Any]:
             [command, "-p", "/usage", "--output-format", "json", "--print-timeout", "15s"],
             check=True, capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL,
         )
-        return normalize_agy(json.loads(output.stdout))
+        try:
+            payload = json.loads(output.stdout)
+        except json.JSONDecodeError as error:
+            if _agy_text_requires_login(output.stdout, output.stderr):
+                return _agy_login_required(error)
+            raise
+        return normalize_agy(payload)
     except FileNotFoundError:
         return _cli_not_installed(
             "antigravity",
@@ -541,6 +575,14 @@ def agy() -> dict[str, Any]:
             "antigravity", "Antigravity", "antigravity",
             f"Antigravity usage unavailable; run agy and sign in if prompted: {error}",
             reason=REASON_TIMEOUT,
+        )
+    except subprocess.CalledProcessError as error:
+        if _agy_text_requires_login(error.stdout, error.stderr):
+            return _agy_login_required(error)
+        return unavailable(
+            "antigravity", "Antigravity", "antigravity",
+            f"Antigravity usage unavailable; run agy and sign in if prompted: {error}",
+            reason=REASON_SOURCE_FAILED,
         )
     except (OSError, ValueError, KeyError, json.JSONDecodeError, subprocess.SubprocessError) as error:
         return unavailable(

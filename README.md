@@ -645,7 +645,9 @@ Antigravity quota is read directly from the provider-owned command
 `agy -p /usage --output-format json`. It queries the internal language server's
 `PredictionService.RetrieveUserQuotaSummary` RPC cache and returns the real
 five-hour and weekly remaining fractions and reset times without reading OAuth storage.
-The **Connect** button launches `agy` so its browser sign-in can complete.
+If that command reports that sign-in is required, background polling stops until
+**Connect** runs the provider-owned login. The **Connect** button launches `agy`
+so its browser sign-in can complete.
 
 Antigravity exposes separate quota pools for distinct model families, reported
 as stable window identifiers:
@@ -862,8 +864,8 @@ only touch docs, Markdown, `.github/` or `tests/` are not released. See
 
 Agent Meter respects agy's one-hour keyring-timeout cooldown without reading or
 removing provider credential files. During that cooldown quota is unavailable,
-not zero, and an interactive agy session may still be signed in. A usage timeout
-pauses later automatic attempts until **Connect** succeeds. Connect runs the
+not zero, and an interactive agy session may still be signed in. A usage timeout, or command output that asks for login or OAuth, pauses later
+automatic attempts until **Connect** succeeds. Connect runs the
 provider-owned `agy acp --login` flow and clears only Agent Meter's retry latch;
 it does not accept tokens. Provider cooldown remains in force after login until
 its hour expires. Generic source/JSON errors remain retryable.
