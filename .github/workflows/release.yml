@@ -42,6 +42,7 @@ jobs:
         with:
           name: release-dist
           path: dist/*
+          retention-days: 7
       - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: v${{ steps.version.outputs.value }}
