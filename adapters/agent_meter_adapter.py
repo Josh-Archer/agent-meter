@@ -469,22 +469,76 @@ def _agy_reconnect_marker() -> str:
     return os.path.join(state_home, "agent-meter", "agy-reconnect-required")
 
 
+_AGY_KEYRING_UNAVAILABLE_MARKERS = (
+    "~/.gemini/antigravity-cli/cache/antigravity-keyring-unavailable",
+    "~/.gemini/antigravity-cli/cache/jetski-keyring-unavailable",
+    "~/.gemini/cache/antigravity-keyring-unavailable",
+    "~/.gemini/cache/jetski-keyring-unavailable",
+)
+
+
+def _agy_keyring_unavailable_markers() -> tuple[str, ...]:
+    return tuple(os.path.expanduser(path) for path in _AGY_KEYRING_UNAVAILABLE_MARKERS)
+
+
+def _agy_keyring_cooldown_reason() -> str | None:
+    # Provider-owned circuit breaker, not a credential. Respect its one-hour
+    # cooldown without deleting it or interpreting its existence as logout.
+    now = time.time()
+    for marker in _agy_keyring_unavailable_markers():
+        try:
+            if now - os.stat(marker).st_mtime < 3600:
+                return "keyring_cooldown"
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return "refresh_paused"
+    return None
+
+
 def _agy_pause_reason() -> str | None:
     if os.path.exists(_agy_reconnect_marker()):
         return "refresh_paused"
-    # Provider-owned circuit breaker, not a credential. Respect its one-hour
-    # cooldown without deleting it or interpreting its existence as logout.
-    marker = os.path.expanduser(
-        "~/.gemini/antigravity-cli/cache/antigravity-keyring-unavailable"
-    )
-    try:
-        if time.time() - os.stat(marker).st_mtime < 3600:
-            return "keyring_cooldown"
-    except FileNotFoundError:
-        pass
-    except OSError:
-        return "refresh_paused"
-    return None
+    return _agy_keyring_cooldown_reason()
+
+
+def _agy_dbus_unix_path_missing(address: str) -> bool:
+    for part in address.split(";"):
+        if not part.startswith("unix:"):
+            continue
+        fields = dict(
+            item.split("=", 1)
+            for item in part[len("unix:"):].split(",")
+            if "=" in item
+        )
+        if "abstract" in fields:
+            return False
+        path = fields.get("path")
+        if path and not os.path.exists(path):
+            return True
+    return False
+
+
+def _agy_subprocess_env() -> dict[str, str]:
+    env = os.environ.copy()
+    runtime_dir = env.get("XDG_RUNTIME_DIR", "").strip()
+    if not runtime_dir or not os.path.isdir(runtime_dir):
+        candidate = f"/run/user/{os.getuid()}"
+        if os.path.isdir(candidate):
+            runtime_dir = candidate
+            env["XDG_RUNTIME_DIR"] = runtime_dir
+        else:
+            runtime_dir = ""
+    if runtime_dir:
+        bus_path = os.path.join(runtime_dir, "bus")
+        dbus_addr = env.get("DBUS_SESSION_BUS_ADDRESS", "").strip()
+        if (
+            not dbus_addr
+            or dbus_addr.startswith("autolaunch:")
+            or _agy_dbus_unix_path_missing(dbus_addr)
+        ) and os.path.exists(bus_path):
+            env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus_path}"
+    return env
 
 
 def _agy_latch_reconnect() -> bool:
@@ -553,19 +607,29 @@ def agy() -> dict[str, Any]:
     if pause:
         return _agy_refresh_paused(pause)
     try:
+        # Run in a new POSIX session (setsid) so agy's print-mode controlling-TTY
+        # probe (/dev/tty) fails with ENXIO and aborts interactive browser OAuth
+        # immediately when keyring or file credentials cannot be loaded.
         output = subprocess.run(
             [command, "-p", "/usage", "--output-format", "json", "--print-timeout", "15s"],
-            check=True, capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL,
+            check=True, capture_output=True, text=True, timeout=20,
+            stdin=subprocess.DEVNULL, start_new_session=True, env=_agy_subprocess_env(),
         )
         try:
             payload = json.loads(output.stdout)
         except json.JSONDecodeError:
+            cooldown = _agy_keyring_cooldown_reason()
+            if cooldown:
+                return _agy_refresh_paused(cooldown)
             if _agy_text_requires_login(output.stdout, output.stderr):
                 return _agy_login_required()
             raise
         try:
             return normalize_agy(payload)
         except (ValueError, KeyError, TypeError, AttributeError):
+            cooldown = _agy_keyring_cooldown_reason()
+            if cooldown:
+                return _agy_refresh_paused(cooldown)
             if _agy_text_requires_login(output.stdout, output.stderr):
                 return _agy_login_required()
             raise
@@ -577,6 +641,9 @@ def agy() -> dict[str, Any]:
             f"{command} is not installed; install Antigravity (agy) and sign in to see usage.",
         )
     except subprocess.TimeoutExpired:
+        cooldown = _agy_keyring_cooldown_reason()
+        if cooldown:
+            return _agy_refresh_paused(cooldown)
         latched = _agy_latch_reconnect()
         return unavailable(
             "antigravity", "Antigravity", "antigravity",
@@ -587,6 +654,9 @@ def agy() -> dict[str, Any]:
             reason=REASON_TIMEOUT,
         )
     except subprocess.CalledProcessError as error:
+        cooldown = _agy_keyring_cooldown_reason()
+        if cooldown:
+            return _agy_refresh_paused(cooldown)
         if _agy_text_requires_login(error.stdout, error.stderr):
             return _agy_login_required()
         return unavailable(
