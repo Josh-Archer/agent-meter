@@ -872,10 +872,16 @@ provider-owned `agy acp --login` flow and clears only Agent Meter's retry latch;
 it does not accept tokens. Provider cooldown remains in force after login until
 its hour expires. Generic source/JSON errors remain retryable.
 
-This guard mitigates repeated login windows; it is not a general no-login mode
-for agy. The CLI's print mode can initiate OAuth when credentials cannot be
-loaded, and no documented no-auth print flag is available. The first timeout
-may therefore still open a login window. An unwritable Agent Meter state directory
-also prevents persisting its retry latch. Fix the desktop keyring/session issue
-through the provider's supported login rather than copying tokens or deleting
-its circuit-breaker marker. Live keyring recovery must be verified separately.
+Background `agy -p /usage` polls run in a detached POSIX session
+(`start_new_session=True`, `stdin=DEVNULL`) with a normalized user runtime
+D-Bus address (`XDG_RUNTIME_DIR` / `DBUS_SESSION_BUS_ADDRESS`). Detaching the
+controlling terminal causes `agy`'s print-mode `/dev/tty` check to fail closed
+and exit immediately without starting an interactive OAuth listener or launching
+a browser window when keyring or fallback file credentials cannot be loaded. If
+`agy` records a fresh keyring-timeout marker during a poll, Agent Meter reports
+`keyring_cooldown` without latching `agy-reconnect-required`, so background
+refresh automatically resumes once the one-hour cooldown expires. An unwritable
+Agent Meter state directory still prevents persisting its retry latch on genuine
+sign-in failures. Fix the desktop keyring/session issue through the provider's
+supported login rather than copying tokens or deleting its circuit-breaker
+marker.
