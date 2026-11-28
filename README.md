@@ -622,6 +622,12 @@ status-line input and no credentials. Once at least one payload has been receive
 Before the first payload arrives, the adapter returns `status: "unavailable"` with
 instructions pointing back to this setup step.
 
+Claude Code leaves `rate_limits` out of the payload until a session's first API
+response. The helper ignores those payloads once it has a real reading, so
+opening a new session does not blank the meter. `agent-meterd --watch` watches
+`file` sources and republishes as soon as the helper rewrites `claude.json`;
+command adapters still run on `refresh_seconds`.
+
 ### GitHub Copilot
 
 GitHub Copilot uses the official Copilot SDK's `account.getQuota` RPC. It reports

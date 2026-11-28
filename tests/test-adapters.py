@@ -741,6 +741,40 @@ def test_claude_reads_raw_statusline_json() -> None:
     assert result["windows"][0]["remaining_percent"] == 70.0
 
 
+def _run_claude_statusline(payload: str, output: str) -> None:
+    import io
+    saved_argv, saved_stdin = sys.argv, sys.stdin
+    sys.argv, sys.stdin = ["agent-meter-claude-statusline", "--output", output], io.StringIO(payload)
+    try:
+        assert adapter.claude_statusline() == 0
+    finally:
+        sys.argv, sys.stdin = saved_argv, saved_stdin
+
+
+def test_claude_statusline_keeps_last_reading_without_rate_limits() -> None:
+    good = json.dumps({"rate_limits": {"five_hour": {"used_percentage": 25, "resets_at": 4_102_444_800}}})
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "agent-meter", "claude.json")
+        # Nothing saved yet: a payload without rate limits explains itself.
+        _run_claude_statusline('{"model":{"display_name":"Opus"}}', path)
+        with open(path) as stream:
+            assert json.load(stream)["status"] == "unavailable"
+        _run_claude_statusline(good, path)
+        with open(path) as stream:
+            assert json.load(stream)["windows"][0]["remaining_percent"] == 75.0
+        # A new session reports no rate limits before its first API response.
+        for payload in ('{"model":{"display_name":"Opus"}}', "not json", '{"rate_limits":{}}'):
+            _run_claude_statusline(payload, path)
+            with open(path) as stream:
+                kept = json.load(stream)
+            assert kept["status"] == "fresh", kept
+            assert kept["windows"][0]["remaining_percent"] == 75.0
+        newer = json.dumps({"rate_limits": {"five_hour": {"used_percentage": 40, "resets_at": 4_102_444_800}}})
+        _run_claude_statusline(newer, path)
+        with open(path) as stream:
+            assert json.load(stream)["windows"][0]["remaining_percent"] == 60.0
+
+
 def test_claude_marks_expired_state_stale() -> None:
     normalized = {
         "id": "claude",
@@ -2594,6 +2628,7 @@ if __name__ == "__main__":
     test_claude_absent()
     test_claude_reads_normalized_state()
     test_claude_reads_raw_statusline_json()
+    test_claude_statusline_keeps_last_reading_without_rate_limits()
     test_claude_marks_expired_state_stale()
     test_copilot_usage_items()
     test_copilot_with_allowance()

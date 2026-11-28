@@ -1243,6 +1243,22 @@ def write_state_file(path: str, state: dict[str, Any]) -> None:
         raise
 
 
+def _claude_state_has_usage(path: str) -> bool:
+    """Whether the saved Claude state already holds a real remaining percent."""
+    try:
+        with open(os.path.abspath(os.path.expanduser(path)), encoding="utf-8") as stream:
+            saved = json.load(stream)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(saved, dict) or saved.get("id") != "claude":
+        return False
+    windows = saved.get("windows")
+    return isinstance(windows, list) and any(
+        isinstance(window, dict) and _number(window.get("remaining_percent")) is not None
+        for window in windows
+    )
+
+
 def claude_statusline() -> int:
     parser = argparse.ArgumentParser(description="Consume Claude Code status-line JSON")
     parser.add_argument("--output", default=os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "agent-meter", "claude.json"))
@@ -1251,6 +1267,11 @@ def claude_statusline() -> int:
         payload = json.load(sys.stdin)
         state = normalize_claude(payload)
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+        # Claude Code omits rate_limits until a session's first API response,
+        # so every new session sends payloads without them. Keep the last real
+        # reading rather than replacing it with "unavailable".
+        if _claude_state_has_usage(args.output):
+            return 0
         state = unavailable("claude", "Claude Code", "claude", f"Claude Code usage unavailable: {error}")
     write_state_file(args.output, state)
     return 0

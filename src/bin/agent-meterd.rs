@@ -286,26 +286,138 @@ fn arm_inbox_watch(dir: &Path) -> Option<i32> {
     Some(fd)
 }
 
-fn wait_inbox(fd: Option<i32>, timeout: StdDuration) {
-    let Some(fd) = fd else {
-        thread::sleep(timeout);
-        return;
-    };
-    let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
-    let mut pollfd = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let ready = unsafe { libc::poll(&mut pollfd, 1, millis) };
-    if ready <= 0 {
-        return;
+/// Inotify watch on the directories holding `file` sources, so a status-line
+/// helper that rewrites its state file shows up at once instead of on the
+/// next refresh interval.
+struct SourceWatch {
+    fd: i32,
+    /// Watch descriptor to the watched file names inside that directory.
+    names: HashMap<i32, HashSet<std::ffi::OsString>>,
+}
+
+/// `None` means file sources are only read on the refresh interval.
+fn arm_source_watch(config: &Config) -> Option<SourceWatch> {
+    let mut dirs: HashMap<PathBuf, HashSet<std::ffi::OsString>> = HashMap::new();
+    for source in &config.sources {
+        if let Source::File { path } = source {
+            let Some(name) = path.file_name() else {
+                continue;
+            };
+            let dir = match path.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+                _ => PathBuf::from("."),
+            };
+            dirs.entry(dir).or_default().insert(name.to_os_string());
+        }
     }
+    if dirs.is_empty() {
+        return None;
+    }
+    let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+    if fd < 0 {
+        eprintln!("agent-meterd: inotify unavailable; file sources refresh on the interval");
+        return None;
+    }
+    let mut names = HashMap::new();
+    for (dir, files) in dirs {
+        let Ok(path) = CString::new(dir.as_os_str().as_bytes()) else {
+            continue;
+        };
+        // The directory is watched, not the file: helpers publish by rename.
+        let mask = libc::IN_MOVED_TO | libc::IN_CLOSE_WRITE;
+        let watch = unsafe { libc::inotify_add_watch(fd, path.as_ptr(), mask) };
+        if watch < 0 {
+            eprintln!(
+                "agent-meterd: cannot watch {}; its file sources refresh on the interval",
+                dir.display()
+            );
+            continue;
+        }
+        names.insert(watch, files);
+    }
+    if names.is_empty() {
+        unsafe { libc::close(fd) };
+        return None;
+    }
+    Some(SourceWatch { fd, names })
+}
+
+/// Drain pending events. True when one names a watched source file. Other
+/// files in the same directory, such as the daemon's own state, are ignored.
+fn drain_source_watch(watch: &SourceWatch) -> bool {
+    const HEADER: usize = std::mem::size_of::<libc::inotify_event>();
+    let mut changed = false;
     let mut buf = [0u8; 4096];
     loop {
-        let read = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+        let read =
+            unsafe { libc::read(watch.fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
         if read <= 0 {
             break;
+        }
+        let filled = read as usize;
+        let mut offset = 0;
+        while offset + HEADER <= filled {
+            let event: libc::inotify_event =
+                unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset).cast()) };
+            let start = offset + HEADER;
+            let end = (start + event.len as usize).min(filled);
+            let raw = &buf[start..end];
+            let name = &raw[..raw.iter().position(|&b| b == 0).unwrap_or(raw.len())];
+            if watch
+                .names
+                .get(&event.wd)
+                .is_some_and(|files| files.contains(std::ffi::OsStr::from_bytes(name)))
+            {
+                changed = true;
+            }
+            offset = end;
+        }
+    }
+    changed
+}
+
+/// Sleep until the timeout, an inbox drop, or a watched source file changes.
+/// Returns true only for the last case.
+///
+/// The daemon writes its own files next to the file sources on every loop
+/// pass, so an event for any other name keeps waiting instead of returning.
+fn wait_events(inbox: Option<i32>, sources: Option<&SourceWatch>, timeout: StdDuration) -> bool {
+    if inbox.is_none() && sources.is_none() {
+        thread::sleep(timeout);
+        return false;
+    }
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let millis = i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX);
+        let mut pollfds: Vec<libc::pollfd> = inbox
+            .into_iter()
+            .chain(sources.map(|watch| watch.fd))
+            .map(|fd| libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        let ready =
+            unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, millis) };
+        if ready <= 0 {
+            return false;
+        }
+        let inbox_ready = inbox.is_some() && pollfds[0].revents != 0;
+        if let Some(fd) = inbox.filter(|_| inbox_ready) {
+            let mut buf = [0u8; 4096];
+            loop {
+                let read =
+                    unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+                if read <= 0 {
+                    break;
+                }
+            }
+        }
+        let changed = sources.is_some_and(drain_source_watch);
+        if inbox_ready || changed {
+            return changed;
         }
     }
 }
@@ -823,6 +935,7 @@ fn refresh_publishing(
     refresh_publishing_target(config, None, last_good, publish)
 }
 
+#[cfg(test)]
 /// Refresh either all sources (`target_provider = None`) or only sources
 /// matching `target_provider`, preserving existing `last_good` entries in
 /// `slots` for non-targeted sources without executing their adapter commands.
@@ -836,19 +949,19 @@ fn refresh_publishing_target(
     config: &Config,
     target_provider: Option<&str>,
     last_good: &mut HashMap<usize, ProviderState>,
-    mut publish: impl FnMut(&AgentMeterState),
+    publish: impl FnMut(&AgentMeterState),
 ) -> AgentMeterState {
-    if config.sources.is_empty() {
-        let state = AgentMeterState {
-            version: STATE_VERSION,
-            generated_at: Utc::now(),
-            providers: Vec::new(),
-        };
-        publish(&state);
-        return state;
-    }
+    let targeted = target_mask(config, target_provider, last_good);
+    refresh_publishing_selected(config, &targeted, &[], last_good, publish).0
+}
 
-    let targeted: Vec<bool> = match target_provider {
+/// Which sources a refresh runs: all of them, or those matching one provider.
+fn target_mask(
+    config: &Config,
+    target_provider: Option<&str>,
+    last_good: &HashMap<usize, ProviderState>,
+) -> Vec<bool> {
+    match target_provider {
         Some(target) => config
             .sources
             .iter()
@@ -858,14 +971,42 @@ fn refresh_publishing_target(
             })
             .collect(),
         None => vec![true; config.sources.len()],
-    };
+    }
+}
+
+/// Refresh the sources flagged in `targeted` and return the snapshot with the
+/// per-source slots behind it.
+///
+/// A source that is not targeted keeps its entry from `carried`, the slots of
+/// the previous refresh, so a provider with no last-good data (an unavailable
+/// one) stays visible. Without a carried entry it falls back to `last_good`.
+fn refresh_publishing_selected(
+    config: &Config,
+    targeted: &[bool],
+    carried: &[Option<ProviderState>],
+    last_good: &mut HashMap<usize, ProviderState>,
+    mut publish: impl FnMut(&AgentMeterState),
+) -> (AgentMeterState, Vec<Option<ProviderState>>) {
+    if config.sources.is_empty() {
+        let state = AgentMeterState {
+            version: STATE_VERSION,
+            generated_at: Utc::now(),
+            providers: Vec::new(),
+        };
+        publish(&state);
+        return (state, Vec::new());
+    }
 
     let mut slots = vec![None; config.sources.len()];
     let mut targeted_indices = Vec::new();
     for (index, &is_targeted) in targeted.iter().enumerate() {
         if is_targeted {
             targeted_indices.push(index);
-        } else if let Some(existing) = last_good.get(&index) {
+        } else if let Some(existing) = carried
+            .get(index)
+            .and_then(Option::as_ref)
+            .or_else(|| last_good.get(&index))
+        {
             slots[index] = Some(existing.clone());
         }
     }
@@ -873,7 +1014,7 @@ fn refresh_publishing_target(
     if targeted_indices.is_empty() {
         let latest = snapshot_from(&slots, last_good, false);
         publish(&latest);
-        return latest;
+        return (latest, slots);
     }
 
     let deadline = refresh_deadline_instant(config);
@@ -887,7 +1028,7 @@ fn refresh_publishing_target(
     let job_queue = &job_queue;
     let (result_tx, result_rx) = mpsc::channel::<(usize, SourceRefresh)>();
 
-    thread::scope(|scope| {
+    let latest = thread::scope(|scope| {
         for _ in 0..worker_count {
             let result_tx = result_tx.clone();
             scope.spawn(move || loop {
@@ -961,7 +1102,8 @@ fn refresh_publishing_target(
             publish(&latest);
         }
         latest
-    })
+    });
+    (latest, slots)
 }
 
 fn normalize_id(hint: &str) -> String {
@@ -1398,22 +1540,46 @@ fn main() -> Result<()> {
         .map(|existing| seed_last_good_from_state(&config, existing))
         .unwrap_or_default();
     let mut last_good_state: Option<AgentMeterState> = existing_state;
+    let source_watch = if args.watch {
+        arm_source_watch(&config)
+    } else {
+        None
+    };
+    let file_sources: Vec<bool> = config
+        .sources
+        .iter()
+        .map(|source| matches!(source, Source::File { .. }))
+        .collect();
+    let mut slots: Vec<Option<ProviderState>> = Vec::new();
+    let mut files_changed = false;
     let mut did_refresh = false;
     let mut next_refresh = Instant::now();
     loop {
         if let Some(store) = &usage_store {
             drain_usage(store);
         }
-        if (args.watch || !did_refresh) && Instant::now() >= next_refresh {
+        let full_refresh = (args.watch || !did_refresh) && Instant::now() >= next_refresh;
+        // A watched file source changed between intervals: re-read the file
+        // sources only. Command adapters keep their interval.
+        if full_refresh || (files_changed && did_refresh) {
             let mut write_error: Option<anyhow::Error> = None;
             let mut wrote_this_refresh = false;
-            let final_state =
-                refresh_publishing_target(&config, args.provider.as_deref(), &mut last_good, |state| {
-                    match emit_state(&state_path, state, &mut last_good_state) {
-                        Ok(()) => wrote_this_refresh = true,
-                        Err(err) => write_error = Some(err),
-                    }
-                });
+            let publish = |state: &AgentMeterState| match emit_state(
+                &state_path,
+                state,
+                &mut last_good_state,
+            ) {
+                Ok(()) => wrote_this_refresh = true,
+                Err(err) => write_error = Some(err),
+            };
+            let targeted = if full_refresh {
+                target_mask(&config, args.provider.as_deref(), &last_good)
+            } else {
+                file_sources.clone()
+            };
+            let (final_state, refreshed) =
+                refresh_publishing_selected(&config, &targeted, &slots, &mut last_good, publish);
+            slots = refreshed;
             if let Some(history) = forecast_history.as_mut() {
                 update_forecast_history(&config.forecast, history, &final_state);
             }
@@ -1424,8 +1590,10 @@ fn main() -> Result<()> {
                     }
                 }
             }
-            did_refresh = true;
-            next_refresh = Instant::now() + StdDuration::from_secs(config.refresh_seconds);
+            if full_refresh {
+                did_refresh = true;
+                next_refresh = Instant::now() + StdDuration::from_secs(config.refresh_seconds);
+            }
         }
         if !args.watch && listener.is_none() {
             break;
@@ -1435,7 +1603,7 @@ fn main() -> Result<()> {
         } else {
             StdDuration::from_secs(60)
         };
-        wait_inbox(inbox_watch, timeout);
+        files_changed = wait_events(inbox_watch, source_watch.as_ref(), timeout);
     }
     Ok(())
 }
@@ -2841,6 +3009,91 @@ mod tests {
     }
 
     #[test]
+    fn file_only_refresh_rereads_files_and_carries_other_slots() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("claude.json");
+        let marker = dir.path().join("command-runs");
+        std::fs::write(
+            &file,
+            serde_json::to_string(&fresh_provider("claude", 80.0)).unwrap(),
+        )
+        .unwrap();
+        let config = Config {
+            refresh_seconds: 60,
+            command_timeout_seconds: 5,
+            max_concurrent_refreshes: 4,
+            refresh_deadline_seconds: 5,
+            sources: vec![
+                // Fails, so it has no last-good entry to fall back on.
+                Source::Command {
+                    program: "sh".into(),
+                    args: vec![
+                        "-c".into(),
+                        format!("echo run >> '{}'; exit 1", marker.display()),
+                    ],
+                    timeout_seconds: Some(5),
+                },
+                Source::File { path: file.clone() },
+            ],
+            forecast: ForecastConfig::default(),
+        };
+        let mut last_good = HashMap::new();
+        let (first, slots) =
+            refresh_publishing_selected(&config, &[true, true], &[], &mut last_good, |_| {});
+        assert_eq!(first.providers.len(), 2);
+        assert_eq!(first.providers[0].status, "unavailable");
+        assert_eq!(first.providers[1].windows[0].remaining_percent, Some(80.0));
+
+        std::fs::write(
+            &file,
+            serde_json::to_string(&fresh_provider("claude", 55.0)).unwrap(),
+        )
+        .unwrap();
+        let (second, _) =
+            refresh_publishing_selected(&config, &[false, true], &slots, &mut last_good, |_| {});
+        assert_eq!(second.providers.len(), 2, "unavailable provider must stay");
+        assert_eq!(second.providers[0], first.providers[0]);
+        assert_eq!(second.providers[1].windows[0].remaining_percent, Some(55.0));
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap().lines().count(),
+            1,
+            "command source must not run on a file-only refresh"
+        );
+    }
+
+    #[test]
+    fn source_watch_reports_only_watched_file_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("claude.json");
+        let config = Config {
+            refresh_seconds: 60,
+            command_timeout_seconds: 5,
+            max_concurrent_refreshes: 4,
+            refresh_deadline_seconds: 5,
+            sources: vec![Source::File { path: file.clone() }],
+            forecast: ForecastConfig::default(),
+        };
+        let watch = arm_source_watch(&config).expect("inotify watch");
+
+        // The daemon's own state lives in the same directory.
+        std::fs::write(dir.path().join("state.json"), "{}").unwrap();
+        let started = Instant::now();
+        assert!(!wait_events(
+            None,
+            Some(&watch),
+            StdDuration::from_millis(200)
+        ));
+        assert!(started.elapsed() >= StdDuration::from_millis(150));
+
+        // Helpers publish with an atomic rename.
+        let temporary = dir.path().join(".agent-meter-tmp");
+        std::fs::write(&temporary, "{}").unwrap();
+        std::fs::rename(&temporary, &file).unwrap();
+        assert!(wait_events(None, Some(&watch), StdDuration::from_secs(5)));
+        unsafe { libc::close(watch.fd) };
+    }
+
+    #[test]
     fn single_provider_refresh_only_executes_matching_source_and_preserves_others() {
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join("state.json");
@@ -2990,8 +3243,7 @@ mod tests {
             .expect("should fall back to stable state path");
         let mut last_good = seed_last_good_from_state(&config, &loaded);
 
-        let state =
-            refresh_publishing_target(&config, Some("antigravity"), &mut last_good, |_| {});
+        let state = refresh_publishing_target(&config, Some("antigravity"), &mut last_good, |_| {});
 
         assert!(
             !untouched_marker.exists(),
